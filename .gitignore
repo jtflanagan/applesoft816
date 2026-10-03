@@ -25,3 +25,5 @@ sys/sys.o
 sys/sys.lst
 sys/sys.map
 tools/prodisk
+gsrun/parsetest
+gsrun/parse.o

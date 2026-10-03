@@ -17,5 +17,13 @@ $(EMU)/cpu816.o: $(EMU)/cpu816.cpp $(EMU)/cpu816.hpp
 	$(MAKE) -C $(EMU) cpu816.o
 
 clean:
-	rm -f gsrun compile.o
+	rm -f gsrun compile.o parsetest parse.o
+
+
+# parsetest: compiler/parse.c against the ROM's PARSE.INPUT.LINE
+parsetest: parsetest.cpp parse.o $(EMU)/cpu816.o $(EMU)/cpu816.hpp $(COMP)/parse.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ parsetest.cpp parse.o $(EMU)/cpu816.o
+
+parse.o: $(COMP)/parse.c $(COMP)/parse.h
+	$(CC) $(CFLAGS) -c -o $@ $(COMP)/parse.c
 .PHONY: clean

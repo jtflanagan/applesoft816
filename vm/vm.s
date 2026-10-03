@@ -210,6 +210,10 @@ vm_run:
         sta     SH_END
         lda     #$FFFF
         sta     CURLIN
+        jsr     clear_all       ; a RUN is a CLEAR first: the image may have run before
+        rep     #$20
+        .a16
+        ldy     VM_PROG
         ldx     a:$0000,y       ; entry IP
         lda     COUT_VEC        ; patch the COUT trampoline
         sta     cout_target

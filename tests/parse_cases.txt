@@ -1,0 +1,37 @@
+10 print "hello"; x
+20 PRINT "lower case in strings"   ,a$
+30 data abc, Def ,  "q r" ,1 2 3 :print a
+40 rem this is a remark: with colon "and quote
+50 ? 1;2
+60 P R I N T  1 0
+70 HTAB 5: VTAB 3: PRINT AT
+80 X = ATN(1) + AT
+90 FOR I = A TO B STEP 2
+100 FOR I=ATOB
+110 IF ATN(X) THEN PRINT AT
+120 HGR2 : HGR : HCOLOR= 3 : HPLOT 0,0 TO 279,191
+130 X=SCRN( 1,2):Y=SCRN(1,2)
+140 GOTO 10: GO TO 20: GOSUB30
+150 ON X GOTO 1,2,3
+160 A$="X":B$ = LEFT$ (A$,1)+MID$(A$,1)+RIGHT$(A$,1)
+170 PRINT CHR$(4);"CATALOG"
+180 IFX=1THENPRINT"ONE"
+190 DATA "unclosed
+200 rem
+210 data
+220 tO = 1: ToX = 2 : at = 3
+230 PRINT "a":data x,y:print "b"
+240 x = 1e3 + 1E-3 + .5 + 5. 
+250 DEF FN f(x) = x*x : print fn f(2)
+260 ON ERR GOTO 100: ONERR GOTO 100
+270 PR#3: IN#0 : PR# 6
+280 print tab( 5)spc(3)pos(0)
+290 print "unterminated
+300 A=1:REM:B=2
+310   print   1
+PRINT 2+2
+? "immediate"
+run
+list 10,20
+   
+    10
