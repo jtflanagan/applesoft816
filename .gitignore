@@ -4,3 +4,9 @@ __pycache__/
 emu816/sst_run
 emu816/*.o
 emu816/out/
+ref/
+fp816/fp.bin
+fp816/fp.o
+fp816/fp.lst
+fp816/fp.map
+fp816/fptest
