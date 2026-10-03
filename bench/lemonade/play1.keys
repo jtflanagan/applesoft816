@@ -1,0 +1,14 @@
+# Lemonade Stand, one player, five days, then ESC and "no" to playing again.
+# Amounts are small enough that no day can ask "THINK AGAIN".
+# 12200 new game? / 12220 how many players
+Y{CR}1{CR}
+# 13000: two pages of instructions (GOSUB 18000 each)
+{SP}{SP}
+# day 1: glasses, signs, price, change anything? / report page
+{SNAP}10{CR}1{CR}10{CR}N{CR}{SNAP}{SP}
+# days 2-4
+10{CR}1{CR}10{CR}N{CR}{SP}
+10{CR}1{CR}10{CR}N{CR}{SP}
+10{CR}1{CR}10{CR}N{CR}{SP}
+# day 5, then ESC at the report and N to "play again"
+10{CR}1{CR}10{CR}N{CR}{SNAP}{ESC}N
