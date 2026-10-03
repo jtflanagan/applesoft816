@@ -446,7 +446,9 @@ static void usage(void)
 {
   die("usage: asprof --rom ROM --sym A2_BASIC.SYM --sym APPLE2E.SYM\n"
       "              (--prog TOKENIZED | --type LISTING) [--keys SCRIPT]\n"
-      "              [--max-cycles N] [--idle N] [--lines N] [--syms N] [--snap-end]");
+      "              [--max-cycles N] [--idle N] [--lines N] [--syms N] [--snap-end]\n"
+      "              [--cout FILE]       every byte the running program sends to COUT ($FDED)\n"
+      "              [--dump-prog FILE]  the tokenized program ($801..PRGEND) at the end");
 }
 
 int main(int argc, char **argv)
@@ -455,6 +457,7 @@ int main(int argc, char **argv)
   uint64_t max_cycles = 4000000000ULL, idle_limit = 3000000;
   int top_lines = 25, top_syms = 25;
   bool snap_end = false;
+  const char *cout_path = NULL, *dump_path = NULL;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -468,6 +471,8 @@ int main(int argc, char **argv)
     else if (!strcmp(a, "--lines") && v) top_lines = atoi(argv[++i]);
     else if (!strcmp(a, "--syms") && v) top_syms = atoi(argv[++i]);
     else if (!strcmp(a, "--snap-end")) snap_end = true;
+    else if (!strcmp(a, "--cout") && v) cout_path = argv[++i];
+    else if (!strcmp(a, "--dump-prog") && v) dump_path = argv[++i];
     else usage();
   }
   if (!rom_path || !nsyms || (!prog_path == !type_path)) usage();
@@ -502,10 +507,19 @@ int main(int argc, char **argv)
   vrEmu6502Reset(cpu);
 
   bool running = false, ever_ran = false;
+  FILE *cout_f = NULL;
+  bool cout_done = false;
+  int restart_addr = sym_addr("RESTART");
+  if (restart_addr < 0) die("RESTART not in the symbols");
+  if (cout_path && !(cout_f = fopen(cout_path, "wb"))) die("%s: cannot write", cout_path);
   const char *why = "max cycles";
   while (cycles < max_cycles) {
     uint16_t pc = vrEmu6502GetPC(cpu);
     uint8_t op = mem_read(pc, true);
+    /* the program's output: from RUN until AppleSoft's RESTART (END, STOP,
+     * an error - its message included - all end there; the ] prompt after) */
+    if (cout_f && pc == restart_addr && ever_ran) cout_done = true;
+    if (cout_f && running && !cout_done && pc == 0xFDED) fputc(vrEmu6502GetAcc(cpu), cout_f);
     uint8_t sp0 = vrEmu6502GetStackPointer(cpu);
     unsigned c = vrEmu6502InstCycle(cpu);
     cycles += c;
@@ -557,6 +571,15 @@ int main(int argc, char **argv)
   }
 
   if (snap_end) snap_screen();
+  if (cout_f) fclose(cout_f);
+  if (dump_path) {
+    FILE *f = fopen(dump_path, "wb");
+    if (!f) die("%s: cannot write", dump_path);
+    unsigned start = ram[0x67] | ram[0x68] << 8, end = ram[0xAF] | ram[0xB0] << 8;
+    if (start != 0x801 || end < start || end > 0xC000) die("odd program pointers %04X-%04X", start, end);
+    fwrite(ram + start, 1, end - start, f);
+    fclose(f);
+  }
   if (getenv("ASPROF_MEM")) {
     for (int z = 0x67; z < 0x74; z++) fprintf(stderr, "%02X=%02X ", z, ram[z]);
     fprintf(stderr, "\nAF=%02X B0=%02X  $800:", ram[0xAF], ram[0xB0]);
