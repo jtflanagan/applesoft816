@@ -29,14 +29,16 @@ constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R
                    R_FMULT = 0xE97F, R_FDIV = 0xEA66, R_FCOMP = 0xEBB2, R_MUL10 = 0xEA39,
                    R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_INT = 0xEC23, R_QINT = 0xEBF2,
                    R_AYINT = 0xE10C, R_GIVAYF = 0xE2F2, R_CONINT = 0xE6FB, R_GETADR = 0xE752,
-                   R_FIN = 0xEC4A, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
+                   R_FIN = 0xEC4A, R_FOUT = 0xED34, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
 // fp816 jump table
 constexpr uint32_t LIB = 0xF20000;
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
                    F_SUB = LIB + 0x10, F_MUL = LIB + 0x1C, F_DIV = LIB + 0x20, F_CMP = LIB + 0x24,
                    F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34,
                    F_INT = LIB + 0x38, F_QINT = LIB + 0x3C, F_AYINT = LIB + 0x40, F_GIVAYF = LIB + 0x44,
-                   F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C, F_FIN = LIB + 0x50;
+                   F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C, F_FIN = LIB + 0x50, F_FOUT = LIB + 0x58;
+constexpr int FP_BUF = 0xFD;
+constexpr uint32_t OUTBUF = 0x000500; // fp816's FOUT text (the ROM's is $0100)
 constexpr int LINNUM = 0x50, FP_INT = 0xF8, FP_TXT = 0xFA, TXTPTR = 0xB8;
 constexpr uint32_t TEXT = 0x000400; // number text for FIN
 
@@ -152,6 +154,23 @@ struct Machine {
       return false;
     };
     cpu.on_write = [](uint32_t a, uint8_t) { return a >= 0xD000 && a <= 0xFFFF; };
+  }
+
+  // the ROM's own FIN on a string -> FAC (for realistic FOUT inputs)
+  bool rom_fin(const std::string& txt, Fac& out)
+  {
+    memcpy(&cpu.mem[TEXT], txt.data(), txt.size());
+    memset(&cpu.mem[0], 0, 0x100);
+    for (int k = 0; k < 24; k++) cpu.mem[0xB1 + k] = cpu.mem[0xFF0000 + R_CHRGET_TEMPLATE + k];
+    cpu.mem[TXTPTR] = uint8_t(TEXT - 1), cpu.mem[TXTPTR + 1] = uint8_t((TEXT - 1) >> 8);
+    uint8_t stub[] = {0x20, 0xB1, 0x00, 0x20, uint8_t(R_FIN), uint8_t(R_FIN >> 8), 0xDB};
+    memcpy(&cpu.mem[STUB], stub, sizeof stub);
+    cpu.reset_regs();
+    cpu.set_regs(0, 0, 0, 0x01FF, 0, 0, 0x34, true);
+    int err;
+    if (!run(STUB, true, err) || err) return false;
+    out = get_fac(0);
+    return true;
   }
 
   void put_fac(uint32_t dp, const Fac& f)
@@ -402,6 +421,68 @@ int main(int argc, char** argv)
       }
     }
     printf("%-20s %8ld cases  %6ld ROM errors  %ld differ\n", "FIN text->FAC", cases, errs, bad);
+    failed_tests += bad != 0;
+  }
+
+  // FOUT: FAC -> text
+  if (!getenv("FPTEST_ONLY") || strstr("FOUT", getenv("FPTEST_ONLY"))) {
+    long bad = 0, errs = 0;
+    for (long i = 0; i < cases; i++) {
+      Fac f;
+      switch (rndn(3)) {
+      case 0: f = random_fac(int(rndn(256))); break;
+      case 1: f = random_fac(0x78 + int(rndn(0x30))); break;
+      default:
+        if (!m.rom_fin(random_number_text(), f)) f = random_fac(0x80);
+        if (rndn(2)) f.ext = uint8_t(rnd());
+      }
+      Outcome want{}, got{};
+      std::string ws, gs;
+      for (int ours = 0; ours < 2; ours++) {
+        Cpu816& c = m.cpu;
+        Outcome& o = ours ? got : want;
+        std::string& str = ours ? gs : ws;
+        c.reset_regs();
+        uint32_t text_at;
+        if (!ours) {
+          memset(&c.mem[0], 0, 0x100);
+          memset(&c.mem[0x100], 0xEE, 0x20);
+          m.put_fac(0, f);
+          uint8_t stub[] = {0x20, uint8_t(R_FOUT), uint8_t(R_FOUT >> 8), 0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          c.set_regs(0, 0, 0, 0x01FF, 0, 0, 0x34, true);
+          if (!m.run(STUB, true, o.err)) o.err = -1;
+          o.fac = m.get_fac(0);
+          text_at = 0x100;
+        } else {
+          memset(&c.mem[DP_OURS], 0, 0x100);
+          memset(&c.mem[OUTBUF], 0xEE, 0x20);
+          m.put_fac(DP_OURS, f);
+          c.mem[DP_OURS + FP_BUF] = uint8_t(OUTBUF - 1);
+          c.mem[DP_OURS + FP_BUF + 1] = uint8_t((OUTBUF - 1) >> 8);
+          c.mem[DP_OURS + FP_BUF + 2] = uint8_t((OUTBUF - 1) >> 16);
+          uint8_t stub[] = {0x22, uint8_t(F_FOUT), uint8_t(F_FOUT >> 8), uint8_t(F_FOUT >> 16), 0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          c.set_regs(0, 0, 0, 0x01FF, DP_OURS, 0x12, 0x00, false);
+          if (!m.run(STUB, false, o.err)) o.err = -1;
+          else o.err = c.mem[DP_OURS + FP_ERR];
+          if (c.dbr() != 0x12) o.err = -3; // DBR not restored
+          o.fac = m.get_fac(DP_OURS);
+          text_at = OUTBUF;
+        }
+        for (int k = 0; k < 0x20 && c.mem[text_at + k]; k++) str += char(c.mem[text_at + k]);
+        o.res = int(str.size());
+      }
+      errs += want.err != 0;
+      if (getenv("FOUT_SHOW") && i < 12) printf("  %-16s exp=%02X\n", gs.c_str(), f.exp);
+      if ((!(want == got) || ws != gs) && ++bad <= 4) {
+        printf("FOUT: case %ld differs: ROM \"%s\" fp \"%s\"\n", i, ws.c_str(), gs.c_str());
+        show("in ", f);
+        show("ROM", want);
+        show("fp ", got);
+      }
+    }
+    printf("%-20s %8ld cases  %6ld ROM errors  %ld differ\n", "FOUT FAC->text", cases, errs, bad);
     failed_tests += bad != 0;
   }
 

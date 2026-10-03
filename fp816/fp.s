@@ -6,7 +6,7 @@
 ; fptest; the 16-bit rewrites come after, against the same oracle.
 ;
 ; Calling: native mode (E=0), any M/X (preserved), D = the FP direct page,
-; DBR anything.  JSL an entry in the jump table at the start of the bank;
+; DBR anything (preserved; set to this bank inside).  JSL an entry in the jump table at the start of the bank;
 ; each returns with RTL.  A memory operand is a 5-byte packed float at the
 ; 24-bit address in FP_PTR (not preserved).  FP_ERR is 0, or the AppleSoft
 ; error code ($45 ?OVERFLOW, $85 ?DIVISION BY ZERO) when the operation
@@ -41,6 +41,9 @@ DPFLG    = $9B          ; FIN: decimal point seen
 EXPSGN   = $9C          ; FIN: exponent sign
 SERLEN   = $A3          ; FIN: mantissa sign ($FF negative)
 FP_TXT   = $FA          ; 3 bytes: text pointer for FIN (ours; AppleSoft TXTPTR)
+FP_BUF   = $FD          ; 3 bytes: FOUT's output buffer MINUS ONE (ours; the ROM's $00FF)
+VARPNT   = $83          ; FOUT scratch
+SERPNT   = $AD          ; FOUT scratch
 LINNUM   = $50          ; GETADR's result, 2 bytes
 FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 
@@ -51,6 +54,9 @@ ERR_ILLQTY   = $35
 ; ---- entry/exit ----
 .macro  ENTER
         php
+        phb                     ; constants and tables are read with DBR = our bank
+        phk
+        plb
         rep     #$30
         .a16
         .i16
@@ -66,8 +72,19 @@ ERR_ILLQTY   = $35
 .endmacro
 
 .macro  LEAVE
+        plb
         plp
         rtl
+.endmacro
+
+; FP_PTR = a constant in this bank
+.macro  PTR     addr
+        lda     #<(addr)
+        sta     FP_PTR
+        lda     #>(addr)
+        sta     FP_PTR+1
+        lda     #^(addr)
+        sta     FP_PTR+2
 .endmacro
 
         .segment "CODE"
@@ -116,6 +133,8 @@ ERR_ILLQTY   = $35
         jmp     fp_fin             ; +$50  FAC = the number at FP_TXT+1 (CHRGET, FIN)
         nop
         jmp     fp_negop           ; +$54  FAC = -FAC              (ROM NEGOP)
+        nop
+        jmp     fp_fout            ; +$58  [FP_BUF+1..] = FAC as text, 0-terminated (ROM FOUT)
         nop
 
 ; ---- public entries ----
@@ -242,6 +261,11 @@ fp_fin:
 fp_negop:
         ENTER
         jsr     negop
+        LEAVE
+
+fp_fout:
+        ENTER
+        jsr     fout
         LEAVE
 
 ; Error: unwind to the entry's frame and return with FP_ERR set.
@@ -1152,3 +1176,203 @@ negop:  lda     FAC
         eor     #$FF
         sta     FACSIGN
 @rts:   rts
+
+; =========================================================================
+; Number -> text
+; =========================================================================
+
+; FMULT ($E97F) / FADD ($E7BE) on [FP_PTR], for internal use
+fmult:  jsr     load_arg_from_ptr
+        jmp     fmultt
+fadd:   jsr     load_arg_from_ptr
+        jmp     faddt
+
+; FADDH ($E7A0): FAC = FAC + 0.5
+faddh:  PTR     con_half
+        jmp     fadd
+
+con_99999999_9: .byte $9B, $3E, $BC, $1F, $FD
+con_999999999:  .byte $9E, $6E, $6B, $27, $FD
+con_billion:    .byte $9E, $6E, $6B, $28, $00
+con_half:       .byte $80, $00, $00, $00, $00
+; DECTBL ($EE69): -1e8, +1e7, -1e6, ... +10, -1 as 32-bit two's complement
+dectbl: .byte   $FA, $0A, $1F, $00
+        .byte   $00, $98, $96, $80
+        .byte   $FF, $F0, $BD, $C0
+        .byte   $00, $01, $86, $A0
+        .byte   $FF, $FF, $D8, $F0
+        .byte   $00, $00, $03, $E8
+        .byte   $FF, $FF, $FF, $9C
+        .byte   $00, $00, $00, $0A
+        .byte   $FF, $FF, $FF, $FF
+
+; FOUT ($ED34).  The ROM writes the text at $0100 with "sta $FF,y" (abs,Y:
+; there is no zp,Y STA) and "sta $0100..$0104,y"; here [FP_BUF],y with
+; FP_BUF standing for $00FF, so $0100+k,y is index y+k+1.
+fout:   ldy     #$01
+fout_1: lda     #$2D            ; '-'
+        dey
+        bit     FACSIGN
+        bpl     @led41
+        iny
+        sta     [FP_BUF],y
+@led41: sta     FACSIGN
+        sty     SERPNT
+        iny
+        lda     #$30
+        ldx     FAC
+        bne     @led4f
+        jmp     fout_4
+@led4f: lda     #$00
+        cpx     #$80
+        beq     @led57
+        bcs     @led60
+@led57: PTR     con_billion
+        jsr     fmult
+        lda     #$F7
+@led60: sta     INDX
+@led62: PTR     con_999999999
+        jsr     fcomp
+        beq     @led89
+        bpl     @led7f
+@led6d: PTR     con_99999999_9
+        jsr     fcomp
+        beq     @led78
+        bpl     @led86
+@led78: jsr     mul10
+        dec     INDX
+        bne     @led6d
+@led7f: jsr     div10
+        inc     INDX
+        bne     @led62
+@led86: jsr     faddh
+@led89: jsr     qint
+; FOUT.2 ($ED8C)
+        ldx     #$01
+        lda     INDX
+        clc
+        adc     #$0A
+        bmi     @led9e
+        cmp     #$0B
+        bcs     @led9f
+        adc     #$FF
+        tax
+        lda     #$02
+@led9e: sec
+@led9f: sbc     #$02
+        sta     EXPON
+        stx     INDX
+        txa
+        beq     @ledaa
+        bpl     @ledbd
+@ledaa: ldy     SERPNT
+        lda     #$2E            ; '.'
+        iny
+        sta     [FP_BUF],y
+        txa
+        beq     @ledbb
+        lda     #$30
+        iny
+        sta     [FP_BUF],y
+@ledbb: sty     SERPNT
+@ledbd: ldy     #$00
+        ldx     #$80
+@ledc1: lda     FAC+4
+        clc
+        adc     dectbl+3,y
+        sta     FAC+4
+        lda     FAC+3
+        adc     dectbl+2,y
+        sta     FAC+3
+        lda     FAC+2
+        adc     dectbl+1,y
+        sta     FAC+2
+        lda     FAC+1
+        adc     dectbl,y
+        sta     FAC+1
+        inx
+        bcs     @lede5
+        bpl     @ledc1
+        bmi     @lede7
+@lede5: bmi     @ledc1
+@lede7: txa
+        bcc     @ledee
+        eor     #$FF
+        adc     #$0A
+@ledee: adc     #$2F
+        iny
+        iny
+        iny
+        iny
+        sty     VARPNT
+        ldy     SERPNT
+        iny
+        tax
+        and     #$7F
+        sta     [FP_BUF],y
+        dec     INDX
+        bne     @lee09
+        lda     #$2E
+        iny
+        sta     [FP_BUF],y
+@lee09: sty     SERPNT
+        ldy     VARPNT
+        txa
+        eor     #$FF
+        and     #$80
+        tax
+        cpy     #$24
+        bne     @ledc1
+; FOUT.3 ($EE17): drop trailing zeros (and a bare point), then the exponent
+        ldy     SERPNT
+@lee19: lda     [FP_BUF],y
+        dey
+        cmp     #$30
+        beq     @lee19
+        cmp     #$2E
+        beq     @lee26
+        iny
+@lee26: lda     #$2B            ; '+'
+        ldx     EXPON
+        beq     fout_5
+        bpl     @lee36
+        lda     #$00
+        sec
+        sbc     EXPON
+        tax
+        lda     #$2D            ; '-'
+@lee36: iny                     ; sta $0101,y
+        iny
+        sta     [FP_BUF],y
+        lda     #$45            ; 'E'
+        dey                     ; sta $0100,y
+        sta     [FP_BUF],y
+        dey
+        txa
+        ldx     #$2F
+        sec
+@lee42: inx
+        sbc     #$0A
+        bcs     @lee42
+        adc     #$3A
+        iny                     ; sta $0103,y
+        iny
+        iny
+        iny
+        sta     [FP_BUF],y
+        txa
+        dey                     ; sta $0102,y
+        sta     [FP_BUF],y
+        lda     #$00
+        iny                     ; sta $0104,y
+        iny
+        sta     [FP_BUF],y
+        bra     fout_6          ; ROM: beq FOUT.6 right after lda #0
+; FOUT.4 ($EE57), FOUT.5 ($EE5A), FOUT.6 ($EE5F)
+fout_4: sta     [FP_BUF],y      ; "0" for zero
+fout_5: lda     #$00
+        iny                     ; sta $0100,y
+        sta     [FP_BUF],y
+fout_6: lda     #$00
+        ldy     #$01
+        rts

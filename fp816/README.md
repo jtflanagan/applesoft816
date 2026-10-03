@@ -30,7 +30,8 @@ compare each fail it.
 | FCOMP, SGN, ABS, MUL10, DIV10 | ported, matches |
 | INT, QINT, AYINT, GIVAYF, CONINT, GETADR (incl. ?ILLEGAL QUANTITY) | ported, matches |
 | FIN (with CHRGET/CHRGOT over a long text pointer), NEGOP | ported, matches (incl. ?OVERFLOW) |
-| FOUT, functions (SQR ^ LOG EXP SIN COS TAN ATN RND) | to do |
+| FOUT (number to text, into a caller's buffer) | ported, matches |
+| functions: SQR ^ LOG EXP SIN COS TAN ATN RND | to do |
 
 Two places where a transliteration would be wrong on the 65816: FDIV's
 `sta $65,x` (X = $FD..$01) wraps in zero page on the 6502 but not in
@@ -38,6 +39,11 @@ native-mode dp,X, so it stores through a long pointer to the direct page;
 and FADD's `lda $04,y` is absolute,Y (there is no zp,Y LDA), which ignores
 D, so its two cases are written out.  ADD.EXPONENTS's `.byte $2C` skip (a
 stray BIT read that can land on `$C010`) is a plain branch.
+
+Every entry sets DBR to the library's bank (restored on exit, also after
+an error), so constants and FOUT's decimal table are read absolute as in
+the ROM.  FOUT writes where the ROM wrote `$0100` through a long pointer
+(`FP_BUF`, standing for the ROM's `$00FF`).
 
 AYINT's -32768 is the ROM's constant at `$E0FE`, whose last byte is the
 `$20` of the following JSR - a hair below -32768; the port keeps it.
