@@ -35,6 +35,12 @@ FP_RES   = $F3          ; byte result (ours)
 FP_DPP   = $F4          ; 3 bytes: long pointer to this direct page (ours)
 
 CHARAC   = $0D          ; INT leaves FAC's low mantissa byte here
+INDX     = $99          ; FIN: digits after the point
+EXPON    = $9A          ; FIN: decimal exponent
+DPFLG    = $9B          ; FIN: decimal point seen
+EXPSGN   = $9C          ; FIN: exponent sign
+SERLEN   = $A3          ; FIN: mantissa sign ($FF negative)
+FP_TXT   = $FA          ; 3 bytes: text pointer for FIN (ours; AppleSoft TXTPTR)
 LINNUM   = $50          ; GETADR's result, 2 bytes
 FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 
@@ -106,6 +112,10 @@ ERR_ILLQTY   = $35
         jmp     fp_conint          ; +$48  FP_RES = byte 0-255 or ?ILLEGAL QUANTITY
         nop
         jmp     fp_getadr          ; +$4C  LINNUM = 16-bit address or ?ILLEGAL QUANTITY
+        nop
+        jmp     fp_fin             ; +$50  FAC = the number at FP_TXT+1 (CHRGET, FIN)
+        nop
+        jmp     fp_negop           ; +$54  FAC = -FAC              (ROM NEGOP)
         nop
 
 ; ---- public entries ----
@@ -219,6 +229,19 @@ fp_conint:
 fp_getadr:
         ENTER
         jsr     getadr
+        LEAVE
+
+; FIN as AppleSoft calls it: CHRGET to the first character, then FIN.
+; FP_TXT is left on the character that ended the number.
+fp_fin:
+        ENTER
+        jsr     chrget
+        jsr     fin
+        LEAVE
+
+fp_negop:
+        ENTER
+        jsr     negop
         LEAVE
 
 ; Error: unwind to the entry's frame and return with FP_ERR set.
@@ -995,3 +1018,137 @@ getadr: lda     FAC
         sty     LINNUM
         sta     LINNUM+1
         rts
+
+; =========================================================================
+; Text -> number
+; =========================================================================
+
+; CHRGET / CHRGOT ($00B1 / $00B7, copied from GENERIC.CHRGET $F10B): the
+; same instructions over a long text pointer, so A and the flags are the
+; ROM's: spaces skipped, C clear only for '0'-'9', Z set for 0 and ':'.
+; The pointer carries into its middle byte, not the bank, as TXTPTR does.
+chrget: inc     FP_TXT
+        bne     chrgot
+        inc     FP_TXT+1
+chrgot: lda     [FP_TXT]
+        cmp     #$3A
+        bcs     @rts
+        cmp     #$20
+        beq     chrget
+        sec
+        sbc     #$30
+        sec
+        sbc     #$D0
+@rts:   rts
+
+; FIN ($EC4A): A = the first character, C clear if a digit (from CHRGET)
+fin:    ldy     #$00
+        ldx     #$0A
+@lec4e: sty     INDX,x
+        dex
+        bpl     @lec4e
+        bcc     fin_2
+        cmp     #$2D            ; '-'
+        bne     @lec5d
+        stx     SERLEN
+        beq     fin_1
+@lec5d: cmp     #$2B            ; '+'
+        bne     fin_3
+fin_1:  jsr     chrget
+fin_2:  bcc     fin_9
+fin_3:  cmp     #$2E            ; '.'
+        beq     fin_10
+        cmp     #$45            ; 'E'
+        bne     fin_7
+        jsr     chrget
+        bcc     fin_5
+        cmp     #$C9            ; token '-'
+        beq     @lec85
+        cmp     #$2D            ; '-'
+        beq     @lec85
+        cmp     #$C8            ; token '+'
+        beq     fin_4
+        cmp     #$2B            ; '+'
+        beq     fin_4
+        bne     fin_6
+@lec85: ror     EXPSGN
+fin_4:  jsr     chrget
+fin_5:  bcc     getexp
+fin_6:  bit     EXPSGN
+        bpl     fin_7
+        lda     #$00
+        sec
+        sbc     EXPON
+        jmp     fin_8
+
+fin_10: ror     DPFLG
+        bit     DPFLG
+        bvc     fin_1
+fin_7:  lda     EXPON
+fin_8:  sec
+        sbc     INDX
+        sta     EXPON
+        beq     @lecb9
+        bpl     @lecb2
+@leca9: jsr     div10
+        inc     EXPON
+        bne     @leca9
+        beq     @lecb9
+@lecb2: jsr     mul10
+        dec     EXPON
+        bne     @lecb2
+@lecb9: lda     SERLEN
+        bmi     @lecbe
+        rts
+@lecbe: jmp     negop
+
+fin_9:  pha
+        bit     DPFLG
+        bpl     @lecc8
+        inc     INDX
+@lecc8: jsr     mul10
+        pla
+        sec
+        sbc     #$30
+        jsr     addacc
+        jmp     fin_1
+
+; ADDACC ($ECD5): FAC = FAC + A (a digit)
+addacc: pha
+        jsr     copy_fac_to_arg_rounded
+        pla
+        jsr     float
+        lda     ARGSIGN
+        eor     FACSIGN
+        sta     SGNCPR
+        ldx     FAC
+        jmp     faddt
+
+; GETEXP ($ECE8)
+getexp: lda     EXPON
+        cmp     #$0A
+        bcc     @lecf7
+        lda     #$64
+        bit     EXPSGN
+        bmi     @led05
+        jmp     overflow
+@lecf7: asl     a
+        asl     a
+        clc
+        adc     EXPON
+        asl     a
+        clc
+        ldy     #$00
+        adc     [FP_TXT],y
+        sec
+        sbc     #$30
+@led05: sta     EXPON
+        jmp     fin_4
+
+; NEGOP ($EED0)
+negop:  lda     FAC
+        beq     @rts
+        lda     FACSIGN
+        eor     #$FF
+        sta     FACSIGN
+@rts:   rts

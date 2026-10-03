@@ -29,7 +29,8 @@ compare each fail it.
 | FMULT / FDIV (incl. ?OVERFLOW, ?DIVISION BY ZERO) | ported, matches |
 | FCOMP, SGN, ABS, MUL10, DIV10 | ported, matches |
 | INT, QINT, AYINT, GIVAYF, CONINT, GETADR (incl. ?ILLEGAL QUANTITY) | ported, matches |
-| FIN, FOUT, functions (SQR ^ LOG EXP SIN COS TAN ATN RND) | to do |
+| FIN (with CHRGET/CHRGOT over a long text pointer), NEGOP | ported, matches (incl. ?OVERFLOW) |
+| FOUT, functions (SQR ^ LOG EXP SIN COS TAN ATN RND) | to do |
 
 Two places where a transliteration would be wrong on the 65816: FDIV's
 `sta $65,x` (X = $FD..$01) wraps in zero page on the 6502 but not in

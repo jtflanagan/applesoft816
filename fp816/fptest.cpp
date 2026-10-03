@@ -29,15 +29,16 @@ constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R
                    R_FMULT = 0xE97F, R_FDIV = 0xEA66, R_FCOMP = 0xEBB2, R_MUL10 = 0xEA39,
                    R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_INT = 0xEC23, R_QINT = 0xEBF2,
                    R_AYINT = 0xE10C, R_GIVAYF = 0xE2F2, R_CONINT = 0xE6FB, R_GETADR = 0xE752,
-                   R_ERROR = 0xD412, R_CHRGOT = 0x00B7;
+                   R_FIN = 0xEC4A, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
 // fp816 jump table
 constexpr uint32_t LIB = 0xF20000;
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
                    F_SUB = LIB + 0x10, F_MUL = LIB + 0x1C, F_DIV = LIB + 0x20, F_CMP = LIB + 0x24,
                    F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34,
                    F_INT = LIB + 0x38, F_QINT = LIB + 0x3C, F_AYINT = LIB + 0x40, F_GIVAYF = LIB + 0x44,
-                   F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C;
-constexpr int LINNUM = 0x50, FP_INT = 0xF8;
+                   F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C, F_FIN = LIB + 0x50;
+constexpr int LINNUM = 0x50, FP_INT = 0xF8, FP_TXT = 0xFA, TXTPTR = 0xB8;
+constexpr uint32_t TEXT = 0x000400; // number text for FIN
 
 // how a ROM routine takes its operand
 enum Conv { AY, XY, NONE, INT16 }; // INT16: A = high, Y = low (operand bytes 3, 4)
@@ -139,6 +140,7 @@ void packed_near(uint8_t p[5], Fac& f)
 struct Machine {
   Cpu816 cpu;
   std::vector<uint8_t> rom; // 256K
+  bool stop_at_chrgot = false; // CONINT ends JMP CHRGOT: treat as its return
   explicit Machine(const std::vector<uint8_t>& r) : rom(r)
   {
     memcpy(&cpu.mem[0xFC0000], rom.data(), rom.size()); // banks $FC-$FF
@@ -180,7 +182,7 @@ struct Machine {
         err = cpu.x() & 0xFF;
         return true;
       }
-      if (rom_mode && cpu.pc() == R_CHRGOT) return true; // CONINT's tail: JMP CHRGOT
+      if (rom_mode && stop_at_chrgot && cpu.pc() == R_CHRGOT) return true; // CONINT's tail
       cpu.step();
       if (cpu.halted()) return true;
     }
@@ -243,6 +245,37 @@ struct Machine {
   }
 };
 
+// a number as AppleSoft might meet it: in a program (tokens for the exponent
+// sign) or typed (VAL, INPUT), with spaces, leading zeros, odd points
+std::string random_number_text()
+{
+  std::string t;
+  auto digits = [&](int n) {
+    for (int i = 0; i < n; i++) t += char('0' + (rndn(4) == 0 ? 0 : rndn(10)));
+  };
+  if (rndn(4) == 0) t += ' ';
+  if (rndn(4) == 0) t += '-';
+  else if (rndn(10) == 0) t += '+';
+  digits(int(rndn(13)));
+  if (rndn(8) == 0) t += ' ';
+  if (rndn(5) < 2) {
+    t += '.';
+    digits(int(rndn(13)));
+    if (rndn(20) == 0) t += '.', digits(int(rndn(4)));
+  }
+  if (rndn(10) < 3) {
+    t += 'E';
+    static const char signs[] = {'-', '+', char(0xC9), char(0xC8), 0, 0};
+    if (char c = signs[rndn(6)]) t += c;
+    if (rndn(10) == 0) t += ' ';
+    digits(int(rndn(4)));
+  }
+  static const char ends[] = {0, ':', ',', ')', 'X', ' ', ';'};
+  t += ends[rndn(7)];
+  t += char(0);
+  return t;
+}
+
 void show(const char* tag, const Fac& f)
 {
   printf("  %s exp=%02X m=%02X%02X%02X%02X sign=%02X ext=%02X\n", tag, f.exp, f.m[0], f.m[1], f.m[2], f.m[3],
@@ -289,6 +322,7 @@ int main(int argc, char** argv)
   };
   auto both = [&](uint32_t ours, uint16_t rom, Conv conv, Res res = R_NONE) {
     return [&m, ours, rom, conv, res](bool o, const Fac& f, const uint8_t* p) {
+      m.stop_at_chrgot = rom == R_CONINT;
       return o ? m.lib_call(ours, f, p, conv, res) : m.rom_call(rom, f, p, conv, res);
     };
   };
@@ -321,6 +355,56 @@ int main(int argc, char** argv)
   }
 
   int failed_tests = 0;
+
+  // FIN: number text -> FAC, entered the way AppleSoft does (CHRGET, FIN)
+  if (!getenv("FPTEST_ONLY") || strstr("FIN", getenv("FPTEST_ONLY"))) {
+    long bad = 0, errs = 0;
+    for (long i = 0; i < cases; i++) {
+      std::string txt = random_number_text();
+      Outcome want{}, got{};
+      for (int ours = 0; ours < 2; ours++) {
+        Cpu816& c = m.cpu;
+        memcpy(&c.mem[TEXT], txt.data(), txt.size());
+        Outcome& o = ours ? got : want;
+        c.reset_regs();
+        if (!ours) {
+          memset(&c.mem[0], 0, 0x100);
+          for (int k = 0; k < 24; k++) c.mem[0xB1 + k] = c.mem[0xFF0000 + R_CHRGET_TEMPLATE + k];
+          c.mem[TXTPTR] = uint8_t(TEXT - 1), c.mem[TXTPTR + 1] = uint8_t((TEXT - 1) >> 8);
+          uint8_t stub[] = {0x20, 0xB1, 0x00, 0x20, uint8_t(R_FIN), uint8_t(R_FIN >> 8), 0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          c.set_regs(0, 0, 0, 0x01FF, 0, 0, 0x34, true);
+          if (!m.run(STUB, true, o.err)) o.err = -1;
+          o.fac = m.get_fac(0);
+          o.res = c.mem[TXTPTR] | c.mem[TXTPTR + 1] << 8;
+        } else {
+          memset(&c.mem[DP_OURS], 0, 0x100);
+          c.mem[DP_OURS + FP_TXT] = uint8_t(TEXT - 1);
+          c.mem[DP_OURS + FP_TXT + 1] = uint8_t((TEXT - 1) >> 8);
+          c.mem[DP_OURS + FP_TXT + 2] = uint8_t((TEXT - 1) >> 16);
+          uint8_t stub[] = {0x22, uint8_t(F_FIN), uint8_t(F_FIN >> 8), uint8_t(F_FIN >> 16), 0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          c.set_regs(0, 0, 0, 0x01FF, DP_OURS, 0, 0x30, false);
+          if (!m.run(STUB, false, o.err)) o.err = -1;
+          else o.err = c.mem[DP_OURS + FP_ERR];
+          o.fac = m.get_fac(DP_OURS);
+          o.res = c.mem[DP_OURS + FP_TXT] | c.mem[DP_OURS + FP_TXT + 1] << 8;
+        }
+        if (o.err) o.res = 0, o.fac = Fac{}; // FAC/pointer undefined after an error
+      }
+      errs += want.err != 0;
+      if (!(want == got) && ++bad <= 4) {
+        printf("FIN: case %ld differs, text \"", i);
+        for (char ch : txt) if (ch) printf(uint8_t(ch) >= 0x80 ? "<%02X>" : "%c", uint8_t(ch));
+        printf("\"\n");
+        show("ROM", want);
+        show("fp ", got);
+      }
+    }
+    printf("%-20s %8ld cases  %6ld ROM errors  %ld differ\n", "FIN text->FAC", cases, errs, bad);
+    failed_tests += bad != 0;
+  }
+
   for (auto& t : tests) {
     long bad = 0, errs = 0;
     for (long i = 0; i < cases; i++) {
