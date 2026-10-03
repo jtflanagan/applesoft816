@@ -1,38 +1,22 @@
 /* shell.c - the command line: BASIC.SYSTEM's place (docs/M5.md).
  *
- * For now: RUN name (or -name) loads a tokenized program, compiles it -
- * timed, the number shown - and runs it; COMPILE name stops after the
- * compile; CAT/CATALOG; BYE.  Immediate
- * statements and the line editor come next.
+ * A line typed is BASIC.SYSTEM's command (dos.c) if it is one, else
+ * AppleSoft's: a numbered line goes into the program (the text bank),
+ * LIST/NEW/RUN are done here, anything else is a direct line, compiled
+ * against the program and run by the VM.  RUN compiles the program (or
+ * takes it from the bytecode cache) and runs it.  COMPILE name is ours: a
+ * timed compile, not run.
  *
- * Everything reaches the machine through glue.s: the ROM's COUT/GETLN in
- * emulation mode, the MLI with its parameters in bank 0 (res.h), the VM.
+ * Everything reaches the machine through machine.c and glue.s: the ROM's
+ * COUT/GETLN in emulation mode, the MLI with its parameters in bank 0
+ * (res.h), the VM.
  */
 #include <stdint.h>
 #include <string.h>
 
+#include "dos.h"
+#include "machine.h"
 #include "parse.h"
-#include "res.h"
-#include "shell.h"
-
-/* the ROM */
-#define COUT 0xFDED
-#define GETLN 0xFD6A
-#define HOME 0xFC58
-#define CH 0x24
-#define PROMPT 0x33
-#define INBUF 0x0200
-
-/* the MLI */
-#define MLI_CREATE 0xC0
-#define MLI_DESTROY 0xC1
-#define MLI_WRITE 0xCB
-#define MLI_GET_FILE_INFO 0xC4
-#define MLI_GET_PREFIX 0xC7
-#define MLI_OPEN 0xC8
-#define MLI_READ 0xCA
-#define MLI_CLOSE 0xCC
-#define MLI_EOF 0x4C
 
 /* the video counter: $C02E is the vertical count over two, $7D-$FF (262
  * lines a frame, 15734 a second) */
@@ -41,11 +25,11 @@
 /* the VM's direct page (vm/vm.s) and image header */
 #define VM_DENTRY 0xE6
 #define VM_FRESH 0xE8
+#define VM_ONERR 0xE4
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
 static uint8_t raw[256];             /* the line typed, 7-bit, 0 after (INLIN's) */
-static uint8_t line[256];            /* the same, upper case: the shell's commands */
 static uint8_t len;
 
 /* the program in the text bank: $0801 to prog_end (after its 00 00) */
@@ -59,137 +43,28 @@ static uint16_t src_len, src_hash;
 static uint16_t vm_print;           /* the VM image's hash: bytecode names its handlers */
 static uint16_t prog_start;         /* where the VM image ends and the program begins */
 
-/* ---- bank 0 ---- */
-static void to0(uint16_t a, const void *src, uint16_t n)
+static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
+
+/* ---- the program from a file, to a file ---- */
+
+static void hash_source(void)
 {
-  xfer_far = (uint32_t)a - 1, xfer_near = (uint16_t)((uint16_t)src - 1), xfer_n = n;
-  far_out();
-}
-static void from0(void *dst, uint16_t a, uint16_t n)
-{
-  xfer_far = (uint32_t)a - 1, xfer_near = (uint16_t)((uint16_t)dst - 1), xfer_n = n;
-  far_in();
+  src_len = (uint16_t)(prog_end - 0x0801);
+  hash_acc = 0;
+  xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
+  if (src_len) far_hash();
+  src_hash = hash_acc;
 }
 
-/* ---- output, through the ROM's COUT ---- */
-static void cout(uint8_t c)
-{
-  poke0(RES_A, (uint8_t)(c | 0x80));
-  rom_call(COUT);
-}
-static void print(const char *s)
-{
-  while (*s) cout((uint8_t)*s++);
-}
-static void crout(void) { cout('\r'); }
-static void print_u(uint32_t v)
-{
-  char b[11];
-  int i = 10;
-  b[i] = 0;
-  do b[--i] = (char)('0' + v % 10); while ((v /= 10) != 0);
-  print(b + i);
-}
-/* v/100 as d.dd */
-static void print_centi(uint32_t v)
-{
-  print_u(v / 100);
-  cout('.');
-  cout((uint8_t)('0' + v / 10 % 10));
-  cout((uint8_t)('0' + v % 10));
-}
-
-/* ---- the MLI ---- */
-static uint8_t mli(uint8_t cmd, void *parms, uint8_t n)
-{
-  uint8_t e;
-  to0(RES_PARMS, parms, n);
-  e = mli_call(cmd);
-  from0(parms, RES_PARMS, n);
-  return e;
-}
-
-/* AppleSoft's own: "?SYNTAX ERROR" and the bell */
-static void as_error(const char *m)
-{
-  crout();
-  cout('?');
-  print(m);
-  print(" ERROR");
-  cout(7);
-  crout();
-}
-
-static void error(uint8_t e)
-{
-  crout();
-  switch (e) {
-  case 0x40: case 0x44: case 0x45: print("PATH NOT FOUND"); break;
-  case 0x46: print("FILE NOT FOUND"); break;
-  case 0x27: case 0x28: case 0x2F: print("I/O ERROR"); break;
-  case 0x2B: print("WRITE PROTECTED"); break;
-  case 0x4D: case 0x4C: print("RANGE ERROR"); break;
-  case 0x4A: case 0x52: print("FILE TYPE MISMATCH"); break;
-  case 0x80: print("SYNTAX ERROR"); break;
-  case 0x81: print("PROGRAM TOO LARGE"); break;
-  default: print("MLI ERROR $"); cout("0123456789ABCDEF"[e >> 4]); cout("0123456789ABCDEF"[e & 15]); break;
-  }
-  crout();
-}
-
-/* a pathname (length first) into RES_PATH */
-static void put_path(const uint8_t *p)
-{
-  to0(RES_PATH, p, (uint16_t)(p[0] + 1));
-}
-
-/* the name at line[i] (to the end) into path and RES_PATH; 0 if there is none */
-static int set_path(uint8_t i)
-{
-  uint8_t n = 0;
-  while (i < len && line[i] == ' ') i++;
-  while (i < len && n < 64 && line[i] != ' ' && line[i] != ',') path[1 + n++] = line[i++];
-  if (!n) return 0;
-  path[0] = n;
-  put_path(path);
-  return 1;
-}
-
-typedef struct { uint8_t n; uint16_t path, buf; uint8_t ref; } OpenParms;
-typedef struct { uint8_t n, ref; uint16_t buf, req, trans; } ReadParms;
-typedef struct { uint8_t n, ref; } CloseParms;
-typedef struct { uint8_t n, ref; uint16_t buf, req, trans; } WriteParms;
-typedef struct { uint8_t n; uint16_t path; } PathParms;
-typedef struct {
-  uint8_t n; uint16_t path; uint8_t access, type; uint16_t aux; uint8_t storage; uint16_t cdate, ctime;
-} CreateParms;
-typedef struct {
-  uint8_t n; uint16_t path; uint8_t access, type; uint16_t aux; uint8_t storage;
-  uint16_t blocks, mdate, mtime, cdate, ctime;
-} InfoParms;
-
-static uint8_t open_path(uint8_t *ref)
-{
-  OpenParms o = {3, RES_PATH, RES_FBUF, 0};
-  uint8_t e = mli(MLI_OPEN, &o, sizeof o);
-  *ref = o.ref;
-  return e;
-}
-static void close_ref(uint8_t ref)
-{
-  CloseParms c = {1, ref};
-  mli(MLI_CLOSE, &c, sizeof c);
-}
-
-/* ---- RUN ---- */
-
-/* the program at RES_PATH into the text bank at $0801; 0 or an error */
-static uint8_t load_program(void)
+/* LOAD: the BAS file at p into the text bank at $0801; an MLI error (or
+ * $4A for the file's type, $4D for its size) */
+uint8_t prog_load(const uint8_t *p)
 {
   InfoParms info;
   ReadParms r;
   uint8_t e, ref, z[2] = {0, 0};
   uint16_t at = 0x0801;
+  put_path(p);
   memset(&info, 0, sizeof info);
   info.n = 10, info.path = RES_PATH;
   if ((e = mli(MLI_GET_FILE_INFO, &info, sizeof info)) != 0) return e;
@@ -201,41 +76,73 @@ static uint8_t load_program(void)
     e = mli(MLI_READ, &r, sizeof r);
     if (e == MLI_EOF || (!e && !r.trans)) { e = 0; break; }
     if (e) break;
-    if ((uint32_t)at + r.trans > 0xFFF0) { e = 0x81; break; }
+    if ((uint32_t)at + r.trans > 0xFFF0) { e = 0x4D; break; }
     xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (text_base | at) - 1, xfer_n = r.trans;
     far_move();
     at = (uint16_t)(at + r.trans);
   }
   close_ref(ref);
-  if (e) return e;
-  /* the end of the program: two zero bytes after it, whatever the file had;
-   * the links made for here, wherever it was saved from (FIX.LINKS) */
-  xfer_far = (text_base | at) - 1, xfer_near = (uint16_t)((uint16_t)z - 1), xfer_n = 2;
-  far_out();
+  if (e) {
+    static const uint8_t none[2] = {0, 0};
+    to_text(0x0801, none, 2);              /* (half a program is none) */
+    prog_end = 0x0803, compiled = 0, from_file = 0;
+    return e;
+  }
+  /* the end: two zero bytes after it, whatever the file had; the links
+   * made for here, wherever it was saved from (FIX.LINKS) */
+  to_text(at, z, 2);
   prog_end = (uint16_t)(fix_links() + 2);
+  memcpy(path, p, (size_t)p[0] + 1);
   compiled = 0, from_file = 1;
-  src_len = (uint16_t)(prog_end - 0x0801);
-  hash_acc = 0;
-  xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
-  if (src_len) far_hash();
-  src_hash = hash_acc;
+  hash_source();
   return 0;
+}
+
+/* SAVE: the program as a BAS file at p (made anew) */
+uint8_t prog_save(const uint8_t *p)
+{
+  CreateParms c;
+  PathParms d;
+  ReadParms w;
+  uint8_t e, ref;
+  uint16_t at, n;
+  put_path(p);
+  d.n = 1, d.path = RES_PATH;
+  mli(MLI_DESTROY, &d, sizeof d);
+  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0xFC, c.aux = 0x0801, c.storage = 0x01;
+  p8_now(&c.cdate, &c.ctime);
+  if ((e = mli(MLI_CREATE, &c, sizeof c)) != 0) return e;
+  if ((e = open_path(&ref)) != 0) return e;
+  w.n = 4, w.ref = ref, w.buf = RES_IOBUF;
+  for (at = 0x0801; at < prog_end && !e; at = (uint16_t)(at + n)) {
+    n = (uint16_t)(prog_end - at) < RES_IOSIZE ? (uint16_t)(prog_end - at) : RES_IOSIZE;
+    xfer_far = (text_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = n;
+    far_move();
+    w.req = n;
+    e = mli(MLI_WRITE, &w, sizeof w);
+  }
+  close_ref(ref);
+  if (!e) {                               /* it is that file now */
+    memcpy(path, p, (size_t)p[0] + 1);
+    hash_source();
+    from_file = 1;
+  }
+  return e;
 }
 
 /* ---- the bytecode cache: DIR/AS816.CACHE/NAME beside DIR/NAME (ProDOS
  * names leave no room for a suffix), the VM bank's image of the compiled
  * program from prog_start to the stacks, after a header that says which
- * source and which VM it was made from ---- */
+ * source and which VM it was made from, then the compiler's tables ---- */
 typedef struct {
   uint8_t magic[4];                 /* "A816" */
-  uint8_t kind, version;            /* 'C', 1 */
+  uint8_t kind, version;            /* 'C', CACHE_VERSION */
   uint16_t vm_print, src_len, src_hash, start, len, lines, code;
 } CacheHdr;
 
 #define CACHE_DIR "AS816.CACHE"
 #define CACHE_VERSION 3             /* 2: the compiler's tables after the image; 3: salist_cap */
 
-/* the compiler's tables to and from the open cache, through the I/O buffer */
 static uint8_t cache_ref, cache_err;
 static void cache_io(void *ctx, void *p, uint16_t n)
 {
@@ -276,16 +183,6 @@ static int cache_path(uint8_t *out, int dir_only)
   return 1;
 }
 
-static uint16_t vm_read16(uint16_t a)
-{
-  uint16_t v;
-  xfer_far = (vm_base | a) - 1, xfer_near = (uint16_t)((uint16_t)&v - 1), xfer_n = 2;
-  far_in();
-  return v;
-}
-
-/* the compiled program from the cache, if it is this source's and this
- * VM's: 1 */
 static int cache_load(CompileStats *st)
 {
   uint8_t cp[65], ref, e;
@@ -329,14 +226,15 @@ static void cache_save(const CompileStats *st)
   CacheHdr h;
   CreateParms c;
   PathParms d;
-  WriteParms w;
+  ReadParms w;
   uint16_t end = vm_read16((uint16_t)(prog_start + 2)), at, n;   /* the header's fstack */
   memcpy(h.magic, "A816", 4);
   h.kind = 'C', h.version = CACHE_VERSION, h.vm_print = vm_print, h.src_len = src_len, h.src_hash = src_hash;
   h.start = prog_start, h.len = (uint16_t)(end - prog_start), h.lines = st->lines, h.code = st->code_size;
   if (!cache_path(cp, 1)) return;
   put_path(cp);
-  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0x0F, c.aux = 0, c.storage = 0x0D, c.cdate = c.ctime = 0;
+  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0x0F, c.aux = 0, c.storage = 0x0D;
+  p8_now(&c.cdate, &c.ctime);
   mli(MLI_CREATE, &c, sizeof c);              /* (there already, mostly) */
   cache_path(cp, 0);
   put_path(cp);
@@ -399,6 +297,9 @@ static int compile_current(void)
   e = (uint8_t)compile(&st, clk_poll);
   clk_poll(0);
   if (e) { as_error("OUT OF MEMORY"); return 1; }
+  compiled = 1;
+  poke0((uint16_t)(vm_dp + VM_FRESH), 1);
+  if (!st.lines) return 0;                    /* (no program: nothing to say) */
   crout();
   print_u(st.lines);
   print(" LINES, ");
@@ -408,44 +309,75 @@ static int compile_current(void)
   print(" S");
   crout();
   if (from_file) cache_save(&st);
-  compiled = 1;
-  poke0((uint16_t)(vm_dp + VM_FRESH), 1);
   return 0;
 }
 
-static uint8_t pending;               /* a CHR$(4) RUN (1) or LOAD (2) for after the VM */
-static int word(const char *w, uint8_t *after);
-static int is_digit(uint8_t c);
+/* ---- running ---- */
 
-/* after the VM: what a program's CHR$(4) RUN or LOAD asked for */
+/* what a program's CHR$(4) asked for, done once the VM is back: 1 RUN,
+ * 2 LOAD, 3 BYE */
+static uint8_t pending, pending_path[65];
+static int32_t pending_line;
+static int bye;
+
+void prog_pending(uint8_t what, const uint8_t *p, int32_t line)
+{
+  pending = what, pending_line = line;
+  if (p) memcpy(pending_path, p, (size_t)p[0] + 1);
+}
+
+static void direct_tokens(void);
+
+/* RUN [n] of the program in memory */
+static void run_from(int32_t line)
+{
+  if (line < 0) {
+    if (!compile_current()) vm_call(0);
+    return;
+  }
+  /* RUN n: a direct line of its own */
+  {
+    uint8_t k = 1;
+    char d[6];
+    int8_t j = 0;
+    raw[0] = 0xAC;                        /* RUN */
+    do d[j++] = (char)('0' + line % 10); while ((line /= 10) != 0);
+    while (j) raw[k++] = (uint8_t)d[--j];
+    raw[k] = 0;
+    direct_tokens();
+  }
+}
+
 static void after_vm(void)
 {
   uint8_t what, e;
   while ((what = pending) != 0) {
     pending = 0;
-    if ((e = load_program()) != 0) { error(e); return; }
-    if (what == 1 && !compile_current()) vm_call(0);
+    if (what == 3) { bye = 1; return; }
+    if ((e = prog_load(pending_path)) != 0) { dos_message(dos_error(e)); return; }
+    if (what == 1) run_from(pending_line);
   }
 }
 
-static void run_current(void)
+void prog_run(int32_t line)
 {
-  if (!compile_current()) vm_call(0);
+  run_from(line);
   after_vm();
 }
 
-/* ---- the program in memory: lines in, out, listed ---- */
-static void to_text(uint16_t a, const void *src, uint16_t n)
+/* the direct line in raw (tokens): compiled against the program - which is
+ * compiled first, if it has to be - and run with its variables */
+static void direct_tokens(void)
 {
-  xfer_far = (text_base | a) - 1, xfer_near = (uint16_t)((uint16_t)src - 1), xfer_n = n;
-  far_out();
-}
-static void from_text(void *dst, uint16_t a, uint16_t n)
-{
-  xfer_far = (text_base | a) - 1, xfer_near = (uint16_t)((uint16_t)dst - 1), xfer_n = n;
-  far_in();
+  uint16_t entry;
+  if (compile_current()) return;
+  if (compile_direct(raw, &entry)) { as_error("OUT OF MEMORY"); return; }
+  poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)entry);
+  poke0((uint16_t)(vm_dp + VM_DENTRY + 1), (uint8_t)(entry >> 8));
+  vm_call(vm_read16(VMH_DIRECT));
 }
 
+/* ---- the program in memory: lines in, out, listed ---- */
 static void new_program(void)
 {
   static const uint8_t z[2] = {0, 0};
@@ -471,8 +403,9 @@ static int find_line(uint16_t num, uint16_t *at, uint16_t *link)
 
 /* a numbered line typed: tok (n bytes, its 0 last) in place of line num's;
  * n = 1 (nothing but the 0) takes the line out */
-static void edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
+static int edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
 {
+  int said = 0;
   uint16_t at, link, size = (uint16_t)(4 + n);
   uint8_t h[4];
   if (find_line(num, &at, &link)) {
@@ -481,7 +414,7 @@ static void edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
     prog_end = (uint16_t)(prog_end - (link - at));
   }
   if (n > 1) {
-    if ((uint32_t)prog_end + size > 0xFF00) { as_error("OUT OF MEMORY"); n = 0; }
+    if ((uint32_t)prog_end + size > 0xFF00) { as_error("OUT OF MEMORY"); said = 1; }
     else {
       xfer_far = (text_base | at) - 1, xfer_far2 = (text_base | (uint16_t)(at + size)) - 1;
       xfer_n = (uint16_t)(prog_end - at);
@@ -494,6 +427,7 @@ static void edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
   }
   prog_end = (uint16_t)(fix_links() + 2);
   compiled = 0, from_file = 0;
+  return said;
 }
 
 /* LIST ($D6A5 on), as the GS ROM does it: CR, a space, the number, then
@@ -552,142 +486,39 @@ static void list(uint16_t from, uint16_t to)
   crout();
 }
 
-/* SAVE: the program as a BAS file at RES_PATH */
-static uint8_t save_program(void)
+/* ---- CHR$(4) commands from a running program: vm_command, called by the
+ * VM (glue.s cmd_entry) with the command in its buffer.  0: go on; 1: the
+ * program stops (an error said, or a RUN/LOAD/BYE pending); else an error
+ * number for ONERR. ---- */
+uint8_t cmd_answer;
+
+static int onerr(void)
 {
-  CreateParms c;
-  PathParms d;
-  WriteParms w;
-  uint8_t e, ref;
-  uint16_t at, n;
-  d.n = 1, d.path = RES_PATH;
-  mli(MLI_DESTROY, &d, sizeof d);
-  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0xFC, c.aux = 0x0801, c.storage = 0x01, c.cdate = c.ctime = 0;
-  if ((e = mli(MLI_CREATE, &c, sizeof c)) != 0) return e;
-  if ((e = open_path(&ref)) != 0) return e;
-  w.n = 4, w.ref = ref, w.buf = RES_IOBUF;
-  for (at = 0x0801; at < prog_end && !e; at = (uint16_t)(at + n)) {
-    n = (uint16_t)(prog_end - at) < RES_IOSIZE ? (uint16_t)(prog_end - at) : RES_IOSIZE;
-    xfer_far = (text_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = n;
-    far_move();
-    w.req = n;
-    e = mli(MLI_WRITE, &w, sizeof w);
-  }
-  close_ref(ref);
-  if (!e) {                           /* it is that file now */
-    src_len = (uint16_t)(prog_end - 0x0801);
-    hash_acc = 0;
-    xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
-    far_hash();
-    src_hash = hash_acc;
-    from_file = 1;
-  }
-  return e;
+  return (peek0(0xD8) & 0x80) && (peek0((uint16_t)(vm_dp + VM_ONERR)) | peek0((uint16_t)(vm_dp + VM_ONERR + 1)));
 }
 
-/* ---- CATALOG ---- */
-static const char *type_name(uint8_t t)
+uint8_t vm_command(void)
 {
-  switch (t) {
-  case 0x04: return "TXT";
-  case 0x06: return "BIN";
-  case 0x0F: return "DIR";
-  case 0xFC: return "BAS";
-  case 0xFF: return "SYS";
-  case 0xFA: return "INT";
-  case 0xFB: return "IVR";
+  uint8_t n, k, quiet = (uint8_t)onerr();
+  uint16_t b = vm_read16(VMH_CMDBUF);
+  xfer_far = (vm_base | b) - 1, xfer_near = (uint16_t)((uint16_t)&n - 1), xfer_n = 1;
+  far_in();
+  if (!n) return 0;
+  xfer_far = (vm_base | (uint16_t)(b + 1)) - 1, xfer_near = (uint16_t)((uint16_t)raw - 1), xfer_n = n;
+  far_in();
+  k = dos_command(raw, n, 1, quiet);
+  if (k == DOS_OK) return 0;
+  if (k == DOS_BYE) { pending = 3; return 1; }
+  if (k == DOS_STOP) return 1;
+  if (k == DOS_NOT) {                     /* not a command: BASIC.SYSTEM's SYNTAX ERROR */
+    if (quiet) return 16;
+    dos_message(16);
+    return 1;
   }
-  return 0;
-}
-
-static void catalog(uint8_t at)
-{
-  typedef struct { uint8_t n; uint16_t buf; } PrefixParms;
-  PrefixParms pp = {1, RES_PATH};
-  ReadParms r;
-  uint8_t e, ref, blk[512], first = 1;
-  uint16_t i;
-  if (!set_path(at) && (e = mli(MLI_GET_PREFIX, &pp, sizeof pp)) != 0) { error(e); return; }
-  if ((e = open_path(&ref)) != 0) { error(e); return; }
-  r.n = 4, r.ref = ref, r.buf = RES_IOBUF, r.req = 512;
-  crout();
-  for (;;) {
-    if (mli(MLI_READ, &r, sizeof r) || r.trans != 512) break;
-    from0(blk, RES_IOBUF, 512);
-    for (i = 4; i + 0x27 <= 512; i += 0x27) {
-      uint8_t st = blk[i] >> 4, n = blk[i] & 15, k;
-      const char *tn;
-      if (first) {                        /* the directory's header */
-        first = 0;
-        cout('/');
-        for (k = 0; k < n; k++) cout(blk[i + 1 + k]);
-        crout();
-        crout();
-        continue;
-      }
-      if (!st) continue;
-      cout(' ');
-      for (k = 0; k < 15; k++) cout(k < n ? blk[i + 1 + k] : ' ');
-      cout(' ');
-      if ((tn = type_name(blk[i + 0x10])) != 0) print(tn);
-      else { cout('$'); cout("0123456789ABCDEF"[blk[i + 0x10] >> 4]); cout("0123456789ABCDEF"[blk[i + 0x10] & 15]); }
-      cout(' ');
-      print_u((uint16_t)(blk[i + 0x13] | blk[i + 0x14] << 8));
-      crout();
-    }
-  }
-  close_ref(ref);
+  return quiet ? (uint8_t)(k & 0x7F) : 1;
 }
 
 /* ---- the command line ---- */
-static int word(const char *w, uint8_t *after)
-{
-  uint8_t i = 0;
-  while (w[i] && i < len && line[i] == (uint8_t)w[i]) i++;
-  if (w[i]) return 0;
-  *after = i;
-  return 1;
-}
-
-/* the name after i, or 0 if what follows is not a name (RUN 100, RUN) */
-static int name_at(uint8_t i)
-{
-  while (i < len && line[i] == ' ') i++;
-  return i < len && ((line[i] >= 'A' && line[i] <= 'Z') || line[i] == '/');
-}
-
-/* BASIC.SYSTEM's commands: 1 if the line was one, 2 for BYE */
-static int command(void)
-{
-  uint8_t i, e;
-  if (word("BYE", &i)) return 2;
-  if (word("CATALOG", &i) || word("CAT", &i)) { catalog(i); return 1; }
-  if (word("COMPILE", &i)) {
-    if (!set_path(i)) error(0x80);
-    else if ((e = load_program()) != 0) error(e);
-    else compile_current();
-    return 1;
-  }
-  if (word("LOAD", &i)) {
-    if (!set_path(i)) error(0x80);
-    else if ((e = load_program()) != 0) error(e);
-    return 1;
-  }
-  if (word("SAVE", &i)) {
-    if (!set_path(i)) error(0x80);
-    else if ((e = save_program()) != 0) error(e);
-    return 1;
-  }
-  if (word("-", &i) || (word("RUN", &i) && name_at(i))) {
-    if (!set_path(i)) error(0x80);
-    else if ((e = load_program()) != 0) error(e);
-    else run_current();
-    return 1;
-  }
-  return 0;
-}
-
-static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
 
 /* LINGET over the tokens at raw[*p]: a line number, digits (no spaces are
  * left by now); 0 for none; -1 past 63999 */
@@ -701,69 +532,26 @@ static int32_t linget(uint8_t *p)
   return n;
 }
 
-/* a direct line (its tokens in raw): compiled against the program - which
- * is compiled first, if it has to be - and run with its variables */
-static void direct_line(void)
+/* COMPILE name: ours, a timed compile */
+static int compile_command(void)
 {
-  uint16_t entry;
-  if (compile_current()) return;
-  if (compile_direct(raw, &entry)) { as_error("OUT OF MEMORY"); return; }
-  poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)entry);
-  poke0((uint16_t)(vm_dp + VM_DENTRY + 1), (uint8_t)(entry >> 8));
-  vm_call(vm_read16(VMH_DIRECT));
-  after_vm();
-}
-
-/* ---- CHR$(4) commands from a running program: vm_command, called by the
- * VM (glue.s cmd_entry) with the command in its buffer; 0 to go on, else
- * the program stops (and a RUN or LOAD is pending) ---- */
-uint8_t cmd_answer;
-
-static void port(uint16_t rom, uint8_t at)
-{
-  uint8_t n = 0;
-  while (at < len && line[at] == ' ') at++;
-  while (at < len && is_digit(line[at])) n = (uint8_t)(n * 10 + (line[at++] - '0'));
-  poke0(RES_A, n);
-  rom_call(rom);
-}
-
-uint8_t vm_command(void)
-{
-  uint8_t n, i, k;
-  uint16_t b = vm_read16(VMH_CMDBUF);
-  xfer_far = (vm_base | b) - 1, xfer_near = (uint16_t)((uint16_t)&n - 1), xfer_n = 1;
-  far_in();
-  xfer_far = (vm_base | (uint16_t)(b + 1)) - 1, xfer_near = (uint16_t)((uint16_t)raw - 1), xfer_n = n;
-  if (n) far_in();
-  for (k = 0; k < n && raw[k] == ' '; k++) {}
-  len = 0;
-  for (i = k; i < n; i++) {
-    uint8_t c = raw[i] & 0x7F;
-    line[len++] = c >= 'a' && c <= 'z' ? (uint8_t)(c - 32) : c;
-  }
-  line[len] = 0;
-  if (!len) return 0;
-  if (word("CATALOG", &i) || word("CAT", &i)) { catalog(i); return 0; }
-  if (word("PR#", &i)) { port(0xFE95, i); return 0; }      /* OUTPORT */
-  if (word("IN#", &i)) { port(0xFE8B, i); return 0; }      /* INPORT */
-  if (word("NOMON", &i) || word("MON", &i)) return 0;
-  if (word("-", &i) || word("RUN", &i)) {
-    if (!set_path(i)) { error(0x80); return 1; }
-    pending = 1;
-    return 1;
-  }
-  if (word("LOAD", &i)) {
-    if (!set_path(i)) { error(0x80); return 1; }
-    pending = 2;
-    return 1;
-  }
-  error(0x80);
+  static const char w[] = "COMPILE";
+  uint8_t i = 0, k = 0, p[65], e;
+  while (i < len && raw[i] == ' ') i++;
+  for (k = 0; w[k]; k++, i++)
+    if (i >= len || (raw[i] & 0xDF) != (uint8_t)w[k]) return 0;
+  while (i < len && raw[i] == ' ') i++;
+  for (k = 0; i < len && raw[i] != ' ' && k < 64; i++) p[++k] = (uint8_t)(raw[i] >= 'a' && raw[i] <= 'z' ? raw[i] - 32 : raw[i]);
+  p[0] = k;
+  if (!k) { dos_message(16); return 1; }
+  if ((e = prog_load(p)) != 0) dos_message(dos_error(e));
+  else compile_current();
   return 1;
 }
 
-/* an AppleSoft line: numbered, into the program; else at once */
-static void basic_line(void)
+/* an AppleSoft line: numbered, into the program; else at once.  1 if
+ * RESTART's CR is due before the prompt (all but a line taken in) */
+static int basic_line(void)
 {
   uint8_t x = 0, y, p;
   uint16_t num = 0;
@@ -772,14 +560,13 @@ static void basic_line(void)
   if (is_digit(raw[x])) {
     while (is_digit(raw[x]) || raw[x] == ' ') {
       if (raw[x] != ' ') {
-        if (num >= 6400) { as_error("SYNTAX"); return; }
+        if (num >= 6400) { as_error("SYNTAX"); return 1; }
         num = (uint16_t)(num * 10 + (raw[x] - '0'));
       }
       x++;
     }
     y = as816_parse(raw, x);
-    edit_line(num, raw, (uint8_t)(y - 4));
-    return;
+    return edit_line(num, raw, (uint8_t)(y - 4));
   }
   as816_parse(raw, x);
   switch (raw[0]) {
@@ -793,27 +580,30 @@ static void basic_line(void)
     }
     if (raw[p]) break;
     list((uint16_t)a, b ? (uint16_t)b : 0xFFFF);
-    return;
+    return 1;
   case 0xBF:                            /* NEW */
     if (raw[1]) break;
     new_program();
-    return;
+    return 1;
   case 0xAC:                            /* RUN (RUN n: a direct line) */
-    if (raw[1]) { direct_line(); return; }
-    run_current();
-    return;
+    if (raw[1]) direct_tokens();
+    else run_from(-1);
+    after_vm();
+    return 1;
   case 0:
-    return;
+    return 1;
   default:
-    direct_line();
-    return;
+    direct_tokens();
+    after_vm();
+    return 1;
   }
   as_error("SYNTAX");
+  return 1;
 }
 
 void shell(void)
 {
-  uint8_t i;
+  uint8_t i, k;
   rom_call(HOME);
   prog_start = vm_read16(0x0E);
   hash_acc = 0;
@@ -824,22 +614,19 @@ void shell(void)
   vm_hook();
   print("APPLESOFT816 0.1");
   crout();
-  for (;;) {
-    if (peek0(CH)) crout();
+  while (!bye) {
     poke0(PROMPT, ']' | 0x80);
     rom_call(GETLN);
     len = peek0(RES_X);
     if (len > 239) len = 239;           /* INLIN's limit */
     from0(raw, INBUF, len);
-    for (i = 0; i < len; i++) {
-      uint8_t c = raw[i] & 0x7F;
-      raw[i] = c;
-      line[i] = c >= 'a' && c <= 'z' ? (uint8_t)(c - 32) : c;
-    }
-    raw[len] = line[len] = 0;
-    if (!len) continue;
-    i = (uint8_t)command();
-    if (i == 2) return;
-    if (!i) basic_line();
+    for (i = 0; i < len; i++) raw[i] &= 0x7F;
+    raw[len] = 0;
+    for (i = 0; i < len && raw[i] == ' '; i++) {}
+    if (i == len) continue;
+    if (compile_command()) continue;
+    k = dos_command(raw, len, 0, 0);
+    if (k == DOS_BYE) return;
+    if (k == DOS_NOT && basic_line()) crout();   /* RESTART's CRDO */
   }
 }

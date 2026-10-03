@@ -3,7 +3,7 @@
 TC      ?= $(HOME)/opt/llvm-mos-65816-root/usr/lib/llvm-mos-65816
 CC816    = $(TC)/bin/mos-common-clang
 FLAGS    = -mcpu=mosw65816 -Os -fno-jump-tables -mlto-zp=0 -nostartfiles -I../compiler -T link.ld -Wl,-Map=cc.map
-SRC = crt0.s glue.s main.c shell.c ../compiler/compile.c ../compiler/parse.c
+SRC = crt0.s glue.s main.c shell.c machine.c dos.c ../compiler/compile.c ../compiler/parse.c
 
 cc.bin: $(SRC) link.ld ../compiler/compile.h
 	$(CC816) $(FLAGS) -o $@ $(SRC)

@@ -5,6 +5,7 @@
 //   prodisk IMAGE get PATH OUTFILE
 //   prodisk IMAGE put PATH TYPE AUX FILE      (TYPE, AUX hex; replaces)
 //   prodisk IMAGE rm PATH
+//   prodisk IMAGE mkdir PATH
 //   prodisk IMAGE format VOLNAME [BLOCKS]     (default 1600 = 800K)
 //   prodisk IMAGE boot FROMIMAGE              (blocks 0-1: the boot loader)
 #include <cstdio>
@@ -48,7 +49,7 @@ int main(int argc, char** argv)
 {
   if (argc < 3) {
     fprintf(stderr, "usage: prodisk IMAGE ls [DIR] | get PATH OUT | put PATH TYPE AUX FILE | rm PATH |\n"
-                    "               format VOLNAME [BLOCKS] | boot FROMIMAGE\n");
+                    "               mkdir PATH | format VOLNAME [BLOCKS] | boot FROMIMAGE\n");
     return 2;
   }
   const char* image = argv[1];
@@ -88,6 +89,10 @@ int main(int argc, char** argv)
     if (!vol.create_file(dir, name, uint8_t(strtoul(argv[4], nullptr, 16)), uint16_t(strtoul(argv[5], nullptr, 16)),
                          data, &err))
       return fail(std::string(argv[3]) + ": " + err);
+  } else if (cmd == "mkdir" && argc == 4) {
+    std::string dir, name;
+    split(argv[3], &dir, &name);
+    if (!vol.create_dir(dir, name, &err)) return fail(std::string(argv[3]) + ": " + err);
   } else if (cmd == "rm" && argc == 4) {
     if (!vol.remove(argv[3], &err)) return fail(std::string(argv[3]) + ": " + err);
   } else if (cmd == "boot" && argc == 4) {

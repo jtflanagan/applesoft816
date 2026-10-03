@@ -7,6 +7,7 @@
 #   kegs.sh type TEXT               keys, as typed ('\n' = Return)
 #   kegs.sh key KEYSYM...           xdotool key names (Return, Escape, ctrl+c)
 #   kegs.sh shot FILE.png           the window, as a PNG
+#   kegs.sh text                    the text screen, as text (kegs_text.py)
 #   kegs.sh stop
 set -eu
 DISP=:99
@@ -72,12 +73,18 @@ off = hs + ncolors * 12
 Image.frombuffer("RGB", (w, h), d[off:off + bpl * h], "raw", "BGRX", bpl, 1).save(sys.argv[1])
 ' "$2"
   ;;
+text)
+  t=$(mktemp --suffix=.png)
+  "$0" shot "$t"
+  python3 "$(dirname "$0")/kegs_text.py" "$t"
+  rm -f "$t"
+  ;;
 stop)
   pid=$(pgrep -x xkegs || true)
   [ -n "$pid" ] && kill $pid
   ;;
 *)
-  sed -n '2,12p' "$0"
+  sed -n '2,13p' "$0"
   exit 2
   ;;
 esac

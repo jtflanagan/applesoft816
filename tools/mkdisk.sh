@@ -32,7 +32,7 @@ tok() {     # tok FILE: its tokenized bytes in $work/NAME.tok, NAME on stdout
   echo "$name"
 }
 
-$pd "$img" format AS816
+$pd "$img" format "${VOL:-AS816}"
 $pd "$img" boot "$P8"
 $pd "$P8" get PRODOS "$work/PRODOS"
 $pd "$img" put PRODOS FF 0000 "$work/PRODOS"
