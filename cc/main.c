@@ -28,6 +28,7 @@ uint8_t vm_bank;
 uint16_t vm_dp, fp_fin_addr;
 uint32_t xfer_far, xfer_far2;   /* far_in/far_out/far_move: one below the first byte */
 uint16_t xfer_near, xfer_n;
+uint16_t hash_acc;              /* far_hash */
 void far_in(void);
 void far_out(void);
 

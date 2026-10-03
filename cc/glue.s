@@ -279,3 +279,28 @@ move_loop:
         bne     move_loop
         sep     #0x10
         rts
+
+; far_hash: hash_acc over xfer_n bytes at xfer_far (one below), last byte
+; first: h = (h rotated left 1) ^ byte
+        .global far_hash
+far_hash:
+        jsr     xfer_setup
+        rep     #0x20
+        lda     mos16(hash_acc)
+        sta     __rc7
+hash_loop:
+        lda     [__rc2],y
+        .byte   0x29                    ; and #$00FF (sixteen bits)
+        .short  0x00ff
+        sta     __rc9
+        lda     __rc7
+        asl     a
+        .byte   0x69                    ; adc #0
+        .short  0
+        eor     __rc9
+        sta     __rc7
+        dey
+        bne     hash_loop
+        sta     mos16(hash_acc)
+        sep     #0x30
+        rts

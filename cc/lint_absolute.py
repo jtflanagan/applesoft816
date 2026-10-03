@@ -28,6 +28,7 @@ import sys
 LINE = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(\w+)\t?(.*)$")
 # JSR/JMP operands are program-bank addresses; JSL/JML and immediates never match.
 LINK_BANKS = (0x01, 0x02)
+HEADER_END = 0x1000C                    # crt0's header, $0000-$000B of the code bank
 SKIP = {"jsr", "jmp", "jsl", "jml", "pea", "per", "brl", "mvn", "mvp"}
 
 
@@ -40,6 +41,8 @@ def main() -> int:
         m = LINE.match(line)
         if not m:
             continue
+        if int(m.group(1), 16) < HEADER_END:
+            continue                    # crt0's header: data, not instructions
         nbytes = len(m.group(2).split())
         mnem, operand = m.group(3), m.group(4).strip()
         if mnem in ("jmp", "jsr") and re.match(r"\(\$[0-9a-f]+,x\)", operand):

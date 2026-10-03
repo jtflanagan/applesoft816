@@ -25,5 +25,7 @@ void poke0(uint16_t a, uint8_t v);
 uint8_t mli_call(uint8_t cmd);
 uint8_t rom_call(uint16_t addr);
 uint8_t vm_call(void);
+extern uint16_t hash_acc;
+void far_hash(void);                   /* hash_acc over xfer_n bytes at xfer_far */
 
 #endif
