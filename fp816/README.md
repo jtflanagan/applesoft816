@@ -31,7 +31,14 @@ compare each fail it.
 | INT, QINT, AYINT, GIVAYF, CONINT, GETADR (incl. ?ILLEGAL QUANTITY) | ported, matches |
 | FIN (with CHRGET/CHRGOT over a long text pointer), NEGOP | ported, matches (incl. ?OVERFLOW) |
 | FOUT (number to text, into a caller's buffer) | ported, matches |
-| functions: SQR ^ LOG EXP SIN COS TAN ATN RND | to do |
+| functions: SQR ^ LOG EXP SIN COS TAN ATN RND (incl. RND's seed, SIN/TAN's quadrant flag) | ported, matches |
+
+**Stage 1 is complete: every AppleSoft float routine, bit-exact** (29 test
+families; `make test CASES=50000` runs in ~90 s).  Cost, cycles per call on
+emu816 (valid cases): the port is the ROM plus 50-60 cycles of public-entry
+overhead (P/DBR/S/D saved, JSL/RTL, long pointers) - e.g. FADD 922 vs 967,
+FMULT 1276 vs 1336, FDIV 2204 vs 2370, SIN 16620 vs 17076.  Internal calls
+do not pay it.  Speed is stage 2's job.
 
 Two places where a transliteration would be wrong on the 65816: FDIV's
 `sta $65,x` (X = $FD..$01) wraps in zero page on the 6502 but not in
@@ -44,6 +51,11 @@ Every entry sets DBR to the library's bank (restored on exit, also after
 an error), so constants and FOUT's decimal table are read absolute as in
 the ROM.  FOUT writes where the ROM wrote `$0100` through a long pointer
 (`FP_BUF`, standing for the ROM's `$00FF`).
+
+The functions keep the ROM's constant and coefficient tables byte for byte,
+including RND's two constants, which overlap each other and end on the
+`$20` that starts RND's code; TEMP1/2/3 and the RND seed live at their
+AppleSoft offsets in the direct page.
 
 AYINT's -32768 is the ROM's constant at `$E0FE`, whose last byte is the
 `$20` of the following JSR - a hair below -32768; the port keeps it.

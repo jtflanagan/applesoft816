@@ -44,6 +44,12 @@ FP_TXT   = $FA          ; 3 bytes: text pointer for FIN (ours; AppleSoft TXTPTR)
 FP_BUF   = $FD          ; 3 bytes: FOUT's output buffer MINUS ONE (ours; the ROM's $00FF)
 VARPNT   = $83          ; FOUT scratch
 SERPNT   = $AD          ; FOUT scratch
+FP_SER   = $AD          ; 3 bytes: polynomial coefficient pointer (the ROM's SERPNT, made long)
+CPRMASK  = $16          ; SIN/TAN quadrant flag
+TEMP3    = $8A          ; 5-byte float temporaries, as in AppleSoft's zero page
+TEMP1    = $93
+TEMP2    = $98
+RNDSEED  = $C9          ; 5 bytes: RND's seed (AppleSoft: 80 4F C7 52 58 at cold start)
 LINNUM   = $50          ; GETADR's result, 2 bytes
 FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 
@@ -78,6 +84,28 @@ ERR_ILLQTY   = $35
 .endmacro
 
 ; FP_PTR = a constant in this bank
+; FP_PTR = this direct page + off (a float temporary; bank 0)
+.macro  DPTR    off
+        rep     #$21            ; 16-bit A, carry clear
+        .a16
+        lda     FP_DPP
+        adc     #off
+        sta     FP_PTR
+        sep     #$20
+        .a8
+        stz     FP_PTR+2
+.endmacro
+
+; FP_SER = a coefficient table in this bank
+.macro  SPTR    addr
+        lda     #<(addr)
+        sta     FP_SER
+        lda     #>(addr)
+        sta     FP_SER+1
+        lda     #^(addr)
+        sta     FP_SER+2
+.endmacro
+
 .macro  PTR     addr
         lda     #<(addr)
         sta     FP_PTR
@@ -135,6 +163,24 @@ ERR_ILLQTY   = $35
         jmp     fp_negop           ; +$54  FAC = -FAC              (ROM NEGOP)
         nop
         jmp     fp_fout            ; +$58  [FP_BUF+1..] = FAC as text, 0-terminated (ROM FOUT)
+        nop
+        jmp     fp_sqr             ; +$5C  FAC = SQR(FAC)
+        nop
+        jmp     fp_pwr             ; +$60  FAC = [FP_PTR] ^ FAC    (ROM FPWRT, base in ARG)
+        nop
+        jmp     fp_log             ; +$64  FAC = LOG(FAC)
+        nop
+        jmp     fp_exp             ; +$68  FAC = EXP(FAC)
+        nop
+        jmp     fp_rnd             ; +$6C  FAC = RND(FAC), seed at RNDSEED
+        nop
+        jmp     fp_sin             ; +$70  FAC = SIN(FAC)
+        nop
+        jmp     fp_cos             ; +$74  FAC = COS(FAC)
+        nop
+        jmp     fp_tan             ; +$78  FAC = TAN(FAC)
+        nop
+        jmp     fp_atn             ; +$7C  FAC = ATN(FAC)
         nop
 
 ; ---- public entries ----
@@ -268,6 +314,43 @@ fp_fout:
         jsr     fout
         LEAVE
 
+fp_sqr: ENTER
+        jsr     sqr
+        LEAVE
+
+fp_pwr: ENTER
+        jsr     load_arg_from_ptr  ; A = FAC exponent, flags from it
+        jsr     fpwrt
+        LEAVE
+
+fp_log: ENTER
+        jsr     log
+        LEAVE
+
+fp_exp: ENTER
+        jsr     exp
+        LEAVE
+
+fp_rnd: ENTER
+        jsr     rnd
+        LEAVE
+
+fp_sin: ENTER
+        jsr     sin
+        LEAVE
+
+fp_cos: ENTER
+        jsr     cos
+        LEAVE
+
+fp_tan: ENTER
+        jsr     tan
+        LEAVE
+
+fp_atn: ENTER
+        jsr     atn
+        LEAVE
+
 ; Error: unwind to the entry's frame and return with FP_ERR set.
 fp_error:                       ; A = error code
         rep     #$30
@@ -370,16 +453,18 @@ mfa:    sta     FACSIGN
         stx     FAC_EXT
         rts
 
-; ROUND.FAC ($EB72)
+; ROUND.FAC ($EB72), INCREMENT.MANTISSA ($EB7A)
 round_fac:
         lda     FAC
-        beq     @rts
+        beq     round_rts
         asl     FAC_EXT
-        bcc     @rts
+        bcc     round_rts
+increment_mantissa:
         jsr     increment_fac_mantissa
-        bne     @rts
+        bne     round_rts
         jmp     normalize_fac_6
-@rts:   rts
+round_rts:
+        rts
 
 ; FSUBT ($E7AA)
 fsubt:
@@ -1376,3 +1461,329 @@ fout_5: lda     #$00
 fout_6: lda     #$00
         ldy     #$01
         rts
+
+; =========================================================================
+; Functions
+; =========================================================================
+
+fdiv:   jsr     load_arg_from_ptr
+        jmp     fdivt
+fsub:   jsr     load_arg_from_ptr
+        jmp     fsubt
+
+; The ROM's constants and coefficient tables, byte for byte ($E913-$E940,
+; $EEDB-$EF08, $EFA6-$EFAE, $F066-$F093, $F0CE-$F10A).
+rom_e913:
+        .byte   $81, $00, $00, $00, $00                 ; CON.ONE
+        .byte   $03                                     ; POLY.LOG
+        .byte   $7F, $5E, $56, $CB, $79
+        .byte   $80, $13, $9B, $0B, $64
+        .byte   $80, $76, $38, $93, $16
+        .byte   $82, $38, $AA, $3B, $20
+        .byte   $80, $35, $04, $F3, $34                 ; CON.SQR.HALF
+        .byte   $81, $35, $04, $F3, $34                 ; CON.SQR.TWO
+        .byte   $80, $80, $00, $00, $00                 ; CON.NEG.HALF
+        .byte   $80, $31, $72, $17, $F8                 ; CON.LOG.TWO
+con_one      = rom_e913 + $00
+poly_log     = rom_e913 + $05
+con_sqr_half = rom_e913 + $1A
+con_sqr_two  = rom_e913 + $1F
+con_neg_half = rom_e913 + $24
+con_log_two  = rom_e913 + $29
+
+rom_eedb:
+        .byte   $81, $38, $AA, $3B, $29                 ; CON.LOG.E
+        .byte   $07                                     ; POLY.EXP
+        .byte   $71, $34, $58, $3E, $56
+        .byte   $74, $16, $7E, $B3, $1B
+        .byte   $77, $2F, $EE, $E3, $85
+        .byte   $7A, $1D, $84, $1C, $2A
+        .byte   $7C, $63, $59, $58, $0A
+        .byte   $7E, $75, $FD, $E7, $C6
+        .byte   $80, $31, $72, $18, $10
+        .byte   $81, $00, $00, $00, $00
+con_log_e    = rom_eedb + $00
+poly_exp     = rom_eedb + $05
+
+; CON.RND.1 and CON.RND.2 overlap, and RND.2's last byte is the $20 that
+; starts RND's code in the ROM - kept, it is part of the sequence
+rom_efa6:
+        .byte   $98, $35, $44, $7A, $68, $28, $B1, $46, $20
+con_rnd_1    = rom_efa6 + 0
+con_rnd_2    = rom_efa6 + 4
+
+rom_f066:
+        .byte   $81, $49, $0F, $DA, $A2                 ; CON.PI.HALF
+        .byte   $83, $49, $0F, $DA, $A2                 ; CON.PI.DOUB
+        .byte   $7F, $00, $00, $00, $00                 ; QUARTER
+        .byte   $05                                     ; POLY.SIN
+        .byte   $84, $E6, $1A, $2D, $1B
+        .byte   $86, $28, $07, $FB, $F8
+        .byte   $87, $99, $68, $89, $01
+        .byte   $87, $23, $35, $DF, $E1
+        .byte   $86, $A5, $5D, $E7, $28
+        .byte   $83, $49, $0F, $DA, $A2
+con_pi_half  = rom_f066 + $00
+con_pi_doub  = rom_f066 + $05
+quarter      = rom_f066 + $0A
+poly_sin     = rom_f066 + $0F
+
+poly_atn:                                               ; $F0CE
+        .byte   $0B
+        .byte   $76, $B3, $83, $BD, $D3
+        .byte   $79, $1E, $F4, $A6, $F5
+        .byte   $7B, $83, $FC, $B0, $10
+        .byte   $7C, $0C, $1F, $67, $CA
+        .byte   $7C, $DE, $53, $CB, $C1
+        .byte   $7D, $14, $64, $70, $4C
+        .byte   $7D, $B7, $EA, $51, $7A
+        .byte   $7D, $63, $30, $88, $7E
+        .byte   $7E, $92, $44, $99, $3A
+        .byte   $7E, $4C, $CC, $91, $C7
+        .byte   $7F, $AA, $AA, $AA, $13
+        .byte   $81, $00, $00, $00, $00
+
+; SQR ($EE8D): ARG = FAC, FAC = 0.5, then FPWRT
+sqr:    jsr     copy_fac_to_arg_rounded
+        PTR     con_half
+        jsr     load_fac_from_ptr
+; FPWRT ($EE97): FAC = ARG ^ FAC; A = FAC exponent with flags on entry
+fpwrt:  bne     @nz             ; ROM: beq EXP (out of range here)
+        jmp     exp
+@nz:    lda     ARG
+        bne     @leea0
+        jmp     sta_in_fac_sign_and_exp
+@leea0: DPTR    TEMP3
+        jsr     store_fac_at_ptr_rounded
+        lda     ARGSIGN
+        bpl     @leeba
+        jsr     int
+        DPTR    TEMP3
+        jsr     fcomp
+        bne     @leeba
+        tya
+        ldy     CHARAC
+@leeba: jsr     mfa
+        tya
+        pha
+        jsr     log
+        DPTR    TEMP3
+        jsr     fmult
+        jsr     exp
+        pla
+        lsr     a
+        bcc     @rts
+        jmp     negop
+@rts:   rts
+
+; LOG ($E941)
+log:    jsr     sign
+        beq     giq
+        bpl     log_2
+giq:    jmp     iqerr
+log_2:  lda     FAC
+        sbc     #$7F
+        pha
+        lda     #$80
+        sta     FAC
+        PTR     con_sqr_half
+        jsr     fadd
+        PTR     con_sqr_two
+        jsr     fdiv
+        PTR     con_one
+        jsr     fsub
+        SPTR    poly_log
+        jsr     polynomial_odd
+        PTR     con_neg_half
+        jsr     fadd
+        pla
+        jsr     addacc
+        PTR     con_log_two
+        jmp     fmult           ; the ROM falls into FMULT
+
+; EXP ($EF09)
+exp:    PTR     con_log_e
+        jsr     fmult
+        lda     FAC_EXT
+        adc     #$50
+        bcc     @lef19
+        jsr     increment_mantissa
+@lef19: sta     ARG_EXT
+        jsr     maf
+        lda     FAC
+        cmp     #$88
+        bcc     @lef27
+@lef24: jsr     outofrng
+@lef27: jsr     int
+        lda     CHARAC
+        clc
+        adc     #$81
+        beq     @lef24
+        sec
+        sbc     #$01
+        pha
+        ldx     #$05
+@lef37: lda     ARG,x
+        ldy     FAC,x
+        sta     FAC,x
+        sty     ARG,x
+        dex
+        bpl     @lef37
+        lda     ARG_EXT
+        sta     FAC_EXT
+        jsr     fsubt
+        jsr     negop
+        SPTR    poly_exp
+        jsr     polynomial
+        lda     #$00
+        sta     SGNCPR
+        pla
+        jsr     add_exponents_1
+        rts
+
+; POLYNOMIAL.ODD ($EF5C): FAC = x * P(x^2), table at FP_SER
+polynomial_odd:
+        DPTR    TEMP1
+        jsr     store_fac_at_ptr_rounded
+        DPTR    TEMP1
+        jsr     fmult
+        jsr     sermain
+        DPTR    TEMP1
+        jmp     fmult
+
+; POLYNOMIAL ($EF72) / SERMAIN ($EF76): Horner over the table at FP_SER
+; (a count, then count+1 coefficients) with x in TEMP2
+polynomial:
+sermain:
+        DPTR    TEMP2
+        jsr     store_fac_at_ptr_rounded
+        lda     [FP_SER]
+        sta     SERLEN
+        inc     FP_SER
+        bne     @ptr
+        inc     FP_SER+1
+@ptr:   jsr     ser_to_ptr
+@lef89: jsr     fmult
+        rep     #$21
+        .a16
+        lda     FP_SER
+        adc     #$0005
+        sta     FP_SER
+        sep     #$20
+        .a8
+        jsr     ser_to_ptr
+        jsr     fadd
+        DPTR    TEMP2
+        dec     SERLEN
+        bne     @lef89
+        rts
+
+ser_to_ptr:
+        lda     FP_SER
+        sta     FP_PTR
+        lda     FP_SER+1
+        sta     FP_PTR+1
+        lda     FP_SER+2
+        sta     FP_PTR+2
+        rts
+
+; RND ($EFAE)
+rnd:    jsr     sign
+        tax
+        bmi     @lefcc
+        DPTR    RNDSEED
+        jsr     load_fac_from_ptr
+        txa
+        beq     @rts
+        PTR     con_rnd_1
+        jsr     fmult
+        PTR     con_rnd_2
+        jsr     fadd
+@lefcc: ldx     FAC+4
+        lda     FAC+1
+        sta     FAC+4
+        stx     FAC+1
+        lda     #$00
+        sta     FACSIGN
+        lda     FAC
+        sta     FAC_EXT
+        lda     #$80
+        sta     FAC
+        jsr     normalize_fac_2
+        DPTR    RNDSEED
+        jmp     store_fac_at_ptr_rounded    ; GO.MOVMF
+@rts:   rts
+
+; COS ($EFEA), SIN ($EFF1)
+cos:    PTR     con_pi_half
+        jsr     fadd
+sin:    jsr     copy_fac_to_arg_rounded
+        PTR     con_pi_doub
+        ldx     ARGSIGN
+        jsr     div
+        jsr     copy_fac_to_arg_rounded
+        jsr     int
+        lda     #$00
+        sta     SGNCPR
+        jsr     fsubt
+        PTR     quarter
+        jsr     fsub
+        lda     FACSIGN
+        pha
+        bpl     sin_1
+        jsr     faddh
+        lda     FACSIGN
+        bmi     sin_2
+        lda     CPRMASK
+        eor     #$FF
+        sta     CPRMASK
+sin_1:  jsr     negop
+sin_2:  PTR     quarter
+        jsr     fadd
+        pla
+        bpl     @lf033
+        jsr     negop
+@lf033: SPTR    poly_sin
+        jmp     polynomial_odd
+
+; TAN ($F03A)
+tan:    DPTR    TEMP1
+        jsr     store_fac_at_ptr_rounded
+        lda     #$00
+        sta     CPRMASK
+        jsr     sin
+        DPTR    TEMP3
+        jsr     store_fac_at_ptr_rounded
+        DPTR    TEMP1
+        jsr     load_fac_from_ptr
+        lda     #$00
+        sta     FACSIGN
+        lda     CPRMASK
+        jsr     tan_1
+        DPTR    TEMP3
+        jmp     fdiv
+tan_1:  pha
+        jmp     sin_1
+
+; ATN ($F09E)
+atn:    lda     FACSIGN
+        pha
+        bpl     @lf0a6
+        jsr     negop
+@lf0a6: lda     FAC
+        pha
+        cmp     #$81
+        bcc     @lf0b4
+        PTR     con_one
+        jsr     fdiv
+@lf0b4: SPTR    poly_atn
+        jsr     polynomial_odd
+        pla
+        cmp     #$81
+        bcc     @lf0c7
+        PTR     con_pi_half
+        jsr     fsub
+@lf0c7: pla
+        bpl     @rts
+        jmp     negop
+@rts:   rts

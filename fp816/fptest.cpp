@@ -29,7 +29,9 @@ constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R
                    R_FMULT = 0xE97F, R_FDIV = 0xEA66, R_FCOMP = 0xEBB2, R_MUL10 = 0xEA39,
                    R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_INT = 0xEC23, R_QINT = 0xEBF2,
                    R_AYINT = 0xE10C, R_GIVAYF = 0xE2F2, R_CONINT = 0xE6FB, R_GETADR = 0xE752,
-                   R_FIN = 0xEC4A, R_FOUT = 0xED34, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
+                   R_FIN = 0xEC4A, R_FOUT = 0xED34, R_SQR = 0xEE8D, R_FPWRT = 0xEE97, R_LOG = 0xE941,
+                   R_EXP = 0xEF09, R_RND = 0xEFAE, R_SIN = 0xEFF1, R_COS = 0xEFEA, R_TAN = 0xF03A,
+                   R_ATN = 0xF09E, R_LOAD_ARG = 0xE9E3, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
 // fp816 jump table
 constexpr uint32_t LIB = 0xF20000;
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
@@ -37,13 +39,17 @@ constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LI
                    F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34,
                    F_INT = LIB + 0x38, F_QINT = LIB + 0x3C, F_AYINT = LIB + 0x40, F_GIVAYF = LIB + 0x44,
                    F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C, F_FIN = LIB + 0x50, F_FOUT = LIB + 0x58;
-constexpr int FP_BUF = 0xFD;
+constexpr int FP_BUF = 0xFD, RNDSEED = 0xC9, CPRMASK = 0x16;
+constexpr uint32_t F_SQR = LIB + 0x5C, F_PWR = LIB + 0x60, F_LOG = LIB + 0x64, F_EXP = LIB + 0x68,
+                   F_RND = LIB + 0x6C, F_SIN = LIB + 0x70, F_COS = LIB + 0x74, F_TAN = LIB + 0x78,
+                   F_ATN = LIB + 0x7C;
 constexpr uint32_t OUTBUF = 0x000500; // fp816's FOUT text (the ROM's is $0100)
 constexpr int LINNUM = 0x50, FP_INT = 0xF8, FP_TXT = 0xFA, TXTPTR = 0xB8;
 constexpr uint32_t TEXT = 0x000400; // number text for FIN
 
 // how a ROM routine takes its operand
-enum Conv { AY, XY, NONE, INT16 }; // INT16: A = high, Y = low (operand bytes 3, 4)
+enum Conv { AY, XY, NONE, INT16, ARG_AY }; // INT16: A = high, Y = low (operand bytes 3, 4)
+                                           // ARG_AY: JSR LOAD.ARG.FROM.YA first (FPWRT)
 // where the byte/word result is
 enum Res { R_NONE, R_A, R_X, R_LINNUM };
 
@@ -59,14 +65,20 @@ struct Fac {
   }
 };
 
+// state every case also carries in, and compares out: RND's seed, SIN/TAN's
+// quadrant flag
+uint8_t g_seed[5], g_cprmask;
+
 struct Outcome {
   Fac fac;
   uint8_t stored[5];
+  uint8_t seed[5] = {}, cprmask = 0;
   int err;     // 0, or the AppleSoft error code
   int res = 0; // the byte result (FCOMP's A), when the test has one
   bool operator==(const Outcome& o) const
   {
-    return fac == o.fac && !memcmp(stored, o.stored, 5) && err == o.err && res == o.res;
+    return fac == o.fac && !memcmp(stored, o.stored, 5) && err == o.err && res == o.res &&
+           (err || (!memcmp(seed, o.seed, 5) && cprmask == o.cprmask));
   }
 };
 
@@ -173,6 +185,17 @@ struct Machine {
     return true;
   }
 
+  void put_state(uint32_t dp)
+  {
+    memcpy(&cpu.mem[dp + RNDSEED], g_seed, 5);
+    cpu.mem[dp + CPRMASK] = g_cprmask;
+  }
+  void get_state(uint32_t dp, Outcome& o)
+  {
+    memcpy(o.seed, &cpu.mem[dp + RNDSEED], 5);
+    o.cprmask = cpu.mem[dp + CPRMASK];
+  }
+
   void put_fac(uint32_t dp, const Fac& f)
   {
     cpu.mem[dp + FAC] = f.exp;
@@ -192,10 +215,13 @@ struct Machine {
   }
 
   // run until STP; returns false on a runaway
+  uint64_t last_cycles = 0;
   bool run(uint32_t pc, bool rom_mode, int& err)
   {
     cpu.set_pc(pc);
     err = 0;
+    uint64_t c0 = cpu.cycles;
+    struct Done { Machine* m; uint64_t c0; ~Done() { m->last_cycles = m->cpu.cycles - c0; } } done{this, c0};
     for (int n = 0; n < 200000; n++) {
       if (rom_mode && cpu.pc() == R_ERROR) {
         err = cpu.x() & 0xFF;
@@ -214,9 +240,16 @@ struct Machine {
     bool store = conv == XY;
     memset(&cpu.mem[0], 0, 0x100);
     put_fac(0, f);
+    put_state(0);
     memcpy(&cpu.mem[OPERAND], op, 5);
-    uint8_t stub[] = {0x20, uint8_t(routine), uint8_t(routine >> 8), 0xDB};
-    memcpy(&cpu.mem[STUB], stub, sizeof stub);
+    if (conv == ARG_AY) {
+      uint8_t stub[] = {0x20, uint8_t(R_LOAD_ARG), uint8_t(R_LOAD_ARG >> 8),
+                        0x20, uint8_t(routine), uint8_t(routine >> 8), 0xDB};
+      memcpy(&cpu.mem[STUB], stub, sizeof stub);
+    } else {
+      uint8_t stub[] = {0x20, uint8_t(routine), uint8_t(routine >> 8), 0xDB};
+      memcpy(&cpu.mem[STUB], stub, sizeof stub);
+    }
     cpu.reset_regs();
     // STORE takes X/Y (low/high); the loads and FADD/FSUB take A/Y
     if (conv == INT16) cpu.set_regs(op[4], 0, op[3], 0x01FF, 0, 0, 0x34, true);
@@ -226,6 +259,7 @@ struct Machine {
     Outcome o{};
     if (!run(STUB, true, o.err)) o.err = -1;
     o.fac = get_fac(0);
+    get_state(0, o);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
     if (!o.err) {
       if (res == R_A) o.res = cpu.a() & 0xFF;
@@ -240,6 +274,7 @@ struct Machine {
   {
     memset(&cpu.mem[DP_OURS], 0, 0x100);
     put_fac(DP_OURS, f);
+    put_state(DP_OURS);
     memcpy(&cpu.mem[OPERAND], op, 5);
     cpu.mem[DP_OURS + FP_PTR] = uint8_t(OPERAND);
     cpu.mem[DP_OURS + FP_PTR + 1] = uint8_t(OPERAND >> 8);
@@ -255,6 +290,7 @@ struct Machine {
     else o.err = cpu.mem[DP_OURS + FP_ERR];
     if (cpu.p() != p && o.err >= 0) o.err = -2; // M/X (or anything) not restored
     o.fac = get_fac(DP_OURS);
+    get_state(DP_OURS, o);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
     if (!o.err) {
       if (res == R_A || res == R_X) o.res = cpu.mem[DP_OURS + FP_RES];
@@ -363,6 +399,15 @@ int main(int argc, char** argv)
       {"GIVAYF", both(F_GIVAYF, R_GIVAYF, INT16)},
       {"CONINT", both(F_CONINT, R_CONINT, NONE, R_X), 0x70, 0x8A},
       {"GETADR", both(F_GETADR, R_GETADR, NONE, R_LINNUM), 0x70, 0x92},
+      {"SQR", both(F_SQR, R_SQR, NONE), 0x40, 0xC0},
+      {"^ (FPWRT)", both(F_PWR, R_FPWRT, ARG_AY), 0x7A, 0x86},
+      {"LOG", both(F_LOG, R_LOG, NONE), 0x40, 0xC0},
+      {"EXP", both(F_EXP, R_EXP, NONE), 0x70, 0x8A},
+      {"RND", both(F_RND, R_RND, NONE), 0x00, 0xFF},
+      {"SIN", both(F_SIN, R_SIN, NONE), 0x60, 0x92},
+      {"COS", both(F_COS, R_COS, NONE), 0x60, 0x92},
+      {"TAN", both(F_TAN, R_TAN, NONE), 0x60, 0x92},
+      {"ATN", both(F_ATN, R_ATN, NONE), 0x40, 0xC0},
   };
 
   // optional filter: FPTEST_ONLY=substring
@@ -374,6 +419,8 @@ int main(int argc, char** argv)
   }
 
   int failed_tests = 0;
+  memset(g_seed, 0, 5);
+  g_cprmask = 0;
 
   // FIN: number text -> FAC, entered the way AppleSoft does (CHRGET, FIN)
   if (!getenv("FPTEST_ONLY") || strstr("FIN", getenv("FPTEST_ONLY"))) {
@@ -488,14 +535,20 @@ int main(int argc, char** argv)
 
   for (auto& t : tests) {
     long bad = 0, errs = 0;
+    uint64_t rom_cyc = 0, our_cyc = 0, ok = 0;
     for (long i = 0; i < cases; i++) {
       int centre = t.lo + int(rndn(unsigned(t.hi - t.lo + 1)));
+      for (auto& b : g_seed) b = uint8_t(rnd());
+      if (rndn(4) == 0) memcpy(g_seed, "\x80\x4F\xC7\x52\x58", 5); // the cold-start seed
+      g_cprmask = uint8_t(rndn(2) ? 0 : 0xFF);
       Fac f = random_fac(centre);
       uint8_t op[5];
       if (rndn(4) == 0 && f.exp) packed_near(op, f);
       else random_packed(op, f.exp ? f.exp : centre);
       Outcome want = t.call(false, f, op);
+      uint64_t rc = m.last_cycles;
       Outcome got = t.call(true, f, op);
+      if (!want.err) rom_cyc += rc, our_cyc += m.last_cycles, ok++;
       errs += want.err != 0;
       if (!(want == got)) {
         if (++bad <= 4) {
@@ -507,7 +560,8 @@ int main(int argc, char** argv)
         }
       }
     }
-    printf("%-20s %8ld cases  %6ld ROM errors  %ld differ\n", t.name, cases, errs, bad);
+    printf("%-20s %8ld cases  %6ld ROM errors  %ld differ   cycles/call ROM %6.0f fp816 %6.0f\n", t.name,
+           cases, errs, bad, ok ? double(rom_cyc) / ok : 0, ok ? double(our_cyc) / ok : 0);
     failed_tests += bad != 0;
   }
   return failed_tests ? 1 : 0;

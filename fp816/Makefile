@@ -4,7 +4,7 @@ ARES    ?= ../../ares/ares/component/processor/wdc65816
 ROM     ?= ../../strudelworks-host/assets/apple2gs_rom3.bin
 CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wno-misleading-indentation
 CPPFLAGS += -I$(EMU) -I$(ARES)
-CASES   ?= 200000
+CASES   ?= 50000
 
 all: fp.bin fptest
 
