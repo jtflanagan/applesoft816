@@ -89,6 +89,8 @@ VM_ERRCSP = $E2         ; 2: ... and its control stack
 VM_ONERR = $E4          ; 2: the ONERR handler's IP (0: none)
 VM_DENTRY = $E6         ; 2: vm_direct's code (the shell's direct line)
 VM_FRESH = $E8          ; 1: vm_direct CLEARs first (the image is new, or was edited)
+VM_CONTIP = $E9         ; 2: where CONT goes on (OLDTEXT; 0: ?CAN'T CONTINUE)
+VM_CONTLIN = $EB        ; 2: ... and its line (OLDLIN)
 LINNUM   = $50          ; 2: GETADR's result (fp816)
 
 ERR_NEXT_WITHOUT_FOR  = $00
@@ -99,6 +101,7 @@ ERR_UNDEF_STATEMENT = $5A
 ERR_BAD_SUBSCRIPT = $6B
 ERR_REDIM   = $78
 ERR_FORMULA = $BF
+ERR_CANT_CONTINUE = $D2
 ERR_STRING_TOO_LONG = $B0
 
 FRAME_FOR   = $81       ; the ROM's FOR token, as its frames are marked
@@ -173,6 +176,7 @@ optable:
         .word   op_inverse, op_flash, op_speed, op_trace, op_notrace, op_text, op_gr, op_color
         .word   op_plot, op_hlin, op_vlin, op_scrn, op_stop, op_clear, op_run, op_onerr
         .word   op_resume, op_stmt, op_tab, op_spc, op_bytepush, op_lomem, op_himem
+        .word   op_cont
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -489,8 +493,36 @@ stub_end:
 ; The operations
 ; =========================================================================
 
+; END: in a running program, CONT goes on after it (END.., $D870)
 op_end:
+        inx
+        inx
+        jsr     cont_here
         stz     VM_ERR
+        jmp     vm_leave
+
+; cont_here: CONT will go on at X, in CURLIN - unless this is a direct line
+cont_here:
+        lda     CURLIN+1
+        cmp     #$FF
+        beq     @rts
+        stx     VM_CONTIP
+        ldy     CURLIN
+        sty     VM_CONTLIN
+@rts:   rts
+
+; BREAK, and IN n unless direct; then back to the shell (VM_ERR $FD)
+break_msg:
+        ldy     #msg_break - msgtab
+        jsr     strout_y
+        lda     CURLIN+1
+        cmp     #$FF
+        beq     @out
+        ldy     #msg_in - msgtab
+        jsr     strout_y
+        jsr     linprt
+@out:   lda     #$FD
+        sta     VM_ERR
         jmp     vm_leave
 
 ; LINE n: the line's number into CURLIN; AppleSoft's Ctrl-C check (ISCNTC)
@@ -502,7 +534,9 @@ op_line:
         cmp     #$83            ; Ctrl-C
         beq     @break
 @go:    NEXTOP  4
-@break: jmp     op_end          ; (M3: BREAK IN n, CONT)
+@break: sta     f:$00C010       ; the key taken (INCHR)
+        jsr     cont_here       ; CONT: this line again from its start
+        jmp     break_msg
 
 ; LDC k: FAC = the constant at k: exp, mantissa 4, sign, rounding byte -
 ; what FIN made of the constant's text at compile time
@@ -3243,14 +3277,20 @@ spc_done:
 
 ; STOP: "\rBREAK" and the bell, " IN n"
 op_stop:
-        ldy     #msg_break - msgtab
-        jsr     strout_y
-        ldy     #msg_in - msgtab
-        jsr     strout_y
-        jsr     linprt
-        lda     #$FD            ; (VM_ERR: STOP)
-        sta     VM_ERR
-        jmp     vm_leave
+        inx
+        inx
+        jsr     cont_here
+        jmp     break_msg
+
+; CONT: on from where END, STOP or Ctrl-C left the program (CONT, $D898)
+op_cont:
+        ldx     VM_CONTIP
+        bne     @go
+        lda     #ERR_CANT_CONTINUE
+        jmp     vm_error
+@go:    ldy     VM_CONTLIN
+        sty     CURLIN
+        jmp     ($0000,x)
 
 ; CLEAR: variables zero, arrays undimensioned, strings and DATA reset, the
 ; stacks empty (CLEARC)
@@ -3329,7 +3369,9 @@ clear_all:
         sta     a:$0000,y
         iny
         bne     @dz
-@heap2: ldy     VM_PROG         ; the array heap from its start
+@heap2: ldy     #$0000          ; no CONT after a CLEAR (STKINI)
+        sty     VM_CONTIP
+        ldy     VM_PROG         ; the array heap from its start
         rep     #$20
         .a16
         lda     a:$0018,y

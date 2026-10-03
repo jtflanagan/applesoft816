@@ -34,7 +34,7 @@ enum {
   T_VLIN = 0x8F, T_HTAB = 0x96, T_HOME = 0x97, T_TRACE = 0x9B, T_NOTRACE = 0x9C, T_NORMAL = 0x9D,
   T_INVERSE = 0x9E, T_FLASH = 0x9F, T_COLOR = 0xA0, T_POP = 0xA1, T_VTAB = 0xA2, T_HIMEM = 0xA3,
   T_LOMEM = 0xA4, T_ONERR = 0xA5, T_RESUME = 0xA6, T_SPEED = 0xA9, T_RUN = 0xAC, T_STOP = 0xB3,
-  T_ON = 0xB4, T_WAIT = 0xB5, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
+  T_ON = 0xB4, T_WAIT = 0xB5, T_CONT = 0xBB, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
   T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
@@ -984,6 +984,7 @@ static void statement(void)
   case T_GR: op(OP_GR); return;
   case T_CLEAR: op(OP_CLEAR); return;
   case T_STOP: op(OP_STOP); return;
+  case T_CONT: op(OP_CONT); return;
   case T_RESUME: op(OP_RESUME); return;
   case T_LOMEM: num_then(OP_LOMEM); return;
   case T_HIMEM: num_then(OP_HIMEM); return;
