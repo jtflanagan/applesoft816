@@ -34,8 +34,13 @@ FP_ERR   = $F2          ; error code, 0 = none (ours)
 FP_RES   = $F3          ; byte result (ours)
 FP_DPP   = $F4          ; 3 bytes: long pointer to this direct page (ours)
 
+CHARAC   = $0D          ; INT leaves FAC's low mantissa byte here
+LINNUM   = $50          ; GETADR's result, 2 bytes
+FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
+
 ERR_OVERFLOW = $45
 ERR_DIVZERO  = $85
+ERR_ILLQTY   = $35
 
 ; ---- entry/exit ----
 .macro  ENTER
@@ -89,6 +94,18 @@ ERR_DIVZERO  = $85
         jmp     fp_sgn             ; +$30  FAC = SGN(FAC)         (ROM SGN)
         nop
         jmp     fp_abs             ; +$34  FAC = ABS(FAC)         (ROM ABS)
+        nop
+        jmp     fp_int             ; +$38  FAC = INT(FAC)         (ROM INT)
+        nop
+        jmp     fp_qint            ; +$3C  FAC mantissa = 32-bit integer (ROM QINT)
+        nop
+        jmp     fp_ayint           ; +$40  FAC+3,4 = signed 16-bit or ?ILLEGAL QUANTITY
+        nop
+        jmp     fp_givayf          ; +$44  FAC = signed 16-bit FP_INT (ROM GIVAYF)
+        nop
+        jmp     fp_conint          ; +$48  FP_RES = byte 0-255 or ?ILLEGAL QUANTITY
+        nop
+        jmp     fp_getadr          ; +$4C  LINNUM = 16-bit address or ?ILLEGAL QUANTITY
         nop
 
 ; ---- public entries ----
@@ -169,6 +186,39 @@ fp_sgn:
 fp_abs:
         ENTER
         lsr     FACSIGN         ; ABS ($EBAF)
+        LEAVE
+
+fp_int:
+        ENTER
+        jsr     int
+        LEAVE
+
+fp_qint:
+        ENTER
+        jsr     qint
+        LEAVE
+
+fp_ayint:
+        ENTER
+        jsr     ayint
+        LEAVE
+
+fp_givayf:
+        ENTER
+        lda     FP_INT+1
+        ldy     FP_INT
+        jsr     givayf
+        LEAVE
+
+fp_conint:
+        ENTER
+        jsr     conint
+        stx     FP_RES
+        LEAVE
+
+fp_getadr:
+        ENTER
+        jsr     getadr
         LEAVE
 
 ; Error: unwind to the entry's frame and return with FP_ERR set.
@@ -838,3 +888,110 @@ fcomp:
         eor     #$FF
 @lebef: jmp     sign2
 @rts:   rts
+
+; =========================================================================
+; Float <-> integer
+; =========================================================================
+
+; QINT ($EBF2): FAC mantissa = INT(FAC) as a 32-bit two's-complement integer
+qint:
+        lda     FAC
+        beq     qint_3
+        sec
+        sbc     #$A0
+        bit     FACSIGN
+        bpl     @lec06
+        tax
+        lda     #$FF
+        sta     SHIFTEXT
+        jsr     complement_fac_mantissa
+        txa
+@lec06: ldx     #FAC
+        cmp     #$F9
+        bpl     qint_2
+        jsr     shift_right
+        sty     SHIFTEXT
+        rts
+; QINT.2 ($EC12)
+qint_2: tay
+        lda     FACSIGN
+        and     #$80
+        lsr     FAC+1
+        ora     FAC+1
+        sta     FAC+1
+        jsr     shift_right_4
+        sty     SHIFTEXT
+        rts
+
+; INT ($EC23)
+int:    lda     FAC
+        cmp     #$A0
+        bcs     int_rts
+        jsr     qint
+        sty     FAC_EXT
+        lda     FACSIGN
+        sty     FACSIGN
+        eor     #$80
+        rol     a
+        lda     #$A0
+        sta     FAC
+        lda     FAC+4
+        sta     CHARAC
+        jmp     normalize_fac_1
+; QINT.3 ($EC40)
+qint_3: sta     FAC+1
+        sta     FAC+2
+        sta     FAC+3
+        sta     FAC+4
+        tay
+int_rts:
+        rts
+
+; -32768 as the ROM has it at $E0FE: its last byte is the $20 of the next
+; routine's JSR, so it is a hair below -32768 - kept, it decides AYINT's range
+neg32768:
+        .byte   $90, $80, $00, $00, $20
+
+; MKINT ($E108), AYINT ($E10C): FAC+3/FAC+4 = signed 16-bit (high, low)
+mkint:  lda     FACSIGN
+        bmi     mi1
+ayint:  lda     FAC
+        cmp     #$90
+        bcc     mi2
+        lda     #<neg32768
+        sta     FP_PTR
+        lda     #>neg32768
+        sta     FP_PTR+1
+        lda     #^neg32768
+        sta     FP_PTR+2
+        jsr     fcomp
+mi1:    bne     iqerr
+mi2:    jmp     qint
+
+iqerr:  lda     #ERR_ILLQTY
+        jmp     fp_error
+
+; GIVAYF ($E2F2): FAC = the signed 16-bit integer in A (high), Y (low)
+givayf: ldx     #$00
+        sta     FAC+1
+        sty     FAC+2
+        ldx     #$90
+        jmp     float_1         ; (the ROM also clears VALTYP here)
+
+; CONINT ($E6FB): X = FAC as a byte, or ?ILLEGAL QUANTITY
+conint: jsr     mkint
+        ldx     FAC+3
+        bne     iqerr
+        ldx     FAC+4
+        rts
+
+; GETADR ($E752): LINNUM = FAC as a 16-bit address (-65535..65535)
+getadr: lda     FAC
+        cmp     #$91
+        bcs     iqerr
+        jsr     qint
+        lda     FAC+3
+        ldy     FAC+4
+        sty     LINNUM
+        sta     LINNUM+1
+        rts

@@ -27,15 +27,22 @@ constexpr int FAC = 0x9D, FACSIGN = 0xA2, SHIFTEXT = 0xA4, ARG = 0xA5, ARGSIGN =
 // ROM entries (S-C DocuMentor labels)
 constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R_FSUB = 0xE7A7,
                    R_FMULT = 0xE97F, R_FDIV = 0xEA66, R_FCOMP = 0xEBB2, R_MUL10 = 0xEA39,
-                   R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_ERROR = 0xD412;
+                   R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_INT = 0xEC23, R_QINT = 0xEBF2,
+                   R_AYINT = 0xE10C, R_GIVAYF = 0xE2F2, R_CONINT = 0xE6FB, R_GETADR = 0xE752,
+                   R_ERROR = 0xD412, R_CHRGOT = 0x00B7;
 // fp816 jump table
 constexpr uint32_t LIB = 0xF20000;
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
                    F_SUB = LIB + 0x10, F_MUL = LIB + 0x1C, F_DIV = LIB + 0x20, F_CMP = LIB + 0x24,
-                   F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34;
+                   F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34,
+                   F_INT = LIB + 0x38, F_QINT = LIB + 0x3C, F_AYINT = LIB + 0x40, F_GIVAYF = LIB + 0x44,
+                   F_CONINT = LIB + 0x48, F_GETADR = LIB + 0x4C;
+constexpr int LINNUM = 0x50, FP_INT = 0xF8;
 
 // how a ROM routine takes its operand
-enum Conv { AY, XY, NONE };
+enum Conv { AY, XY, NONE, INT16 }; // INT16: A = high, Y = low (operand bytes 3, 4)
+// where the byte/word result is
+enum Res { R_NONE, R_A, R_X, R_LINNUM };
 
 constexpr uint32_t OPERAND = 0x000300; // 5 packed bytes
 constexpr uint32_t STUB = 0x000310;
@@ -173,6 +180,7 @@ struct Machine {
         err = cpu.x() & 0xFF;
         return true;
       }
+      if (rom_mode && cpu.pc() == R_CHRGOT) return true; // CONINT's tail: JMP CHRGOT
       cpu.step();
       if (cpu.halted()) return true;
     }
@@ -180,7 +188,7 @@ struct Machine {
   }
 
   // ROM: JSR routine with the operand address in A/Y or X/Y, then STP
-  Outcome rom_call(uint16_t routine, const Fac& f, const uint8_t op[5], Conv conv, bool want_res = false)
+  Outcome rom_call(uint16_t routine, const Fac& f, const uint8_t op[5], Conv conv, Res res = R_NONE)
   {
     bool store = conv == XY;
     memset(&cpu.mem[0], 0, 0x100);
@@ -190,18 +198,24 @@ struct Machine {
     memcpy(&cpu.mem[STUB], stub, sizeof stub);
     cpu.reset_regs();
     // STORE takes X/Y (low/high); the loads and FADD/FSUB take A/Y
-    cpu.set_regs(store ? 0 : OPERAND & 0xFF, store ? OPERAND & 0xFF : 0, OPERAND >> 8, 0x01FF, 0, 0, 0x34,
-                 true);
+    if (conv == INT16) cpu.set_regs(op[4], 0, op[3], 0x01FF, 0, 0, 0x34, true);
+    else
+      cpu.set_regs(store ? 0 : OPERAND & 0xFF, store ? OPERAND & 0xFF : 0, OPERAND >> 8, 0x01FF, 0, 0, 0x34,
+                   true);
     Outcome o{};
     if (!run(STUB, true, o.err)) o.err = -1;
     o.fac = get_fac(0);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
-    if (want_res) o.res = cpu.a() & 0xFF;
+    if (!o.err) {
+      if (res == R_A) o.res = cpu.a() & 0xFF;
+      if (res == R_X) o.res = cpu.x() & 0xFF;
+      if (res == R_LINNUM) o.res = cpu.mem[LINNUM] | cpu.mem[LINNUM + 1] << 8;
+    }
     return o;
   }
 
   // fp816: JSL entry with FP_PTR = operand, D = DP_OURS, then STP
-  Outcome lib_call(uint32_t entry, const Fac& f, const uint8_t op[5], bool want_res = false)
+  Outcome lib_call(uint32_t entry, const Fac& f, const uint8_t op[5], Conv conv, Res res = R_NONE)
   {
     memset(&cpu.mem[DP_OURS], 0, 0x100);
     put_fac(DP_OURS, f);
@@ -209,6 +223,7 @@ struct Machine {
     cpu.mem[DP_OURS + FP_PTR] = uint8_t(OPERAND);
     cpu.mem[DP_OURS + FP_PTR + 1] = uint8_t(OPERAND >> 8);
     cpu.mem[DP_OURS + FP_PTR + 2] = uint8_t(OPERAND >> 16);
+    if (conv == INT16) cpu.mem[DP_OURS + FP_INT] = op[3], cpu.mem[DP_OURS + FP_INT + 1] = op[4];
     uint8_t stub[] = {0x22, uint8_t(entry), uint8_t(entry >> 8), uint8_t(entry >> 16), 0xDB};
     memcpy(&cpu.mem[STUB], stub, sizeof stub);
     cpu.reset_regs();
@@ -220,7 +235,10 @@ struct Machine {
     if (cpu.p() != p && o.err >= 0) o.err = -2; // M/X (or anything) not restored
     o.fac = get_fac(DP_OURS);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
-    if (want_res) o.res = cpu.mem[DP_OURS + FP_RES];
+    if (!o.err) {
+      if (res == R_A || res == R_X) o.res = cpu.mem[DP_OURS + FP_RES];
+      if (res == R_LINNUM) o.res = cpu.mem[DP_OURS + LINNUM] | cpu.mem[DP_OURS + LINNUM + 1] << 8;
+    }
     return o;
   }
 };
@@ -267,10 +285,11 @@ int main(int argc, char** argv)
   struct Test {
     const char* name;
     std::function<Outcome(bool ours, const Fac&, const uint8_t*)> call;
+    int lo = 0, hi = 255; // the exponent range the cases centre on
   };
-  auto both = [&](uint32_t ours, uint16_t rom, Conv conv, bool res = false) {
+  auto both = [&](uint32_t ours, uint16_t rom, Conv conv, Res res = R_NONE) {
     return [&m, ours, rom, conv, res](bool o, const Fac& f, const uint8_t* p) {
-      return o ? m.lib_call(ours, f, p, res) : m.rom_call(rom, f, p, conv, res);
+      return o ? m.lib_call(ours, f, p, conv, res) : m.rom_call(rom, f, p, conv, res);
     };
   };
   std::vector<Test> tests = {
@@ -280,11 +299,17 @@ int main(int argc, char** argv)
       {"FSUB mem-FAC", both(F_SUB, R_FSUB, AY)},
       {"FMULT mem*FAC", both(F_MUL, R_FMULT, AY)},
       {"FDIV mem/FAC", both(F_DIV, R_FDIV, AY)},
-      {"FCOMP mem:FAC", both(F_CMP, R_FCOMP, AY, true)},
+      {"FCOMP mem:FAC", both(F_CMP, R_FCOMP, AY, R_A)},
       {"MUL10", both(F_MUL10, R_MUL10, NONE)},
       {"DIV10", both(F_DIV10, R_DIV10, NONE)},
       {"SGN", both(F_SGN, R_SGN, NONE)},
       {"ABS", both(F_ABS, R_ABS, NONE)},
+      {"INT", both(F_INT, R_INT, NONE), 0x70, 0xA8},
+      {"QINT", both(F_QINT, R_QINT, NONE), 0x70, 0xA0},
+      {"AYINT", both(F_AYINT, R_AYINT, NONE), 0x70, 0x92},
+      {"GIVAYF", both(F_GIVAYF, R_GIVAYF, INT16)},
+      {"CONINT", both(F_CONINT, R_CONINT, NONE, R_X), 0x70, 0x8A},
+      {"GETADR", both(F_GETADR, R_GETADR, NONE, R_LINNUM), 0x70, 0x92},
   };
 
   // optional filter: FPTEST_ONLY=substring
@@ -299,7 +324,7 @@ int main(int argc, char** argv)
   for (auto& t : tests) {
     long bad = 0, errs = 0;
     for (long i = 0; i < cases; i++) {
-      int centre = int(rndn(256));
+      int centre = t.lo + int(rndn(unsigned(t.hi - t.lo + 1)));
       Fac f = random_fac(centre);
       uint8_t op[5];
       if (rndn(4) == 0 && f.exp) packed_near(op, f);
