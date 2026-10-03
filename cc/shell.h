@@ -10,6 +10,7 @@ void shell(void);
 
 /* main.c */
 int compile(CompileStats *st, void (*poll)(void *));
+int compile_direct(const uint8_t *tok, uint16_t *entry);
 extern uint32_t text_base, vm_base;
 extern uint8_t vm_bank;
 extern uint16_t vm_dp;
@@ -26,7 +27,7 @@ uint8_t peek0(uint16_t a);
 void poke0(uint16_t a, uint8_t v);
 uint8_t mli_call(uint8_t cmd);
 uint8_t rom_call(uint16_t addr);
-uint8_t vm_call(void);
+uint8_t vm_call(uint16_t entry);       /* vm_run ($0000) or vm_direct; VM_ERR */
 extern uint16_t hash_acc;
 void far_hash(void);                   /* hash_acc over xfer_n bytes at xfer_far */
 

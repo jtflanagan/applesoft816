@@ -87,6 +87,8 @@ VM_STMTCSP = $DE        ; 2: ... and the control stack then
 VM_ERRIP = $E0          ; 2: RESUME's statement
 VM_ERRCSP = $E2         ; 2: ... and its control stack
 VM_ONERR = $E4          ; 2: the ONERR handler's IP (0: none)
+VM_DENTRY = $E6         ; 2: vm_direct's code (the shell's direct line)
+VM_FRESH = $E8          ; 1: vm_direct CLEARs first (the image is new, or was edited)
 LINNUM   = $50          ; 2: GETADR's result (fp816)
 
 ERR_NEXT_WITHOUT_FOR  = $00
@@ -149,6 +151,7 @@ GOSUB_SIZE  = 5         ; return IP 2, line 2, mark 1
         .word   stub_end - stub_start ; +$12  ...this many bytes, point COUT_VEC at it
         .word   msgtab          ; +$14
         .word   fp_table        ; +$16  fp816's jump table (fp.s), for the platform's FIN
+        .word   vm_direct       ; +$18  JSL here for a direct line (see vm_direct)
 
         .segment "CODE"
 
@@ -184,12 +187,50 @@ OP_COUNT = (* - optable) / 2
 vm_run:
         php
         phb
+        jsr     vm_setup
+        jsr     clear_all       ; a RUN is a CLEAR first: the image may have run before
+        stz     VM_FRESH
+        rep     #$20
+        .a16
+        ldy     VM_PROG
+        ldx     a:$0000,y       ; entry IP
+        sep     #$20
+        .a8
+        stz     VM_ERR
+        jmp     ($0000,x)
+
+; vm_direct: JSL, as vm_run, for the code at VM_DENTRY in direct mode
+; (CURLIN $FFFF) with the program's state as it stands - variables, FOR and
+; GOSUB frames, DATA, strings - or CLEARed first if VM_FRESH (the image is
+; new, or the program was edited: AppleSoft forgets its variables then)
+vm_direct:
+        php
+        phb
+        jsr     vm_setup
+        lda     VM_FRESH
+        beq     @go
+        stz     VM_FRESH
+        jsr     clear_all
+@go:    rep     #$20
+        .a16
+        ldx     VM_DENTRY
+        sep     #$20
+        .a8
+        stz     VM_ERR
+        jmp     ($0000,x)
+
+; what both entries do: DBR, VM_S (the caller's stack, under the return
+; address and the two pushes), the stacks' bases, CURLIN, the trampolines.
+; Returns with M = 1, X = 0.
+vm_setup:
         phk
         plb
         rep     #$30
         .a16
         .i16
         tsc
+        clc
+        adc     #2              ; as it was before this JSR
         sta     VM_S
         lda     #prog_start
         sta     VM_PROG
@@ -197,24 +238,13 @@ vm_run:
         lda     a:$0002,y       ; program header: expression stack base
         sta     VM_FSP
         lda     a:$0004,y       ; control stack base, limit
-        sta     VM_CSP
         sta     VM_CBASE_PTR
         lda     a:$0006,y
         sta     VM_CLIM
         lda     a:$000C,y       ; the string temporary stack
         sta     VM_SSP
-        lda     a:$0016,y       ; the DATA pool (RESTORE's state)
-        sta     DATPTR
-        stz     SH_FREE         ; the string heap: the low half, empty
-        lda     #$8000
-        sta     SH_END
         lda     #$FFFF
         sta     CURLIN
-        jsr     clear_all       ; a RUN is a CLEAR first: the image may have run before
-        rep     #$20
-        .a16
-        ldy     VM_PROG
-        ldx     a:$0000,y       ; entry IP
         lda     COUT_VEC        ; patch the COUT trampoline
         sta     cout_target
         clc                     ; and romcall's: the stub block's base + offsets
@@ -230,9 +260,7 @@ vm_run:
         sta     cout_target+2
         sta     romcall_target+2
         sta     RC_TGT+2
-        stz     SH_HALF
-        stz     VM_ERR
-        jmp     ($0000,x)
+        rts
 
 ; leave: VM_ERR set
 vm_leave:
@@ -3289,7 +3317,19 @@ clear_all:
         ply
         iny
         bra     @d
-@heap:  ldy     VM_PROG         ; the array heap from its start
+@heap:  ldy     VM_PROG         ; direct lines' variables (header +$22, 0: none),
+        rep     #$20            ; up to the bank's end
+        .a16
+        lda     a:$0022,y
+        tay
+        sep     #$20
+        .a8
+        beq     @heap2
+@dz:    lda     #$00
+        sta     a:$0000,y
+        iny
+        bne     @dz
+@heap2: ldy     VM_PROG         ; the array heap from its start
         rep     #$20
         .a16
         lda     a:$0018,y

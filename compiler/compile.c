@@ -54,7 +54,14 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 34
+#define HEADER_SIZE 36
+#define SV_SPARE 16                  /* string roots kept free for direct lines' variables */
+/* the direct line's area, at the top of the VM bank (the array heap ends
+ * below it): an END, the line's code, its constants and strings; the
+ * variables direct lines make, from the top down */
+#define DIRECT_BASE 0xF400u
+#define DIRECT_DATA 0xFA00u
+#define DIRECT_VARS 0xFC00u          /* the lowest a direct line's variable goes */
 #define MAX_FNS 64
 #define MAX_LITS 3000                /* numeric literals FIN converts in pass 1 */
 #define CONST_HASH 128
@@ -89,14 +96,18 @@ static uint16_t str_bytes;          /* string literal pool size, this pass */
 /* the layout, fixed after pass 1 */
 static uint16_t data_base, data_bytes, data_at;   /* the DATA pool */
 static Var fns[MAX_FNS];                          /* DEF FN names */
+static uint16_t fn_addr[MAX_FNS];                 /* a direct line's FN entries */
 static uint16_t nfns, fn_base, desc_copy_base, desc_bytes;
 static int use_onerr;                             /* STMT marks needed */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
-static uint16_t nsvars, nsarrays;
+static uint16_t nsvars, nsarrays, svlist_cap;
 NOINIT static uint16_t var_off[MAX_VARS];
 static uint16_t desc_off[MAX_ARRAYS];
 static uint16_t str_at;             /* pass 2: the next literal's address */
+/* direct lines */
+static int direct;                  /* compiling one */
+static uint16_t dvar_at;            /* the lowest of their variables (0: none yet) */
 
 /* the line being compiled */
 static uint8_t buf[256];
@@ -179,6 +190,25 @@ static void error_here(uint8_t e)
 }
 
 /* ---- symbols ---- */
+
+/* a direct line's new variable (or FN entry): size zeroed bytes from the top
+ * down; a string's address joins the collector's roots (SV_SPARE kept free).
+ * The header's +$22 says where they start, for CLEAR */
+static uint16_t direct_var(uint8_t size, int is_string)
+{
+  uint16_t a = (uint16_t)((dvar_at ? dvar_at : 0) - size), k;
+  if (a < DIRECT_VARS || (is_string && nsvars >= svlist_cap)) { overflow = 1; return DIRECT_VARS; }
+  for (k = 0; k < size; k++) out((uint16_t)(a + k), 0);
+  dvar_at = a;
+  out((uint16_t)(pf->prog_start + 0x22), (uint8_t)a), out((uint16_t)(pf->prog_start + 0x23), (uint8_t)(a >> 8));
+  if (is_string) {
+    uint16_t r = (uint16_t)(svlist_base + 2 * nsvars);
+    out(r, (uint8_t)a), out((uint16_t)(r + 1), (uint8_t)(a >> 8));
+    nsvars++;
+    out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
+  }
+  return a;
+}
 static uint16_t var_slot(uint8_t c1, uint8_t c2, uint8_t type)
 {
   uint16_t i;
@@ -188,6 +218,7 @@ static uint16_t var_slot(uint8_t c1, uint8_t c2, uint8_t type)
     if (nvars == MAX_VARS) { overflow = 1; return 0; }
     vars[nvars].c1 = c1, vars[nvars].c2 = c2, vars[nvars].type = type;
     nvars++;
+    if (direct) var_off[i] = direct_var(type == 1 ? 2 : type == 2 ? 4 : 5, type == 2);
   }
   return pass == 2 ? var_off[i] : 0;
 }
@@ -200,7 +231,7 @@ static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
   for (i = 0; i < narrays; i++)
     if (arrays[i].c1 == c1 && arrays[i].c2 == c2 && arrays[i].type == type) break;
   if (i == narrays) {
-    if (narrays == MAX_ARRAYS) { overflow = 1; return 0; }
+    if (narrays == MAX_ARRAYS || direct) { overflow = 1; return 0; }
     arrays[narrays].c1 = c1, arrays[narrays].c2 = c2, arrays[narrays].type = type;
     arrays[narrays].ndims = ndims;
     narrays++;
@@ -208,23 +239,44 @@ static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
   return arrays[i].ndims == ndims ? (int)i : -1;
 }
 
+static uint8_t const_hash(const uint8_t fac[7])
+{
+  return (uint8_t)((fac[0] + fac[1] + fac[2] + fac[3] + fac[4] + fac[5] + fac[6]) & (CONST_HASH - 1));
+}
+/* the constant's index in the pool + 1, or 0 */
+static uint16_t const_find(const uint8_t fac[7])
+{
+  uint16_t i;
+  uint8_t k;
+  for (i = const_head[const_hash(fac)]; i; i = const_next[i - 1]) {
+    const uint8_t *c = consts[i - 1];
+    for (k = 0; k < 7 && c[k] == fac[k]; k++) {}
+    if (k == 7) return i;
+  }
+  return 0;
+}
 /* the constant's index in the pool, added if new */
 static uint16_t const_index(const uint8_t fac[7])
 {
-  uint8_t h = (uint8_t)((fac[0] + fac[1] + fac[2] + fac[3] + fac[4] + fac[5] + fac[6]) & (CONST_HASH - 1)), k;
-  uint16_t i;
-  for (i = const_head[h]; i; i = const_next[i - 1]) {
-    const uint8_t *c = consts[i - 1];
-    for (k = 0; k < 7 && c[k] == fac[k]; k++) {}
-    if (k == 7) return (uint16_t)(i - 1);
-  }
+  uint8_t h = const_hash(fac);
+  uint16_t i = const_find(fac);
+  if (i) return (uint16_t)(i - 1);
   if (nconsts == MAX_CONSTS) { overflow = 1; return 0; }
   memcpy(consts[nconsts], fac, 7);
   const_next[nconsts] = const_head[h];
   const_head[h] = ++nconsts;
   return (uint16_t)(nconsts - 1);
 }
-static uint16_t const_slot(const uint8_t fac[7]) { return (uint16_t)(const_base + 7 * const_index(fac)); }
+static uint16_t const_slot(const uint8_t fac[7])
+{
+  uint16_t i, k;
+  if (!direct) return (uint16_t)(const_base + 7 * const_index(fac));
+  if ((i = const_find(fac)) != 0) return (uint16_t)(const_base + 7 * (i - 1));
+  if ((uint16_t)(str_at + 7) > DIRECT_VARS) { overflow = 1; return DIRECT_DATA; }
+  for (k = 0; k < 7; k++) out((uint16_t)(str_at + k), fac[k]);
+  str_at = (uint16_t)(str_at + 7);
+  return (uint16_t)(str_at - 7);
+}
 
 /* a numeric literal at buf[p]: its constant's slot, and p past it; 0 for
  * FIN's ?OVERFLOW (p not moved) */
@@ -234,7 +286,7 @@ static int literal(uint16_t *slot)
   uint8_t fac[7];
   uint16_t i;
   int used;
-  if (pass == 2) {                  /* pass 1 saw it (parsing is the same in both passes) */
+  if (pass == 2 && !direct) {       /* pass 1 saw it (parsing is the same in both passes) */
     while (lit_i < nlits && lits[lit_i].at < at) lit_i++;
     if (lit_i < nlits && lits[lit_i].at == at) {
       *slot = (uint16_t)(const_base + 7 * lits[lit_i].slot);
@@ -244,6 +296,11 @@ static int literal(uint16_t *slot)
   }
   used = pf->fin(pf->ctx, buf + p, blen - p, fac);
   if (used <= 0) return 0;
+  if (direct) {
+    *slot = const_slot(fac);
+    p += used;
+    return 1;
+  }
   i = const_index(fac);
   *slot = (uint16_t)(const_base + 7 * i);
   if (pass == 1 && nlits < MAX_LITS) {
@@ -264,8 +321,10 @@ static uint16_t fn_slot(uint8_t c1, uint8_t c2)
     if (nfns == MAX_FNS) { overflow = 1; return 0; }
     fns[nfns].c1 = c1, fns[nfns].c2 = c2, fns[nfns].type = 0;
     nfns++;
+    if (direct) { fns[i].type = 1; fn_addr[i] = direct_var(4, 0); }   /* (type 1: fn_addr has it) */
   }
-  return pass == 2 ? (uint16_t)(fn_base + 4 * i) : 0;
+  if (pass != 2) return 0;
+  return fns[i].type ? fn_addr[i] : (uint16_t)(fn_base + 4 * i);
 }
 
 /* a string literal: length byte, then the text */
@@ -296,6 +355,7 @@ static uint16_t line_addr(uint16_t n)
 /* where control goes after this line: the next line, or the final END */
 static uint16_t next_line_addr(void)
 {
+  if (direct) return DIRECT_BASE;
   return line_i + 1 < nlines ? lines[line_i + 1].addr : lines[nlines].addr;
 }
 
@@ -862,6 +922,13 @@ static int coord(int r)
   return 1;
 }
 
+/* INPUT, GET and DEF in a direct line: ?ILLEGAL DIRECT when it runs */
+static void illegal_direct(void)
+{
+  op16(OP_ERR, E_ILLEGAL_DIRECT);
+  skip_statement();
+}
+
 static void statement(void)
 {
   uint8_t c = peek();
@@ -881,14 +948,14 @@ static void statement(void)
   case T_NEXT: st_next(); return;
   case T_DIM: st_dim(); return;
   case T_REM: p = blen; return;
-  case T_DATA: st_data(); return;
-  case T_INPUT: st_input(); return;
+  case T_DATA: if (direct) skip_statement(); else st_data(); return;
+  case T_INPUT: if (direct) { illegal_direct(); return; } st_input(); return;
   case T_READ: op(OP_READSTART); input_items(); return;
-  case T_GET: op(OP_GETSTART); input_items(); return;
+  case T_GET: if (direct) { illegal_direct(); return; } op(OP_GETSTART); input_items(); return;
   case T_RESTORE: op(OP_RESTORE); return;
   case T_ON: st_on(); return;
   case T_POP: op(OP_POP); return;
-  case T_DEF: st_def(); return;
+  case T_DEF: if (direct) { illegal_direct(); return; } st_def(); return;
   case T_POKE: if (num_then(OP_ADR) && want(',')) num_then(OP_POKE); return;
   case T_WAIT:
     if (!num_then(OP_ADR) || !want(',') || !coord(0)) return;
@@ -1022,6 +1089,8 @@ int as816_compile(const Platform *platform, CompileStats *st)
   uint16_t i, a;
   pf = platform;
   overflow = 0;
+  direct = 0;
+  dvar_at = 0;
   use_onerr = scan_onerr();
   code_base = (uint16_t)(pf->prog_start + HEADER_SIZE);
   const_base = str_base = 0;
@@ -1052,12 +1121,13 @@ int as816_compile(const Platform *platform, CompileStats *st)
   for (i = 0; i < nvars; i++) nsvars += vars[i].type == 2;
   for (i = 0; i < narrays; i++) nsarrays += arrays[i].type == 2;
   svlist_base = a;
-  salist_base = (uint16_t)(svlist_base + 2 * nsvars);
+  svlist_cap = (uint16_t)(nsvars + SV_SPARE);
+  salist_base = (uint16_t)(svlist_base + 2 * svlist_cap);
   fstack_base = (uint16_t)(salist_base + 2 * nsarrays);
   sstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
   heap_base = (uint16_t)(cstack_base + CSTACK_SIZE);
-  if (heap_base < fstack_base || heap_base > 0xFF00) return -1;
+  if (heap_base < fstack_base || heap_base > DIRECT_BASE) return -1;
 
   pass = 2;
   run_pass();
@@ -1094,14 +1164,15 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[17];
+    uint16_t h = pf->prog_start, vals[18];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
-    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = 0xFFFF;
+    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = DIRECT_BASE;
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
     vals[11] = data_base;
     vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
-    for (i = 0; i < 17; i++) {
+    vals[17] = 0;                          /* direct lines' variables: none yet */
+    for (i = 0; i < 18; i++) {
       out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }
@@ -1114,4 +1185,95 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   flush();
   return 0;
+}
+
+/* ---- direct lines ---- */
+
+int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
+{
+  uint16_t nv = nvars, nf = nfns, nsv = nsvars, dv = dvar_at;
+  pf = platform;
+  overflow = 0;
+  direct = 1;
+  pass = 2;
+  for (blen = 0; tok[blen] && blen < sizeof buf - 1; blen++) buf[blen] = tok[blen];
+  buf[blen] = 0;
+  p = 0;
+  line_at = 0;
+  line_i = 0;
+  str_at = DIRECT_DATA;
+  pc = DIRECT_BASE;
+  clen = 0;
+  op(OP_END);                               /* where IF false and ON past its list go */
+  *entry = pc;
+  for (;;) {
+    statement();
+    if (p >= blen || peek() == 0) break;
+    if (peek() == ':') { p++; continue; }
+    error_here(E_SYNTAX);
+  }
+  op(OP_END);
+  if (pc > DIRECT_DATA) overflow = 1;
+  flush_code(clen);
+  flush();
+  direct = 0;
+  if (overflow) {                          /* forget what it made: it never runs */
+    nvars = nv, nfns = nf, dvar_at = dv;
+    if (nsvars != nsv) {
+      nsvars = nsv;
+      out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
+      flush();
+    }
+    return -1;
+  }
+  return 0;
+}
+
+/* the compiler's tables (direct lines need them), out to the cache or back
+ * in from it: io moves n bytes between p and the file, in order */
+typedef struct {
+  uint16_t nlines, nvars, narrays, nconsts, nfns, nsvars, nsarrays, svlist_cap, use_onerr;
+  uint16_t code_base, const_base, str_base, data_base, var_base, fn_base, desc_base, desc_copy_base,
+      desc_bytes, svlist_base, salist_base, fstack_base, sstack_base, cstack_base, heap_base;
+} State;
+
+void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx)
+{
+  State t;
+  uint16_t i;
+  if (save) {
+    t.nlines = nlines, t.nvars = nvars, t.narrays = narrays, t.nconsts = nconsts, t.nfns = nfns;
+    t.nsvars = nsvars, t.nsarrays = nsarrays, t.svlist_cap = svlist_cap, t.use_onerr = (uint16_t)use_onerr;
+    t.code_base = code_base, t.const_base = const_base, t.str_base = str_base, t.data_base = data_base;
+    t.var_base = var_base, t.fn_base = fn_base, t.desc_base = desc_base, t.desc_copy_base = desc_copy_base;
+    t.desc_bytes = desc_bytes, t.svlist_base = svlist_base, t.salist_base = salist_base;
+    t.fstack_base = fstack_base, t.sstack_base = sstack_base, t.cstack_base = cstack_base, t.heap_base = heap_base;
+  }
+  io(ctx, &t, sizeof t);
+  if (!save) {
+    nlines = t.nlines, nvars = t.nvars, narrays = t.narrays, nconsts = t.nconsts, nfns = t.nfns;
+    nsvars = t.nsvars, nsarrays = t.nsarrays, svlist_cap = t.svlist_cap, use_onerr = t.use_onerr;
+    code_base = t.code_base, const_base = t.const_base, str_base = t.str_base, data_base = t.data_base;
+    var_base = t.var_base, fn_base = t.fn_base, desc_base = t.desc_base, desc_copy_base = t.desc_copy_base;
+    desc_bytes = t.desc_bytes, svlist_base = t.svlist_base, salist_base = t.salist_base;
+    fstack_base = t.fstack_base, sstack_base = t.sstack_base, cstack_base = t.cstack_base, heap_base = t.heap_base;
+    if (nlines > MAX_LINES || nvars > MAX_VARS || narrays > MAX_ARRAYS || nconsts > MAX_CONSTS || nfns > MAX_FNS)
+      nlines = nvars = narrays = nconsts = nfns = 0;
+  }
+  io(ctx, lines, (uint16_t)(sizeof lines[0] * (nlines + 1)));
+  io(ctx, vars, (uint16_t)(sizeof vars[0] * nvars));
+  io(ctx, var_off, (uint16_t)(sizeof var_off[0] * nvars));
+  io(ctx, arrays, (uint16_t)(sizeof arrays[0] * narrays));
+  io(ctx, desc_off, (uint16_t)(sizeof desc_off[0] * narrays));
+  io(ctx, fns, (uint16_t)(sizeof fns[0] * nfns));
+  io(ctx, consts, (uint16_t)(sizeof consts[0] * nconsts));
+  if (!save) {                             /* the constants' hash, and no direct lines yet */
+    memset(const_head, 0, sizeof const_head);
+    for (i = 0; i < nconsts; i++) {
+      uint8_t h = const_hash(consts[i]);
+      const_next[i] = const_head[h];
+      const_head[h] = (uint16_t)(i + 1);
+    }
+    dvar_at = 0;
+  }
 }

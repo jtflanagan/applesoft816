@@ -29,6 +29,7 @@ uint16_t vm_dp, fp_fin_addr;
 uint32_t xfer_far, xfer_far2;   /* far_in/far_out/far_move: one below the first byte */
 uint16_t xfer_near, xfer_n;
 uint16_t hash_acc;              /* far_hash */
+uint16_t vm_entry;              /* vm_call's */
 void far_in(void);
 void far_out(void);
 
@@ -63,6 +64,12 @@ int compile(CompileStats *st, void (*poll)(void *))
 {
   pf.poll = poll;
   return as816_compile(&pf, st);
+}
+
+/* compile a direct line against the program's tables */
+int compile_direct(const uint8_t *tok, uint16_t *entry)
+{
+  return as816_direct(&pf, tok, entry);
 }
 
 int cc_main(void)

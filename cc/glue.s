@@ -230,19 +230,22 @@ rom_call:
         .byte   0
         rts
 
-; uint8_t vm_call(void): the VM runs the compiled program (vm_run: JSL its
-; bank's $0000 with D = its direct page); returns its VM_ERR
+; uint8_t vm_call(uint16_t entry): JSL the VM bank's entry (vm_run at
+; $0000, vm_direct) with D = its direct page; returns its VM_ERR
         .global vm_call
 vm_call:
+        sta     mos16(vm_entry)
+        stx     mos16(vm_entry+1)
         jsr     zp_swap
         phk                             ; the VM's RTL comes back to vm_back
         .byte   0xf4                    ; pea vm_back - 1
         .short  vm_back - 1
-        lda     mos16(vm_bank)          ; "return" to vm_bank:$0000
+        lda     mos16(vm_bank)          ; "return" to vm_bank:entry
         pha
-        .byte   0xf4                    ; pea $FFFF
-        .short  0xffff
         rep     #0x20
+        lda     mos16(vm_entry)
+        dec     a
+        pha
         lda     mos16(vm_dp)
         tcd
         sep     #0x20

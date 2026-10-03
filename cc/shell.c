@@ -38,6 +38,11 @@
  * lines a frame, 15734 a second) */
 #define VERTCNT 0xC02E
 
+/* the VM's direct page (vm/vm.s) and image header */
+#define VM_DENTRY 0xE6
+#define VM_FRESH 0xE8
+#define VMH_DIRECT 0x18
+
 static uint8_t raw[256];             /* the line typed, 7-bit, 0 after (INLIN's) */
 static uint8_t line[256];            /* the same, upper case: the shell's commands */
 static uint8_t len;
@@ -227,6 +232,30 @@ typedef struct {
 } CacheHdr;
 
 #define CACHE_DIR "AS816.CACHE"
+#define CACHE_VERSION 2             /* 2: the compiler's tables after the image */
+
+/* the compiler's tables to and from the open cache, through the I/O buffer */
+static uint8_t cache_ref, cache_err;
+static void cache_io(void *ctx, void *p, uint16_t n)
+{
+  ReadParms r;
+  uint8_t *q = (uint8_t *)p;
+  uint16_t k;
+  int save = ctx != 0;
+  while (n && !cache_err) {
+    k = n < RES_IOSIZE ? n : RES_IOSIZE;
+    r.n = 4, r.ref = cache_ref, r.buf = RES_IOBUF, r.req = k, r.trans = 0;
+    if (save) {
+      to0(RES_IOBUF, q, k);
+      cache_err = mli(MLI_WRITE, &r, sizeof r);
+    } else {
+      cache_err = mli(MLI_READ, &r, sizeof r);
+      if (!cache_err && r.trans != k) cache_err = 0x4C;
+      if (!cache_err) from0(q, RES_IOBUF, k);
+    }
+    q += k, n = (uint16_t)(n - k);
+  }
+}
 
 /* the cache's pathname (or, dir_only, its directory's) into out; 0 if too long */
 static int cache_path(uint8_t *out, int dir_only)
@@ -268,22 +297,23 @@ static int cache_load(CompileStats *st)
   r.n = 4, r.ref = ref, r.buf = RES_IOBUF, r.req = sizeof h, r.trans = 0;
   if (mli(MLI_READ, &r, sizeof r) || r.trans != sizeof h) goto no;
   from0(&h, RES_IOBUF, sizeof h);
-  if (memcmp(h.magic, "A816", 4) || h.kind != 'C' || h.version != 1 || h.vm_print != vm_print ||
+  if (memcmp(h.magic, "A816", 4) || h.kind != 'C' || h.version != CACHE_VERSION || h.vm_print != vm_print ||
       h.src_len != src_len || h.src_hash != src_hash || h.start != prog_start)
     goto no;
   at = h.start;
-  r.req = RES_IOSIZE;
-  for (;;) {
+  while (got < h.len) {
+    r.req = (uint16_t)(h.len - got) < RES_IOSIZE ? (uint16_t)(h.len - got) : RES_IOSIZE;
     r.trans = 0;
     e = mli(MLI_READ, &r, sizeof r);
-    if (e == MLI_EOF || (!e && !r.trans)) break;
-    if (e || r.trans > h.len - got) goto no;
+    if (e || r.trans != r.req) goto no;
     xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (vm_base | at) - 1, xfer_n = r.trans;
     far_move();
     at = (uint16_t)(at + r.trans), got = (uint16_t)(got + r.trans);
   }
+  cache_ref = ref, cache_err = 0;
+  as816_state(0, cache_io, 0);
   close_ref(ref);
-  if (got != h.len) return 0;
+  if (cache_err) return 0;
   st->lines = h.lines, st->code_size = h.code;
   return 1;
 no:
@@ -301,7 +331,7 @@ static void cache_save(const CompileStats *st)
   WriteParms w;
   uint16_t end = vm_read16((uint16_t)(prog_start + 2)), at, n;   /* the header's fstack */
   memcpy(h.magic, "A816", 4);
-  h.kind = 'C', h.version = 1, h.vm_print = vm_print, h.src_len = src_len, h.src_hash = src_hash;
+  h.kind = 'C', h.version = CACHE_VERSION, h.vm_print = vm_print, h.src_len = src_len, h.src_hash = src_hash;
   h.start = prog_start, h.len = (uint16_t)(end - prog_start), h.lines = st->lines, h.code = st->code_size;
   if (!cache_path(cp, 1)) return;
   put_path(cp);
@@ -323,6 +353,8 @@ static void cache_save(const CompileStats *st)
       w.req = n;
       if (mli(MLI_WRITE, &w, sizeof w)) break;
     }
+  cache_ref = ref, cache_err = 0;
+  as816_state(1, cache_io, (void *)1);
   close_ref(ref);
 }
 
@@ -359,6 +391,7 @@ static int compile_current(void)
     print(" BYTES: CACHED");
     crout();
     compiled = 1;
+    poke0((uint16_t)(vm_dp + VM_FRESH), 1);
     return 0;
   }
   clk_start();
@@ -375,12 +408,13 @@ static int compile_current(void)
   crout();
   if (from_file) cache_save(&st);
   compiled = 1;
+  poke0((uint16_t)(vm_dp + VM_FRESH), 1);
   return 0;
 }
 
 static void run_current(void)
 {
-  if (!compile_current()) vm_call();
+  if (!compile_current()) vm_call(0);
 }
 
 /* ---- the program in memory: lines in, out, listed ---- */
@@ -650,6 +684,18 @@ static int32_t linget(uint8_t *p)
   return n;
 }
 
+/* a direct line (its tokens in raw): compiled against the program - which
+ * is compiled first, if it has to be - and run with its variables */
+static void direct_line(void)
+{
+  uint16_t entry;
+  if (compile_current()) return;
+  if (compile_direct(raw, &entry)) { as_error("OUT OF MEMORY"); return; }
+  poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)entry);
+  poke0((uint16_t)(vm_dp + VM_DENTRY + 1), (uint8_t)(entry >> 8));
+  vm_call(vm_read16(VMH_DIRECT));
+}
+
 /* an AppleSoft line: numbered, into the program; else at once */
 static void basic_line(void)
 {
@@ -686,16 +732,14 @@ static void basic_line(void)
     if (raw[1]) break;
     new_program();
     return;
-  case 0xAC:                            /* RUN */
-    if (raw[1]) break;                  /* (RUN n: with direct mode) */
+  case 0xAC:                            /* RUN (RUN n: a direct line) */
+    if (raw[1]) { direct_line(); return; }
     run_current();
     return;
   case 0:
     return;
   default:
-    crout();
-    print("DIRECT MODE: NOT YET");
-    crout();
+    direct_line();
     return;
   }
   as_error("SYNTAX");

@@ -36,7 +36,7 @@ enum { FN_SGN, FN_INT, FN_ABS, FN_SQR, FN_RND, FN_LOG, FN_EXP, FN_COS, FN_SIN, F
 /* AppleSoft error codes (offsets into its message table) */
 enum {
   E_SYNTAX = 0x10, E_UNDEF_STATEMENT = 0x5A, E_BAD_SUBSCRIPT = 0x6B, E_TYPE_MISMATCH = 0xA3,
-  E_FORMULA = 0xBF,
+  E_FORMULA = 0xBF, E_ILLEGAL_DIRECT = 0x95, E_OUT_OF_MEMORY = 0x4D,
   E_UNIMPLEMENTED = 0xFE /* ours: a construct the compiler cannot do yet */
 };
 
@@ -65,5 +65,15 @@ typedef struct CompileStats {
 
 /* Compile the program; returns 0, or -1 if it does not fit the bank. */
 int as816_compile(const Platform *pf, CompileStats *st);
+
+/* Compile a direct line (its tokens, ending in 0) against the last compile's
+ * tables, into the top of the VM bank (vm_direct runs it from *entry): its
+ * variables are the program's, new ones made there.  0, or -1 if it does
+ * not fit (then nothing of it is kept). */
+int as816_direct(const Platform *pf, const uint8_t *tok, uint16_t *entry);
+
+/* The compiler's tables for direct lines, to the bytecode cache (save) or
+ * back from it: io moves n bytes between p and the file, in order. */
+void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx);
 
 #endif
