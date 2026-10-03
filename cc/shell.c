@@ -26,6 +26,8 @@
 #define VM_DENTRY 0xE6
 #define VM_FRESH 0xE8
 #define VM_ONERR 0xE4
+#define VM_CBREQ 0x12
+#define VM_CURLIN 0x26
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
@@ -44,6 +46,9 @@ static uint16_t vm_print;           /* the VM image's hash: bytecode names its h
 static uint16_t prog_start;         /* where the VM image ends and the program begins */
 
 static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
+
+/* say what a compile cost (TIMING turns it on for RUN; COMPILE always) */
+static uint8_t timing, say_time;
 
 /* ---- the program from a file, to a file ---- */
 
@@ -283,14 +288,15 @@ static int compile_current(void)
   uint8_t e;
   if (compiled) return 0;
   if (from_file && cache_load(&st)) {
+    compiled = 1;
+    poke0((uint16_t)(vm_dp + VM_FRESH), 1);
+    if (!say_time) return 0;
     crout();
     print_u(st.lines);
     print(" LINES, ");
     print_u(st.code_size);
     print(" BYTES: CACHED");
     crout();
-    compiled = 1;
-    poke0((uint16_t)(vm_dp + VM_FRESH), 1);
     return 0;
   }
   clk_start();
@@ -299,7 +305,8 @@ static int compile_current(void)
   if (e) { as_error("OUT OF MEMORY"); return 1; }
   compiled = 1;
   poke0((uint16_t)(vm_dp + VM_FRESH), 1);
-  if (!st.lines) return 0;                    /* (no program: nothing to say) */
+  if (from_file) cache_save(&st);
+  if (!st.lines || !say_time) return 0;       /* (no program: nothing to say) */
   crout();
   print_u(st.lines);
   print(" LINES, ");
@@ -308,7 +315,6 @@ static int compile_current(void)
   print_centi(clk_half * 200 / 15734);       /* half-lines to hundredths */
   print(" S");
   crout();
-  if (from_file) cache_save(&st);
   return 0;
 }
 
@@ -319,6 +325,7 @@ static int compile_current(void)
 static uint8_t pending, pending_path[65];
 static int32_t pending_line;
 static int bye;
+static uint8_t ran;                  /* a program ran: FILE(S) STILL OPEN is due */
 
 void prog_pending(uint8_t what, const uint8_t *p, int32_t line)
 {
@@ -331,6 +338,9 @@ static void direct_tokens(void);
 /* RUN [n] of the program in memory */
 static void run_from(int32_t line)
 {
+  say_time = timing;
+  ran = 1;
+  crout();                                /* (BASIC.SYSTEM's RUN starts a line) */
   if (line < 0) {
     if (!compile_current()) vm_call(0);
     return;
@@ -370,6 +380,7 @@ void prog_run(int32_t line)
 static void direct_tokens(void)
 {
   uint16_t entry;
+  say_time = timing;
   if (compile_current()) return;
   if (compile_direct(raw, &entry)) { as_error("OUT OF MEMORY"); return; }
   poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)entry);
@@ -499,23 +510,32 @@ static int onerr(void)
 
 uint8_t vm_command(void)
 {
-  uint8_t n, k, quiet = (uint8_t)onerr();
-  uint16_t b = vm_read16(VMH_CMDBUF);
+  uint8_t n, k, quiet = (uint8_t)onerr(), req = peek0((uint16_t)(vm_dp + VM_CBREQ));
+  /* a running program's command, or a direct line's (NOT DIRECT COMMAND) */
+  int deferred = peek0((uint16_t)(vm_dp + VM_CURLIN + 1)) != 0xFF;
+  uint16_t b;
+  if (req) {                              /* a text file's (dos.c) */
+    if ((k = dos_io(req)) == 0) return 0;
+    if (quiet) return k;
+    dos_message(k);
+    return (uint8_t)(0x80 | k);
+  }
+  b = vm_read16(VMH_CMDBUF);
   xfer_far = (vm_base | b) - 1, xfer_near = (uint16_t)((uint16_t)&n - 1), xfer_n = 1;
   far_in();
   if (!n) return 0;
   xfer_far = (vm_base | (uint16_t)(b + 1)) - 1, xfer_near = (uint16_t)((uint16_t)raw - 1), xfer_n = n;
   far_in();
-  k = dos_command(raw, n, 1, quiet);
+  k = dos_command(raw, n, deferred, quiet);
   if (k == DOS_OK) return 0;
   if (k == DOS_BYE) { pending = 3; return 1; }
   if (k == DOS_STOP) return 1;
   if (k == DOS_NOT) {                     /* not a command: BASIC.SYSTEM's SYNTAX ERROR */
     if (quiet) return 16;
     dos_message(16);
-    return 1;
+    return 0x80 | 16;
   }
-  return quiet ? (uint8_t)(k & 0x7F) : 1;
+  return quiet ? (uint8_t)(k & 0x7F) : k; /* (said: the VM stops, BREAK) */
 }
 
 /* ---- the command line ---- */
@@ -532,12 +552,20 @@ static int32_t linget(uint8_t *p)
   return n;
 }
 
-/* COMPILE name: ours, a timed compile */
+/* COMPILE name: ours, a timed compile; TIMING: RUN says it too (or not) */
 static int compile_command(void)
 {
-  static const char w[] = "COMPILE";
+  static const char w[] = "COMPILE", tw[] = "TIMING";
   uint8_t i = 0, k = 0, p[65], e;
   while (i < len && raw[i] == ' ') i++;
+  for (k = 0; tw[k] && i + k < len && (raw[i + k] & 0xDF) == (uint8_t)tw[k]; k++) {}
+  if (!tw[k] && i + k == len) {
+    timing = (uint8_t)!timing;
+    crout();
+    print(timing ? "TIMING ON" : "TIMING OFF");
+    crout();
+    return 1;
+  }
   for (k = 0; w[k]; k++, i++)
     if (i >= len || (raw[i] & 0xDF) != (uint8_t)w[k]) return 0;
   while (i < len && raw[i] == ' ') i++;
@@ -545,7 +573,10 @@ static int compile_command(void)
   p[0] = k;
   if (!k) { dos_message(16); return 1; }
   if ((e = prog_load(p)) != 0) dos_message(dos_error(e));
-  else compile_current();
+  else {
+    say_time = 1;
+    compile_current();
+  }
   return 1;
 }
 
@@ -627,6 +658,11 @@ void shell(void)
     if (compile_command()) continue;
     k = dos_command(raw, len, 0, 0);
     if (k == DOS_BYE) return;
-    if (k == DOS_NOT && basic_line()) crout();   /* RESTART's CRDO */
+    if (k == DOS_NOT && basic_line()) {   /* RESTART's CRDO: to WRITE's file if on */
+      if (dos_writing()) dos_put_cr();
+      else crout();
+    }
+    dos_prompt(ran);
+    ran = 0;
   }
 }

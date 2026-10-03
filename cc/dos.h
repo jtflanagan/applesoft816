@@ -22,6 +22,15 @@ void dos_message(uint8_t err);
 /* an MLI error as BASIC.SYSTEM's number */
 uint8_t dos_error(uint8_t mli_err);
 
+/* the VM's text-file requests (VM_CBREQ 1 flush WRITE's output, 2 READ a
+ * line, 3 READ a character): 0 or BASIC.SYSTEM's error */
+uint8_t dos_io(uint8_t req);
+/* WRITE is on: RESTART's CR goes to the file */
+int dos_writing(void);
+void dos_put_cr(void);
+/* back at the prompt: READ/WRITE off; after a program, FILE(S) STILL OPEN */
+void dos_prompt(int after_run);
+
 /* what dos.c needs of shell.c */
 uint8_t prog_load(const uint8_t *path);           /* a BAS file into memory; an MLI error */
 uint8_t prog_save(const uint8_t *path);

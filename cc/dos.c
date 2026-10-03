@@ -46,7 +46,6 @@ void dos_message(uint8_t err)
   crout();
   print(err >= B_RANGE && err <= B_STILL_OPEN ? messages[err - B_RANGE] : "I/O ERROR");
   crout();
-  if (err == B_NOT_DIRECT || prefix_set) crout();
 }
 
 uint8_t dos_error(uint8_t e)
@@ -388,6 +387,162 @@ static uint8_t catalog(Cmd *c, int wide)
   return 0;
 }
 
+/* ---- text files: OPEN's table, and the one READ or WRITE is on ---- */
+#define VM_IOMODE 0x10              /* the VM's direct page (vm/vm.s) */
+#define VM_OUTLEN 0x13
+#define VM_RC_A 0xBA
+#define VM_RC_X 0xBB
+#define VMH_OUTBUF 0x1C
+#define IO_WRITE 1
+#define IO_READ 2
+
+typedef struct {
+  uint8_t ref;                      /* 0: free */
+  uint16_t reclen;                  /* L (0: sequential) */
+  uint8_t path[65];                 /* the full pathname */
+} File;
+static File files[RES_NTBUF];
+static uint8_t io_file;             /* files[] + 1 that READ/WRITE is on (0: none) */
+
+static void io_mode(uint8_t m) { poke0((uint16_t)(vm_dp + VM_IOMODE), m); }
+
+static File *find_file(const uint8_t *full)
+{
+  uint8_t k;
+  for (k = 0; k < RES_NTBUF; k++)
+    if (files[k].ref && !memcmp(files[k].path, full, (size_t)full[0] + 1)) return &files[k];
+  return 0;
+}
+
+/* WRITE's output still in the VM's out_buf, to its file */
+static uint8_t io_flush(void)
+{
+  uint8_t n = peek0((uint16_t)(vm_dp + VM_OUTLEN)), e = 0;
+  ReadParms w;
+  if (!n) return 0;
+  poke0((uint16_t)(vm_dp + VM_OUTLEN), 0);
+  if (!io_file) return 0;
+  xfer_far = (vm_base | vm_read16(VMH_OUTBUF)) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = n;
+  far_move();
+  w.n = 4, w.ref = files[io_file - 1].ref, w.buf = RES_IOBUF, w.req = n;
+  if ((e = mli(MLI_WRITE, &w, sizeof w)) != 0) return dos_error(e);
+  return 0;
+}
+
+static void close_file(File *f)
+{
+  if (!f->ref) return;
+  if (io_file && &files[io_file - 1] == f) io_file = 0, io_mode(0);
+  close_ref(f->ref);
+  f->ref = 0;
+}
+
+static uint8_t open_file(Cmd *c, File **out)
+{
+  uint8_t full[65], e, k, type = (c->have & O_T) ? c->t : 0x04;
+  InfoParms info;
+  OpenParms o;
+  File *f;
+  if ((e = full_path(c->path, full)) != 0) return dos_error(e);
+  if ((f = find_file(full)) != 0) close_file(f);
+  for (k = 0; k < RES_NTBUF && files[k].ref; k++) {}
+  if (k == RES_NTBUF) return B_NO_BUFFERS;
+  f = &files[k];
+  e = file_info(full, &info);
+  if (e == 0x46) {
+    if ((e = create(full, type, c->l)) != 0) return dos_error(e);
+    info.aux = c->l;
+  } else if (e)
+    return dos_error(e);
+  else if (info.type != type)
+    return B_FILE_TYPE;
+  put_path(full);
+  o.n = 3, o.path = RES_PATH, o.buf = (uint16_t)(RES_TBUF + 0x400 * k);
+  if ((e = mli(MLI_OPEN, &o, sizeof o)) != 0) return dos_error(e);
+  f->ref = o.ref;
+  f->reclen = (c->have & O_L) ? c->l : info.aux;
+  memcpy(f->path, full, (size_t)full[0] + 1);
+  *out = f;
+  return 0;
+}
+
+/* READ/WRITE path[,R][,B]: the open file, positioned */
+static uint8_t io_start(Cmd *c, uint8_t mode)
+{
+  uint8_t full[65], e;
+  File *f;
+  if ((e = full_path(c->path, full)) != 0) return dos_error(e);
+  if (!(f = find_file(full))) return B_FILE_NOT_OPEN;
+  if (c->have & (O_R | O_B)) {
+    uint32_t pos = (uint32_t)((c->have & O_R) ? c->r : 0) * f->reclen + ((c->have & O_B) ? c->b : 0);
+    if ((e = set_mark(f->ref, pos)) != 0) return dos_error(e);
+  }
+  if (mode == IO_READ) {                  /* a line at a time */
+    NewlineParms nl = {3, f->ref, 0x7F, 0x0D};
+    mli(MLI_NEWLINE, &nl, sizeof nl);
+  }
+  io_file = (uint8_t)(f - files + 1);
+  io_mode(mode);
+  return 0;
+}
+
+/* the VM's WRITE flush, READ line (into $0200, its length in RC_X) and
+ * READ character (RC_A): 0, or BASIC.SYSTEM's error */
+uint8_t dos_io(uint8_t req)
+{
+  ReadParms r;
+  uint8_t e, k, line[240];
+  if (req == 1) return io_flush();
+  if (!io_file) return B_FILE_NOT_OPEN;
+  r.n = 4, r.ref = files[io_file - 1].ref, r.buf = RES_IOBUF, r.trans = 0;
+  if (req == 3) {                         /* GET */
+    r.req = 1;
+    e = mli(MLI_READ, &r, sizeof r);
+    if (e && e != MLI_EOF) return dos_error(e);
+    from0(line, RES_IOBUF, 1);
+    poke0((uint16_t)(vm_dp + VM_RC_A), r.trans ? line[0] : 0x0D);   /* (at the end: no error, as 1.7) */
+    return 0;
+  }
+  r.req = 239;
+  e = mli(MLI_READ, &r, sizeof r);
+  if (e == MLI_EOF || (!e && !r.trans)) return B_END_OF_DATA;
+  if (e) return dos_error(e);
+  from0(line, RES_IOBUF, r.trans);
+  k = (uint8_t)r.trans;
+  if (k && (line[k - 1] & 0x7F) == 0x0D) k--;
+  for (e = 0; e < k; e++) line[e] &= 0x7F;
+  line[k] = 0;
+  to0(INBUF, line, (uint16_t)(k + 1));
+  poke0((uint16_t)(vm_dp + VM_RC_X), k);
+  return 0;
+}
+
+int dos_writing(void) { return io_file && (peek0((uint16_t)(vm_dp + VM_IOMODE)) & IO_WRITE); }
+
+void dos_put_cr(void)
+{
+  ReadParms w;
+  static const uint8_t cr = 0x0D;
+  if (!io_file) return;
+  to0(RES_IOBUF, &cr, 1);
+  w.n = 4, w.ref = files[io_file - 1].ref, w.buf = RES_IOBUF, w.req = 1;
+  mli(MLI_WRITE, &w, sizeof w);
+}
+
+/* back at the prompt: READ/WRITE off; after a program, open files are
+ * closed with FILE(S) STILL OPEN */
+void dos_prompt(int after_run)
+{
+  uint8_t k, any = 0;
+  io_flush();
+  io_file = 0;
+  io_mode(0);
+  if (!after_run) return;
+  for (k = 0; k < RES_NTBUF; k++)
+    if (files[k].ref) close_file(&files[k]), any = 1;
+  if (any) dos_message(B_STILL_OPEN);
+}
+
 /* ---- the commands ---- */
 static uint8_t run(Cmd *c, int deferred)
 {
@@ -404,7 +559,57 @@ static uint8_t command(Cmd *c, int deferred)
   uint8_t e = 0, k;
   uint16_t addr;
   InfoParms info;
+  File *f;
+  /* every command ends READ/WRITE (WRITE's output first) */
+  if ((e = io_flush()) != 0) return (uint8_t)(DOS_ERROR | e);
+  io_file = 0;
+  io_mode(0);
   switch (c->cmd) {
+  case C_OPEN: e = open_file(c, &f); break;
+  case C_CLOSE: case C_FLUSH:
+    if (c->path[0]) {
+      uint8_t full[65];
+      if ((e = full_path(c->path, full)) != 0) { e = dos_error(e); break; }
+      if ((f = find_file(full)) != 0) {
+        if (c->cmd == C_CLOSE) close_file(f);
+        else { RefParms fl = {1, f->ref}; mli(MLI_FLUSH, &fl, sizeof fl); }
+      }
+    } else
+      for (k = 0; k < RES_NTBUF; k++) {
+        if (c->cmd == C_CLOSE) close_file(&files[k]);
+        else if (files[k].ref) { RefParms fl = {1, files[k].ref}; mli(MLI_FLUSH, &fl, sizeof fl); }
+      }
+    break;
+  case C_WRITE: e = io_start(c, IO_WRITE); break;
+  case C_READ: e = io_start(c, IO_READ); break;
+  case C_APPEND: {
+    uint8_t full[65];
+    MarkParms m;
+    if ((e = full_path(c->path, full)) != 0) { e = dos_error(e); break; }
+    if (!(f = find_file(full)) && (e = open_file(c, &f)) != 0) break;
+    m.n = 2, m.ref = f->ref;
+    if ((e = mli(MLI_GET_EOF, &m, sizeof m)) == 0) e = mli(MLI_SET_MARK, &m, sizeof m);
+    if (e) { e = dos_error(e); break; }
+    c->have &= (uint16_t)~(O_R | O_B);
+    e = io_start(c, IO_WRITE);
+    break;
+  }
+  case C_POSITION: {                      /* forward R (or F) fields: lines */
+    uint8_t full[65];
+    uint16_t n = (c->have & O_R) ? c->r : c->f;
+    ReadParms r;
+    NewlineParms nl;
+    if ((e = full_path(c->path, full)) != 0) { e = dos_error(e); break; }
+    if (!(f = find_file(full))) { e = B_FILE_NOT_OPEN; break; }
+    nl.n = 3, nl.ref = f->ref, nl.mask = 0x7F, nl.ch = 0x0D;
+    mli(MLI_NEWLINE, &nl, sizeof nl);
+    r.n = 4, r.ref = f->ref, r.buf = RES_IOBUF, r.req = RES_IOSIZE;
+    while (n--) {
+      r.trans = 0;
+      if ((e = mli(MLI_READ, &r, sizeof r)) != 0) { e = e == MLI_EOF ? B_END_OF_DATA : dos_error(e); break; }
+    }
+    break;
+  }
   case C_BYE: return DOS_BYE;
   case C_CAT: case C_CATALOG: e = catalog(c, c->cmd == C_CATALOG); break;
   case C_PREFIX:
@@ -477,8 +682,8 @@ static uint8_t command(Cmd *c, int deferred)
       rom_call(c->cmd == C_PRN ? OUTPORT : INPORT);
     }
     break;
-  case C_FRE: case C_MON: case C_NOMON: case C_CLOSE: case C_FLUSH: break;
-  default: e = B_SYNTAX; break;           /* (OPEN, READ, WRITE, APPEND, POSITION, EXEC, CHAIN, STORE, RESTORE: next) */
+  case C_FRE: case C_MON: case C_NOMON: break;
+  default: e = B_SYNTAX; break;           /* (EXEC, CHAIN, STORE, RESTORE: next) */
   }
   return e ? (uint8_t)(DOS_ERROR | e) : DOS_OK;
 }
@@ -532,6 +737,9 @@ uint8_t dos_command(const uint8_t *text, uint8_t len, int deferred, int quiet)
   if (!(k & DOS_ERROR) || k == DOS_NOT) return k;
   e = (uint8_t)(k & 0x7F);
 fail:
-  if (!quiet) dos_message(e);
+  if (!quiet) {
+    dos_message(e);
+    if (!deferred && (e == B_NOT_DIRECT || prefix_set)) crout();
+  }
   return (uint8_t)(DOS_ERROR | e);
 }

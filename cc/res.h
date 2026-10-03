@@ -17,6 +17,8 @@
 #define RES_SCRATCH 0x9980u
 #define RES_FBUF 0x9C00u
 #define RES_IOBUF 0xA000u
-#define RES_IOSIZE 0x1000u
-#define RES_END 0xB000u
+#define RES_IOSIZE 0x0800u
+#define RES_TBUF 0xA800u               /* 5 x 1K: OPEN's buffers for text files */
+#define RES_NTBUF 5
+#define RES_END 0xBC00u
 #endif

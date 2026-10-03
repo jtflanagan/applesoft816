@@ -41,6 +41,12 @@ FP_INT   = $F8
 FP_BUF   = $FD
 FP_TXT   = $FA
 ; the VM's
+VM_IOMODE = $10         ; 1: text files (the shell sets it): bit 0 WRITE (OUTDO to the
+                        ;    file), bit 1 READ (INPUT/GET from the file)
+VM_IOQUIET = $11        ; 1: an INPUT/GET reading a file: nothing shows (prompts, echo)
+VM_CBREQ = $12          ; 1: what the shell is called for: 0 a command, 1 out_buf to the
+                        ;    file, 2 a line into $0200 (length in RC_X), 3 a key (RC_A)
+VM_OUTLEN = $13         ; 1: bytes in out_buf
 VM_CMDLEN = $18         ; 1: a CHR$(4) command being gathered: its length ($FF: none)
 VM_LASTCR = $19         ; 1: the last character out was a return (a Ctrl-D starts a command)
 VM_CMDDBR = $1A         ; 1: the shell's data bank, for its command entry
@@ -162,6 +168,7 @@ GOSUB_SIZE  = 5         ; return IP 2, line 2, mark 1
         .word   fp_table        ; +$16  fp816's jump table (fp.s), for the platform's FIN
         .word   vm_direct       ; +$18  JSL here for a direct line (see vm_direct)
         .word   cmd_buf         ; +$1A  a CHR$(4) command for the shell: length, then text
+        .word   out_buf         ; +$1C  WRITE's output for the shell (VM_OUTLEN bytes)
 
         .segment "CODE"
 
@@ -279,6 +286,7 @@ vm_setup:
         .a8
         lda     VM_CMDVEC+2
         sta     cmd_target+2
+        stz     VM_IOQUIET
         lda     #$FF            ; no command being gathered; a line starts
         sta     VM_CMDLEN
         lda     #1
@@ -301,6 +309,7 @@ vm_leave:
 ; message, " ERROR" and the bell, then " IN " and the line unless direct.
 ; (ONERR: M3.)
 vm_error:
+        stz     VM_IOQUIET
         sta     VM_ERR
         pha                     ; ONERR set ($D8 bit 7) and a handler: HANDLERR
         lda     f:$0000D8
@@ -310,7 +319,8 @@ vm_error:
         pla
         jmp     handlerr
 @noerr: pla
-        jsr     cont_at_error
+        clc
+        jsr     cont_stmt
         jsr     crdo
         lda     #'?'
         jsr     outdo
@@ -337,13 +347,17 @@ vm_error:
         jsr     linprt
 @done:  jmp     vm_leave
 
-; cont_at_error: a running program stopped by an error goes on, at CONT,
-; from the start of the statement that failed (NEWSTT keeps OLDTEXT there;
+; cont_stmt: a running program stopped by an error goes on, at CONT,
+; from the start of the statement that failed (C=0; C=1: the one after it,
+; for a BASIC.SYSTEM error, which stops as AppleSoft's STOP) (NEWSTT keeps OLDTEXT there;
 ; OLDLIN stays what STOP/END/Ctrl-C left).  The failing operation's IP is
 ; X, or VM_IP when X is not in the code (a handler borrowed it); the
 ; statement is the last in the compiler's table (header +$24, +$26) that
 ; starts at or before it.
-cont_at_error:
+cont_stmt:
+        lda     #0              ; (C=1: the statement after the failing one)
+        rol     a
+        sta     VM_T2
         lda     CURLIN+1
         cmp     #$FF
         beq     @rts8
@@ -390,13 +404,25 @@ cont_at_error:
         bra     @bs
 @done:  lda     VM_T3
         beq     @none
+        dec     a               ; the failing statement's entry
+        sta     VM_T3
+        lda     VM_T2
+        and     #$00FF
+        clc
+        adc     VM_T3
+        ldy     VM_PROG
+        cmp     a:$0026,y       ; past the last: the END after the code
+        bcc     @entry
+        lda     a:$0028,y
         dec     a
-        asl     a
+        dec     a
+        bra     @set
+@entry: asl     a
         clc
         adc     VM_T1
         tay
         lda     a:$0000,y
-        sta     VM_CONTIP
+@set:   sta     VM_CONTIP
 @none:  sep     #$20
         .a8
 @rts8:  rts
@@ -455,7 +481,8 @@ msg_break:
 ;
 ; With a shell (VM_CMDVEC), BASIC.SYSTEM's commands first: a Ctrl-D as the
 ; first character of a line starts one, the return ends it; none of it is
-; printed.  The shell runs it (cmd_tramp: A = 0 on, else leave: VM_ERR $FC).
+; printed.  The shell runs it (cmd_tramp: A = 0 on, 1 leave: VM_ERR $FC, else
+; an error ONERR takes, A its number).
 outdo:  pha
         phy
         sta     VM_CHRAW
@@ -483,21 +510,19 @@ outdo:  pha
         sta     cmd_buf+1,y
         inc     VM_CMDLEN
         bra     @done
-@run:   lda     VM_CMDLEN
+@run:   jsr     io_flush        ; what WRITE gathered goes first
+        lda     VM_CMDLEN
         sta     cmd_buf
         lda     #$FF
         sta     VM_CMDLEN
         lda     #1
         sta     VM_LASTCR
-        lda     VM_CMDDBR
-        phk
-        jsr     cmd_tramp
-        cmp     #0
-        beq     @done
-        lda     #$FC            ; the shell takes over (RUN another, ...)
-        sta     VM_ERR
-        jmp     vm_leave
-@line:  lda     VM_CH
+        stz     VM_CBREQ
+        jsr     shell_call
+        bra     @done
+@line:  lda     VM_IOQUIET      ; an INPUT reading a file shows nothing, and what
+        bne     @done           ; it does not show does not start a line either
+        lda     VM_CH
         cmp     #$04
         bne     @plain
         lda     VM_LASTCR
@@ -506,13 +531,68 @@ outdo:  pha
         bra     @done
 @plain: stz     VM_LASTCR
         cmp     #$0D
-        bne     @show
+        bne     @io
         inc     VM_LASTCR
+@io:    lda     VM_IOMODE       ; WRITE: into out_buf, to the file at a return
+        lsr     a
+        bcc     @show
+        rep     #$20
+        .a16
+        lda     VM_OUTLEN
+        and     #$00FF
+        tay
+        sep     #$20
+        .a8
+        lda     VM_CH
+        sta     out_buf,y
+        inc     VM_OUTLEN
+        cmp     #$0D
+        beq     @flush
+        lda     VM_OUTLEN
+        cmp     #$FF
+        bcc     @done
+@flush: jsr     io_flush
+        bra     @done
 @show:  lda     VM_CHRAW
         jmp     outdo_show
 @done:  ply
         pla
         rts
+
+; io_flush: out_buf to the WRITE file (the shell), if anything is there
+io_flush:
+        lda     VM_OUTLEN
+        beq     @rts
+        lda     #1
+        sta     VM_CBREQ
+        jsr     shell_call
+        stz     VM_OUTLEN
+@rts:   rts
+
+; shell_call: the shell for VM_CBREQ, X kept; its answer: 0 on;
+; 1 leave (VM_ERR $FC: RUN another, BYE...); $80 + n: BASIC.SYSTEM's error
+; n, said - BREAK, as AppleSoft's STOP, CONT on at the next statement;
+; else n for ONERR (HANDLERR)
+shell_call:
+        phx
+        lda     VM_CMDDBR
+        phk
+        jsr     cmd_tramp
+        plx
+        cmp     #0
+        beq     @rts
+        cmp     #1
+        beq     @leave
+        cmp     #$80
+        bcs     @break
+        jmp     handlerr        ; ONERR's, A = its number
+@leave: lda     #$FC
+        sta     VM_ERR
+        jmp     vm_leave
+@break: sec                     ; CONT: the statement after this one
+        jsr     cont_stmt
+        jmp     break_msg
+@rts:   rts
 
 outdo_show:
         ora     #$80
@@ -663,6 +743,7 @@ cont_here:
 
 ; BREAK, and IN n unless direct; then back to the shell (VM_ERR $FD)
 break_msg:
+        stz     VM_IOQUIET
         ldy     #msg_break - msgtab
         jsr     strout_y
         lda     CURLIN+1
@@ -2470,12 +2551,19 @@ vchrgot:
 
 ; INLIN ($D52C): GETLN with prompt $80; at most 239 characters; a 0 after;
 ; the high bits off.  The text pointer is left at $01FF.
-inlin:  lda     #$80
+inlin:  lda     VM_IOMODE       ; READ: the line from the file (the shell)
+        and     #$02
+        beq     @kbd
+        lda     #2
+        sta     VM_CBREQ
+        jsr     shell_call
+        bra     @got
+@kbd:   lda     #$80
         sta     f:$000033
         ldy     #$FD6A
         sty     VM_T4
         jsr     romcall
-        lda     RC_X
+@got:   lda     RC_X
         cmp     #$EF
         bcc     @l
         lda     #$EF
@@ -2505,6 +2593,7 @@ inlin:  lda     #$80
 op_inpstart:
         stx     VM_INSTMT
         stx     VM_IP
+        jsr     io_quiet
         ldy     a:$0002,x
         beq     @ques
         lda     a:$0000,y       ; STRPRT the literal
@@ -2539,6 +2628,7 @@ op_readstart:
 
 ; GETSTART: INPTR = $0201, a 0 there: the first item reads a key
 op_getstart:
+        jsr     io_quiet
         lda     #$40
         sta     VM_INMODE
         lda     #$00
@@ -2581,9 +2671,17 @@ op_item:
         and     #$40
         beq     @more_input
         ; GET: a key into $0200, the text pointer before it
-        ldy     #$FD0C
+        lda     VM_IOMODE       ; READ: the file's next character
+        and     #$02
+        beq     @key
+        lda     #3
+        sta     VM_CBREQ
+        jsr     shell_call
+        bra     @gotkey
+@key:   ldy     #$FD0C
         sty     VM_T4
         jsr     romcall
+@gotkey:
         lda     RC_A
         and     #$7F
         sta     f:$000200
@@ -2836,7 +2934,15 @@ op_inpend:
         jsr     outdo
         iny
         bra     @m
-@done:  NEXTOP  2
+@done:  stz     VM_IOQUIET
+        NEXTOP  2
+
+; io_quiet: an INPUT/GET reading a file shows nothing till its end (INPEND)
+io_quiet:
+        lda     VM_IOMODE
+        and     #$02
+        sta     VM_IOQUIET
+        rts
 
 ; RESTORE: back to the pool's start
 op_restore:
@@ -3590,6 +3696,7 @@ op_stmt:
 ; HANDLERR ($F2E9): A = the code: $DE, the line in $DA/$DB, RESUME's
 ; statement; the expression stacks emptied; the handler
 handlerr:
+        stz     VM_IOQUIET      ; (an error inside INPUT: what follows shows)
         sta     f:$0000DE
         lda     CURLIN
         sta     f:$0000DA
@@ -3629,6 +3736,9 @@ op_resume:
 ; ---- the end of the VM: the program image the compiler writes starts here
 ; a CHR$(4) command for the shell (outdo): its length, then its text
 cmd_buf:
+        .res    256
+; WRITE's output on its way to the file (outdo, io_flush)
+out_buf:
         .res    256
 
         .segment "TAIL"
