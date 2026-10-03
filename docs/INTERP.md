@@ -83,7 +83,21 @@ bytecode address; patch forward jumps at the end.  Variables are assigned
 slots on first sight (AppleSoft's two-significant-character names, `%` and
 `$` kept apart).  The result is cached beside the source (DESIGN.md).
 
-## Testing
+## Testing (as built)
+
+- `gsrun ROM --prog TOKENS [--vm vm/vm.bin]`: the program under the IIgs
+  ROM's AppleSoft, or compiled and run by the VM, both on emu816 behind one
+  virtual monitor (COUT/GETLN/RDKEY/WAIT and the screen calls taken over:
+  the GS monitor needs firmware state only a real boot sets up).
+- `tests/compare.sh PROGRAMS.bas`: tokenizes each with AppleSoft itself
+  (asprof `--no-run`), runs both, compares the bytes, prints the cycles.
+
+Found on the way: the GS's PRINT comma differs from the IIe's only in 80
+columns (its column helper ends with `BIT $C01F`, which hands the comma N =
+the 80-column switch); AppleSoft's cold start sets only four of RND's five
+seed bytes (`$CD` is whatever memory held).
+
+## Testing (plan)
 
 - **Output oracle**: the same program and key script under ROM AppleSoft
   (`prof/asprof`, which already captures the screen, gains a COUT stream)
@@ -96,8 +110,8 @@ slots on first sight (AppleSoft's two-significant-character names, `%` and
 
 | | | gate |
 |---|---|---|
-| M1 | build: one image with crt0, C, the VM and fp816; a test harness on emu816 that loads it, runs a program, traps output | "PRINT 2+2" prints 4 |
-| M2 | numeric core: PRINT, LET, expressions, IF, GOTO, GOSUB/RETURN, FOR/NEXT, END, REM | BM1-BM8: identical output to ROM AppleSoft; cycles measured |
+| M1 | build: the VM image (vm.s + fp816); the compiler (portable C); gsrun runs either the ROM's AppleSoft or the VM on emu816 through one virtual monitor | "PRINT 2+2" prints 4 - **done** |
+| M2 | numeric core: PRINT, LET, expressions, IF, GOTO, GOSUB/RETURN, FOR/NEXT, DIM and arrays, END, REM, the numeric functions, AppleSoft's errors | BM1-BM8 and `tests/m2` (arithmetic, loops, GOSUB, arrays, functions, PRINT layout, eight errors): output identical to the GS ROM's AppleSoft - **done**; 1.03-4.3x before any optimisation |
 | M3 | strings, arrays, DIM, INPUT/GET, DATA/READ/RESTORE, DEF FN, all functions, ONERR | Lemonade's computing lines; a string/array corpus |
 | M4 | screen and machine: HOME, VTAB/HTAB, TEXT/GR/COLOR/PLOT/HLIN/VLIN, HGR/HPLOT, PEEK/POKE/CALL (bank-0 stubs, emulation mode) | Lemonade, whole game, identical screens |
 | M5 | the system file, immediate mode, line editor, LOAD/SAVE/RUN/CATALOG/CHR$(4) commands on ProDOS, the bytecode cache | KEGS, then the machine |

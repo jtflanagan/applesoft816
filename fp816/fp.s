@@ -125,6 +125,8 @@ ERR_ILLQTY   = $35
         .segment "CODE"
 
 ; ---- jump table: the public entries, 4 bytes apart ----
+fp_table:
+        .export fp_table
         jmp     fp_load_fac        ; +$00  FAC = [FP_PTR]
         nop
         jmp     fp_load_arg        ; +$04  ARG = [FP_PTR]; SGNCPR
@@ -189,6 +191,24 @@ ERR_ILLQTY   = $35
         nop
         jmp     fp_atn             ; +$7C  FAC = ATN(FAC)
         nop
+        jmp     fp_round           ; +$80  ROUND.FAC (FRMEVL rounds before every push)
+        nop
+        jmp     fp_multt           ; +$84  FAC = ARG * FAC        (ROM FMULTT)
+        nop
+        jmp     fp_divt            ; +$88  FAC = ARG / FAC        (ROM FDIVT)
+        nop
+        jmp     fp_pwrt            ; +$8C  FAC = ARG ^ FAC        (ROM FPWRT)
+        nop
+        jmp     fp_float           ; +$90  FAC = the signed byte FP_INT (ROM FLOAT)
+        nop
+        jmp     fp_uint16          ; +$94  FAC = the unsigned word FP_INT (LINPRT's FLOAT.2)
+        nop
+
+        .export fp_load_fac, fp_load_arg, fp_store_fac, fp_add, fp_sub, fp_addt, fp_subt
+        .export fp_mul, fp_div, fp_cmp, fp_mul10, fp_div10, fp_sgn, fp_abs, fp_int, fp_qint
+        .export fp_ayint, fp_givayf, fp_conint, fp_getadr, fp_fin, fp_negop, fp_fout
+        .export fp_sqr, fp_pwr, fp_log, fp_exp, fp_rnd, fp_sin, fp_cos, fp_tan, fp_atn
+        .export fp_round, fp_multt, fp_divt, fp_pwrt, fp_float, fp_uint16
 
 ; ---- public entries ----
         .a8
@@ -356,6 +376,47 @@ fp_tan: ENTER
 
 fp_atn: ENTER
         jsr     atn
+        LEAVE
+
+fp_round:
+        ENTER
+        jsr     round_fac
+        LEAVE
+
+fp_multt:
+        ENTER
+        lda     FAC
+        jsr     fmultt
+        LEAVE
+
+fp_divt:
+        ENTER
+        lda     FAC
+        jsr     fdivt
+        LEAVE
+
+fp_pwrt:
+        ENTER
+        lda     FAC
+        jsr     fpwrt
+        LEAVE
+
+fp_float:
+        ENTER
+        lda     FP_INT
+        jsr     float
+        LEAVE
+
+; LINPRT ($ED24): FLOAT.2 with $9E/$9F = the word (high, low), X = $90, C = 1
+fp_uint16:
+        ENTER
+        lda     FP_INT+1
+        sta     FAC+1
+        lda     FP_INT
+        sta     FAC+2
+        ldx     #$90
+        sec
+        jsr     float_2
         LEAVE
 
 ; Error: unwind to the entry's frame and return with FP_ERR set.

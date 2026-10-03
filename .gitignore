@@ -11,3 +11,8 @@ fp816/fp.lst
 fp816/fp.map
 fp816/fptest
 gsrun/gsrun
+vm/vm.bin
+vm/*.o
+vm/vm.lst
+vm/vm.map
+gsrun/compile.o

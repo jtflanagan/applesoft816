@@ -448,7 +448,8 @@ static void usage(void)
       "              (--prog TOKENIZED | --type LISTING) [--keys SCRIPT]\n"
       "              [--max-cycles N] [--idle N] [--lines N] [--syms N] [--snap-end]\n"
       "              [--cout FILE]       every byte the running program sends to COUT ($FDED)\n"
-      "              [--dump-prog FILE]  the tokenized program ($801..PRGEND) at the end");
+      "              [--dump-prog FILE]  the tokenized program ($801..PRGEND) at the end\n"
+      "              [--no-run]          type the listing in, do not RUN it (with --dump-prog)");
 }
 
 int main(int argc, char **argv)
@@ -458,6 +459,7 @@ int main(int argc, char **argv)
   int top_lines = 25, top_syms = 25;
   bool snap_end = false;
   const char *cout_path = NULL, *dump_path = NULL;
+  bool no_run = false;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -473,6 +475,7 @@ int main(int argc, char **argv)
     else if (!strcmp(a, "--snap-end")) snap_end = true;
     else if (!strcmp(a, "--cout") && v) cout_path = argv[++i];
     else if (!strcmp(a, "--dump-prog") && v) dump_path = argv[++i];
+    else if (!strcmp(a, "--no-run")) no_run = true;
     else usage();
   }
   if (!rom_path || !nsyms || (!prog_path == !type_path)) usage();
@@ -492,7 +495,7 @@ int main(int argc, char **argv)
     type_listing((char *)t, &keyq, &nkeys, &cap);
     free(t);
   }
-  load_script("RUN{CR}", &keyq, &nkeys, &cap);
+  if (!no_run) load_script("RUN{CR}", &keyq, &nkeys, &cap);
   size_t run_keys = nkeys; /* counting starts once RUN's Return is taken */
   if (keys_path) {
     uint8_t *t = slurp(keys_path, &n);

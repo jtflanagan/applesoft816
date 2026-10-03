@@ -1,0 +1,1 @@
+10 X=-1:PRINT LOG(X)

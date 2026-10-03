@@ -1,0 +1,1 @@
+10 PRINT "A":GOTO 50
