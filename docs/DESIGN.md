@@ -102,12 +102,15 @@ and in emulators.  In stage 1 a shim implements it over
 the real ProDOS 8 with bank-0 bounce buffers, so the BASIC uses the 16-bit
 MLI from day one.  A GS/OS class-1 subset at `$E1/00A8` is a later option.
 
+## Settled since
+
+- **ProDOS only** *(user)*; DOS 3.3 programs are copied to ProDOS disks.
+- **Assembly and C, split as fits** *(user)*: see `INTERP.md`.
+
 ## Open questions
 
-1. DOS 3.3, ProDOS 8, or both for stage 1 (Lemonade is a DOS 3.3 disk).
-2. How it starts: a system file replacing BASIC.SYSTEM, or a loader that
-   installs itself and takes over the prompt.
-3. Implementation language/assembler for the 65816 side.
+1. How it starts: a system file replacing BASIC.SYSTEM (the likely answer,
+   with ProDOS only), or a loader that installs itself.
 
 ## Benches
 
