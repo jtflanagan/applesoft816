@@ -56,6 +56,8 @@ enum {
 #define CSTACK_SIZE 4096
 #define HEADER_SIZE 42
 #define SV_SPARE 16                  /* string roots kept free for direct lines' variables */
+#define SA_SPARE 8                   /* ... and for their string arrays */
+#define DESC_SPARE 96                /* descriptor bytes kept free for direct lines' arrays */
 /* the direct line's area, at the top of the VM bank (the array heap ends
  * below it): an END, the line's code, its constants and strings; the
  * variables direct lines make, from the top down */
@@ -101,7 +103,7 @@ static uint16_t nfns, fn_base, desc_copy_base, desc_bytes;
 static int use_onerr;                             /* STMT marks needed */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
-static uint16_t nsvars, nsarrays, svlist_cap;
+static uint16_t nsvars, nsarrays, svlist_cap, salist_cap;
 static uint16_t stmt_base, nstmts;  /* where each statement starts (CONT after an error) */
 NOINIT static uint16_t var_off[MAX_VARS];
 static uint16_t desc_off[MAX_ARRAYS];
@@ -192,6 +194,34 @@ static void error_here(uint8_t e)
 
 /* ---- symbols ---- */
 
+/* a direct line's new array: its descriptor (and the pristine copy CLEAR
+ * restores) in the room kept after the program's, the header's count of
+ * descriptor bytes (+$20) grown; a string array joins the roots (+$14) */
+static void direct_array(uint16_t i)
+{
+  uint8_t size = (uint8_t)(4 + 2 * arrays[i].ndims), k;
+  uint8_t el = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
+  uint16_t a = (uint16_t)(desc_base + desc_bytes), c = (uint16_t)(desc_copy_base + desc_bytes);
+  if ((uint16_t)(desc_bytes + size) > (uint16_t)(desc_copy_base - desc_base) ||
+      (arrays[i].type == 2 && nsarrays >= salist_cap)) {
+    overflow = 1;
+    return;
+  }
+  desc_off[i] = a;
+  for (k = 0; k < size; k++) {
+    uint8_t v = k == 2 ? arrays[i].ndims : k == 3 ? el : 0;
+    out((uint16_t)(a + k), v), out((uint16_t)(c + k), v);
+  }
+  desc_bytes = (uint16_t)(desc_bytes + size);
+  out((uint16_t)(pf->prog_start + 0x20), (uint8_t)desc_bytes), out((uint16_t)(pf->prog_start + 0x21), (uint8_t)(desc_bytes >> 8));
+  if (arrays[i].type == 2) {
+    uint16_t r = (uint16_t)(salist_base + 2 * nsarrays);
+    out(r, (uint8_t)a), out((uint16_t)(r + 1), (uint8_t)(a >> 8));
+    nsarrays++;
+    out((uint16_t)(pf->prog_start + 0x14), (uint8_t)nsarrays), out((uint16_t)(pf->prog_start + 0x15), (uint8_t)(nsarrays >> 8));
+  }
+}
+
 /* a direct line's new variable (or FN entry): size zeroed bytes from the top
  * down; a string's address joins the collector's roots (SV_SPARE kept free).
  * The header's +$22 says where they start, for CLEAR */
@@ -232,10 +262,11 @@ static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
   for (i = 0; i < narrays; i++)
     if (arrays[i].c1 == c1 && arrays[i].c2 == c2 && arrays[i].type == type) break;
   if (i == narrays) {
-    if (narrays == MAX_ARRAYS || direct) { overflow = 1; return 0; }
+    if (narrays == MAX_ARRAYS) { overflow = 1; return 0; }
     arrays[narrays].c1 = c1, arrays[narrays].c2 = c2, arrays[narrays].type = type;
     arrays[narrays].ndims = ndims;
     narrays++;
+    if (direct) direct_array(i);
   }
   return arrays[i].ndims == ndims ? (int)i : -1;
 }
@@ -546,7 +577,12 @@ static int element(Pending *pend, int *np)
     if (c == '"') {                        /* STRTXT: a literal, used in place */
       int s0 = ++p, q = s0;
       while (q < blen && buf[q] && buf[q] != '"') q++;
+      if (direct) {                        /* a direct line's text is gone after it: the */
+        op16(OP_SLIT, str_literal(buf, 0));        /* string goes to string space ("" + it), */
+        op(OP_SPUSH);                              /* as AppleSoft copies one from the input */
+      }                                            /* buffer */
       op16(OP_SLIT, str_literal(buf + s0, (uint8_t)(q - s0)));
+      if (direct) op(OP_SCAT);
       p = q < blen && buf[q] == '"' ? q + 1 : q;
       return TY_STR;
     }
@@ -1120,15 +1156,17 @@ int as816_compile(const Platform *platform, CompileStats *st)
     a = (uint16_t)(a + 4 + 2 * arrays[i].ndims);
   }
   desc_bytes = (uint16_t)(a - desc_base);
+  a = (uint16_t)(a + DESC_SPARE);              /* room for direct lines' arrays */
   desc_copy_base = a;
-  a = (uint16_t)(a + desc_bytes);
+  a = (uint16_t)(a + desc_bytes + DESC_SPARE);
   nsvars = nsarrays = 0;
   for (i = 0; i < nvars; i++) nsvars += vars[i].type == 2;
   for (i = 0; i < narrays; i++) nsarrays += arrays[i].type == 2;
   svlist_base = a;
   svlist_cap = (uint16_t)(nsvars + SV_SPARE);
   salist_base = (uint16_t)(svlist_base + 2 * svlist_cap);
-  stmt_base = (uint16_t)(salist_base + 2 * nsarrays);
+  salist_cap = (uint16_t)(nsarrays + SA_SPARE);
+  stmt_base = (uint16_t)(salist_base + 2 * salist_cap);
   fstack_base = (uint16_t)(stmt_base + 2 * nstmts);
   sstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
@@ -1198,7 +1236,7 @@ int as816_compile(const Platform *platform, CompileStats *st)
 
 int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
 {
-  uint16_t nv = nvars, nf = nfns, nsv = nsvars, dv = dvar_at;
+  uint16_t nv = nvars, nf = nfns, nsv = nsvars, dv = dvar_at, na = narrays, nsa = nsarrays, db = desc_bytes;
   pf = platform;
   overflow = 0;
   direct = 1;
@@ -1225,12 +1263,12 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
   flush();
   direct = 0;
   if (overflow) {                          /* forget what it made: it never runs */
-    nvars = nv, nfns = nf, dvar_at = dv;
-    if (nsvars != nsv) {
-      nsvars = nsv;
-      out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
-      flush();
-    }
+    nvars = nv, nfns = nf, dvar_at = dv, narrays = na;
+    nsvars = nsv, nsarrays = nsa, desc_bytes = db;
+    out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
+    out((uint16_t)(pf->prog_start + 0x14), (uint8_t)nsarrays), out((uint16_t)(pf->prog_start + 0x15), (uint8_t)(nsarrays >> 8));
+    out((uint16_t)(pf->prog_start + 0x20), (uint8_t)desc_bytes), out((uint16_t)(pf->prog_start + 0x21), (uint8_t)(desc_bytes >> 8));
+    flush();
     return -1;
   }
   return 0;
@@ -1239,7 +1277,7 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
 /* the compiler's tables (direct lines need them), out to the cache or back
  * in from it: io moves n bytes between p and the file, in order */
 typedef struct {
-  uint16_t nlines, nvars, narrays, nconsts, nfns, nsvars, nsarrays, svlist_cap, use_onerr;
+  uint16_t nlines, nvars, narrays, nconsts, nfns, nsvars, nsarrays, svlist_cap, salist_cap, use_onerr;
   uint16_t code_base, const_base, str_base, data_base, var_base, fn_base, desc_base, desc_copy_base,
       desc_bytes, svlist_base, salist_base, fstack_base, sstack_base, cstack_base, heap_base;
 } State;
@@ -1250,7 +1288,7 @@ void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx
   uint16_t i;
   if (save) {
     t.nlines = nlines, t.nvars = nvars, t.narrays = narrays, t.nconsts = nconsts, t.nfns = nfns;
-    t.nsvars = nsvars, t.nsarrays = nsarrays, t.svlist_cap = svlist_cap, t.use_onerr = (uint16_t)use_onerr;
+    t.nsvars = nsvars, t.nsarrays = nsarrays, t.svlist_cap = svlist_cap, t.salist_cap = salist_cap, t.use_onerr = (uint16_t)use_onerr;
     t.code_base = code_base, t.const_base = const_base, t.str_base = str_base, t.data_base = data_base;
     t.var_base = var_base, t.fn_base = fn_base, t.desc_base = desc_base, t.desc_copy_base = desc_copy_base;
     t.desc_bytes = desc_bytes, t.svlist_base = svlist_base, t.salist_base = salist_base;
@@ -1259,7 +1297,7 @@ void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx
   io(ctx, &t, sizeof t);
   if (!save) {
     nlines = t.nlines, nvars = t.nvars, narrays = t.narrays, nconsts = t.nconsts, nfns = t.nfns;
-    nsvars = t.nsvars, nsarrays = t.nsarrays, svlist_cap = t.svlist_cap, use_onerr = t.use_onerr;
+    nsvars = t.nsvars, nsarrays = t.nsarrays, svlist_cap = t.svlist_cap, salist_cap = t.salist_cap, use_onerr = t.use_onerr;
     code_base = t.code_base, const_base = t.const_base, str_base = t.str_base, data_base = t.data_base;
     var_base = t.var_base, fn_base = t.fn_base, desc_base = t.desc_base, desc_copy_base = t.desc_copy_base;
     desc_bytes = t.desc_bytes, svlist_base = t.svlist_base, salist_base = t.salist_base;

@@ -233,7 +233,7 @@ typedef struct {
 } CacheHdr;
 
 #define CACHE_DIR "AS816.CACHE"
-#define CACHE_VERSION 2             /* 2: the compiler's tables after the image */
+#define CACHE_VERSION 3             /* 2: the compiler's tables after the image; 3: salist_cap */
 
 /* the compiler's tables to and from the open cache, through the I/O buffer */
 static uint8_t cache_ref, cache_err;
