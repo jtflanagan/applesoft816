@@ -988,6 +988,7 @@ static void run_pass(void)
     lines[line_i].num = num, lines[line_i].addr = pc;
     op16(OP_LINE, num);
     for (;;) {
+      if (pf->poll) pf->poll(pf->ctx);
       statement();
       if (p >= blen || peek() == 0) break;
       if (peek() == ':') { p++; continue; }

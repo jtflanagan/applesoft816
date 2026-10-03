@@ -19,3 +19,9 @@ gsrun/compile.o
 cc/cc.bin
 cc/cc.bin.elf
 cc/cc.map
+build/
+sys/AS816.SYSTEM
+sys/sys.o
+sys/sys.lst
+sys/sys.map
+tools/prodisk

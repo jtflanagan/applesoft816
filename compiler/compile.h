@@ -50,6 +50,9 @@ typedef struct Platform {
    * mantissa 4, sign, rounding byte) and returns how many characters FIN
    * took, or -1 for an error (FIN's ?OVERFLOW) */
   int (*fin)(void *ctx, const uint8_t *text, int len, uint8_t fac[7]);
+  /* optional (0 = none): called at every statement, so a few milliseconds
+   * apart at most - the shell's clock watches the video counter there */
+  void (*poll)(void *ctx);
   /* from the VM image's header */
   uint16_t prog_start;          /* first free byte of the VM bank */
   const uint16_t *optable;      /* handler address of each operation */

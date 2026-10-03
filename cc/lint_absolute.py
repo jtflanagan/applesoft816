@@ -14,8 +14,9 @@ JMP/JSR (abs,X) read their table from the PROGRAM bank, but .rodata lives in
 the data bank: a switch jump table there jumps through whatever code sits at
 the same address (build with -fno-jump-tables).
 
-A four-byte (long) operand other than JSL/JML names the link-time bank, never
-the one the image runs in: an asm reference to a data symbol needs mos16().
+A four-byte (long) operand into the link-time banks ($01 code, $02 data) is
+never the bank the image runs in: an asm reference to a data symbol needs
+mos16().  Long operands into bank 0 and the firmware ($E1) are deliberate.
 
     lint_absolute.py LLVM-OBJDUMP IMAGE.elf
 """
@@ -26,6 +27,7 @@ import sys
 # "  f0001a: ad 12 00     \tlda\t$12" - address, bytes, mnemonic, operand.
 LINE = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t(\w+)\t?(.*)$")
 # JSR/JMP operands are program-bank addresses; JSL/JML and immediates never match.
+LINK_BANKS = (0x01, 0x02)
 SKIP = {"jsr", "jmp", "jsl", "jml", "pea", "per", "brl", "mvn", "mvp"}
 
 
@@ -43,8 +45,10 @@ def main() -> int:
         if mnem in ("jmp", "jsr") and re.match(r"\(\$[0-9a-f]+,x\)", operand):
             bad.append(line.strip())
             continue
-        if nbytes == 4 and mnem not in ("jsl", "jml"):
-            bad.append(line.strip())
+        if nbytes == 4:
+            v = re.match(r"\[?\$([0-9a-f]+)", operand)
+            if v and (int(v.group(1), 16) >> 16) in LINK_BANKS:
+                bad.append(line.strip())
             continue
         if nbytes != 3 or mnem in SKIP or operand.startswith("#"):
             continue

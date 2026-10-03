@@ -147,3 +147,135 @@ fin_fail:
         lda     #$ff
         tax
         rts
+
+; ---- bank 0, and the machine around the shell (sys/res.inc, cc/res.h) ----
+        .set    RES_MLI, 0x9780
+        .set    RES_ROM, 0x97C0
+        .set    RES_CMD, 0x9800
+        .set    RES_ERR, 0x9801
+        .set    RES_A, 0x9802
+        .set    RES_TGT, 0x9806
+
+; uint8_t peek0(uint16_t a)
+        .global peek0
+peek0:
+        sta     __rc2
+        stx     __rc3
+        stz     __rc4
+        lda     [__rc2]
+        rts
+
+; void poke0(uint16_t a, uint8_t v)     (v in __rc2)
+        .global poke0
+poke0:
+        ldy     __rc2
+        sta     __rc2
+        stx     __rc3
+        stz     __rc4
+        tya
+        sta     [__rc2]
+        rts
+
+; zp_swap: page zero's $00-$1F (C's registers) <-> zp_save (the machine's,
+; saved by crt0).  Around every call out to the machine - the ROM, the MLI,
+; the VM - so they see the machine's page zero; no __rc register is valid
+; between the two swaps.
+zp_swap:
+        ldx     #0x1f
+zp_swap_1:
+        lda     0x00,x
+        tay
+        lda     mos16(zp_save),x
+        sta     0x00,x
+        tya
+        sta     mos16(zp_save),x
+        dex
+        bpl     zp_swap_1
+        rts
+
+; uint8_t mli_call(uint8_t cmd): the MLI with RES_PARMS; its error, 0 = none
+        .global mli_call
+mli_call:
+        .byte   0x8f                    ; sta RES_CMD (long, bank 0)
+        .short  RES_CMD
+        .byte   0
+        jsr     zp_swap
+        .byte   0x22                    ; jsl RES_MLI
+        .short  RES_MLI
+        .byte   0
+        jsr     zp_swap
+        .byte   0xaf                    ; lda RES_ERR
+        .short  RES_ERR
+        .byte   0
+        rts
+
+; uint8_t rom_call(uint16_t addr): JSR addr in emulation mode, A/X/Y from
+; RES_A/X/Y (and back there, with P); returns A
+        .global rom_call
+rom_call:
+        .byte   0x8f                    ; sta RES_TGT
+        .short  RES_TGT
+        .byte   0
+        txa
+        .byte   0x8f                    ; sta RES_TGT+1
+        .short  RES_TGT + 1
+        .byte   0
+        jsr     zp_swap
+        .byte   0x22                    ; jsl RES_ROM
+        .short  RES_ROM
+        .byte   0
+        jsr     zp_swap
+        .byte   0xaf                    ; lda RES_A
+        .short  RES_A
+        .byte   0
+        rts
+
+; uint8_t vm_call(void): the VM runs the compiled program (vm_run: JSL its
+; bank's $0000 with D = its direct page); returns its VM_ERR
+        .global vm_call
+vm_call:
+        jsr     zp_swap
+        phk                             ; the VM's RTL comes back to vm_back
+        .byte   0xf4                    ; pea vm_back - 1
+        .short  vm_back - 1
+        lda     mos16(vm_bank)          ; "return" to vm_bank:$0000
+        pha
+        .byte   0xf4                    ; pea $FFFF
+        .short  0xffff
+        rep     #0x20
+        lda     mos16(vm_dp)
+        tcd
+        sep     #0x20
+        rtl
+vm_back:
+        .byte   0xf4                    ; pea 0
+        .short  0
+        pld
+        sep     #0x30
+        jsr     zp_swap
+        lda     mos16(vm_dp)
+        sta     __rc2
+        lda     mos16(vm_dp+1)
+        sta     __rc3
+        stz     __rc4
+        ldy     #0x2f                   ; VM_ERR
+        lda     [__rc2],y
+        rts
+
+; far_move: xfer_n bytes from xfer_far to xfer_far2 (both one below)
+        .global far_move
+far_move:
+        jsr     xfer_setup
+        lda     mos16(xfer_far2)
+        sta     __rc7
+        lda     mos16(xfer_far2+1)
+        sta     __rc8
+        lda     mos16(xfer_far2+2)
+        sta     __rc9
+move_loop:
+        lda     [__rc2],y
+        sta     [__rc7],y
+        dey
+        bne     move_loop
+        sep     #0x10
+        rts
