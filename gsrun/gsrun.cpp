@@ -26,7 +26,11 @@
 // $C000 reads "no key"; $C0xx otherwise reads 0 and holds nothing.  A jump
 // into the firmware banks stops the run and names the last monitor entry.
 //
-//   gsrun ROM --prog TOKENS [--vm VM.bin] [--keys SCRIPT] [--out FILE] [--max N]
+//   gsrun ROM --prog TOKENS [--vm VM.bin [--cc cc.bin]] [--keys SCRIPT] [--out FILE] [--max N]
+//
+// --cc: compile with the compiler built for the 65816 (cc/), run on this
+// machine, instead of the PC build - and check the two images are identical
+// byte for byte; the compile's cycles are reported.
 //
 // ROM AppleSoft: cold start at $E000, the program installed at the first
 // prompt, RUN typed; the output is every COUT byte from RUN until AppleSoft
@@ -108,7 +112,7 @@ struct Machine {
   std::vector<uint8_t> screen;           // the text page when the program ended
   void snap() { if (screen.empty()) screen.assign(&c.mem[0x400], &c.mem[0x800]); }
   long long trace = 0;                   // GSRUN_TRACE=n: the VM run's first n instructions
-  std::map<uint32_t, long>* hist = nullptr; // GSRUN_HIST: where the VM run spent its instructions
+  std::map<uint32_t, long>* hist = nullptr; // GSRUN_HIST/GSRUN_CCPROF: cycles spent at each PC
 
   explicit Machine(const std::vector<uint8_t>& rom)
   {
@@ -258,8 +262,10 @@ struct Machine {
       if (trace > 0 && n < trace)
         fprintf(stderr, "%06X a=%04X x=%04X y=%04X s=%04X d=%04X b=%02X p=%02X\n", c.pc(), c.a(), c.x(), c.y(),
                 c.s(), c.d(), c.dbr(), c.p());
-      if (hist) (*hist)[c.pc()]++;
+      uint32_t pc = c.pc();
+      uint64_t c0 = c.cycles;
       if (!step()) return c.halted();
+      if (hist) (*hist)[pc] += long(c.cycles - c0);
     }
     return false;
   }
@@ -272,13 +278,18 @@ struct VmPlatform {
   uint32_t fp_table;
 };
 
-uint8_t pf_prog(void* ctx, uint16_t a)
+void pf_read(void* ctx, uint16_t a, uint8_t* dst, uint16_t n)
 {
   auto* v = static_cast<VmPlatform*>(ctx);
-  size_t i = size_t(a) - 0x801;
-  return i < v->prog.size() ? v->prog[i] : 0;
+  for (uint16_t k = 0; k < n; k++) {
+    size_t i = size_t(uint16_t(a + k)) - 0x801;
+    dst[k] = i < v->prog.size() ? v->prog[i] : 0;
+  }
 }
-void pf_wr(void* ctx, uint16_t a, uint8_t b) { static_cast<VmPlatform*>(ctx)->m->c.mem[VM_BANK | a] = b; }
+void pf_write(void* ctx, uint16_t a, const uint8_t* src, uint16_t n)
+{
+  for (uint16_t k = 0; k < n; k++) static_cast<VmPlatform*>(ctx)->m->c.mem[VM_BANK | uint16_t(a + k)] = src[k];
+}
 
 // FIN: fp816's own, run on the machine
 int pf_fin(void* ctx, const uint8_t* text, int len, uint8_t fac[7])
@@ -335,7 +346,7 @@ void show(const std::vector<uint8_t>& out)
 int main(int argc, char** argv)
 {
   const char *rom_path = nullptr, *prog_path = nullptr, *keys_path = nullptr, *out_path = nullptr,
-             *vm_path = nullptr;
+             *vm_path = nullptr, *cc_path = nullptr;
   long long max_insns = 2000000000;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -343,6 +354,7 @@ int main(int argc, char** argv)
     else if (a == "--keys" && i + 1 < argc) keys_path = argv[++i];
     else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
     else if (a == "--vm" && i + 1 < argc) vm_path = argv[++i];
+    else if (a == "--cc" && i + 1 < argc) cc_path = argv[++i];
     else if (a == "--max" && i + 1 < argc) max_insns = atoll(argv[++i]);
     else if (!rom_path) rom_path = argv[i];
     else rom_path = nullptr, i = argc;
@@ -411,12 +423,56 @@ int main(int argc, char** argv)
 
     VmPlatform vp{&m, prog, VM_BANK | w(0x16)};
     Platform pf{};
-    pf.ctx = &vp, pf.prog = pf_prog, pf.wr = pf_wr, pf.fin = pf_fin;
+    pf.ctx = &vp, pf.read = pf_read, pf.write = pf_write, pf.fin = pf_fin;
     pf.prog_start = prog_start, pf.optable = handlers.data();
     CompileStats st{};
     if (as816_compile(&pf, &st) != 0) { fprintf(stderr, "gsrun: the program does not fit the VM bank\n"); return 1; }
     fprintf(stderr, "gsrun: compiled %u lines: %u bytes of code, %u variables, %u arrays, %u constants\n",
             st.lines, st.code_size, st.vars, st.arrays, st.consts);
+    if (const char* img = getenv("GSRUN_IMAGE")) {   // FILE: the compiled image, prog_start to its end
+      FILE* f = fopen(img, "wb");
+      fwrite(&m.c.mem[VM_BANK + prog_start], 1, st.end - prog_start, f);
+      fclose(f);
+    }
+    if (cc_path) {
+      // the same compile by the 65816 build, on the machine; the PC build's
+      // image is the reference
+      std::vector<uint8_t> ref(&m.c.mem[VM_BANK], &m.c.mem[VM_BANK] + 0x10000);
+      memcpy(&m.c.mem[VM_BANK], vm.data(), vm.size());
+      memset(&m.c.mem[VM_BANK] + vm.size(), 0, 0x10000 - vm.size());
+      auto cc = slurp(cc_path);
+      if (cc.size() < 12 || memcmp(&cc[4], "CC16", 4)) { fprintf(stderr, "%s: not a compiler image\n", cc_path); return 2; }
+      constexpr uint32_t CC_BANK = 0x070000, TEXT_BANK = 0x090000;
+      memcpy(&m.c.mem[CC_BANK], cc.data(), cc.size());
+      memcpy(&m.c.mem[TEXT_BANK + 0x801], prog.data(), prog.size());
+      m.c.mem[TEXT_BANK + 0x801 + prog.size()] = 0, m.c.mem[TEXT_BANK + 0x802 + prog.size()] = 0;
+      uint32_t params = 0x080000 | (cc[8] | cc[9] << 8);
+      m.c.mem[params + 0] = uint8_t(VM_BANK >> 16);
+      m.c.mem[params + 1] = uint8_t(TEXT_BANK >> 16);
+      m.c.mem[params + 2] = uint8_t(VM_DP), m.c.mem[params + 3] = uint8_t(VM_DP >> 8);
+      m.c.mem[params + 4] = 0xAA, m.c.mem[params + 5] = 0xAA;
+      uint64_t c0 = m.c.cycles;
+      std::map<uint32_t, long> cch;
+      const char* prof = getenv("GSRUN_CCPROF");   // FILE: "pc cycles" lines (tools/ccprof.py)
+      if (prof) m.hist = &cch;
+      bool ok = m.call_native(CC_BANK, 0, 400000000);
+      m.hist = nullptr;
+      if (prof) {
+        FILE* f = fopen(prof, "w");
+        for (auto& [k, n] : cch) fprintf(f, "%06X %ld\n", k, n);
+        fclose(f);
+      }
+      uint64_t cc_cycles = m.c.cycles - c0;
+      int16_t res = int16_t(m.c.mem[params + 4] | m.c.mem[params + 5] << 8);
+      int diffs = 0, first = -1;
+      for (uint32_t a = prog_start; a < st.end; a++)
+        if (m.c.mem[VM_BANK + a] != ref[a]) { diffs++; if (first < 0) first = int(a); }
+      fprintf(stderr, "gsrun: the 65816 compiler: %s, result %d, %llu cycles (%.2f s at 2.8 MHz, %.2f s at 1 MHz); "
+              "%d bytes differ from the PC build%s\n", ok ? "returned" : "did not return", res,
+              (unsigned long long)cc_cycles, cc_cycles / 2.8e6, cc_cycles / 1.0205e6, diffs,
+              first >= 0 ? (" (first at $" + std::to_string(first) + ")").c_str() : "");
+      if (!ok || res != 0 || diffs) return 1;
+    }
     m.recording = true;
     if (getenv("GSRUN_TRACE")) m.trace = atoll(getenv("GSRUN_TRACE"));
     std::map<uint32_t, long> hist;

@@ -18,6 +18,14 @@
 
 #include <string.h>
 
+/* the big tables are filled before they are read: the 65816 build's crt0
+ * need not clear them */
+#ifdef __mos__
+#define NOINIT __attribute__((section(".noinit.compile")))
+#else
+#define NOINIT
+#endif
+
 /* ---- tokens ---- */
 enum {
   T_END = 0x80, T_FOR = 0x81, T_NEXT = 0x82, T_DATA = 0x83, T_INPUT = 0x84, T_DIM = 0x86, T_READ = 0x87,
@@ -48,6 +56,8 @@ enum {
 #define CSTACK_SIZE 4096
 #define HEADER_SIZE 34
 #define MAX_FNS 64
+#define MAX_LITS 3000                /* numeric literals FIN converts in pass 1 */
+#define CONST_HASH 128
 
 typedef struct { uint16_t num, addr; } Line;
 typedef struct { uint8_t c1, c2, type; } Var;              /* type: 0 real, 1 integer, 2 string */
@@ -58,14 +68,22 @@ static int pass;
 static uint16_t pc;                 /* the emit position (an address in the VM bank) */
 static int overflow;                /* the image does not fit */
 
-static Line lines[MAX_LINES + 1];      /* + the END after the last line */
+NOINIT static Line lines[MAX_LINES + 1];      /* + the END after the last line */
 static uint16_t nlines, line_i;     /* line_i: the line being compiled */
-static Var vars[MAX_VARS];
+NOINIT static Var vars[MAX_VARS];
 static uint16_t nvars;
-static Array arrays[MAX_ARRAYS];
+NOINIT static Array arrays[MAX_ARRAYS];
 static uint16_t narrays;
-static uint8_t consts[MAX_CONSTS][7];
+/* the constant pool: made in pass 1, kept (same order) for pass 2 */
+NOINIT static uint8_t consts[MAX_CONSTS][7];
 static uint16_t nconsts;
+NOINIT static uint16_t const_head[CONST_HASH], const_next[MAX_CONSTS];   /* index + 1, 0 = none */
+/* pass 1's literals - where in the text, what FIN made of them - so pass 2
+ * neither runs FIN nor looks the constant up again */
+typedef struct { uint16_t at, slot; uint8_t used; } Lit;
+NOINIT static Lit lits[MAX_LITS];
+static uint16_t nlits, lit_i;
+static uint16_t line_at;            /* the text address of buf[0] */
 static uint16_t str_bytes;          /* string literal pool size, this pass */
 
 /* the layout, fixed after pass 1 */
@@ -76,18 +94,56 @@ static int use_onerr;                             /* STMT marks needed */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
 static uint16_t nsvars, nsarrays;
-static uint16_t var_off[MAX_VARS], desc_off[MAX_ARRAYS];
+NOINIT static uint16_t var_off[MAX_VARS];
+static uint16_t desc_off[MAX_ARRAYS];
 static uint16_t str_at;             /* pass 2: the next literal's address */
 
 /* the line being compiled */
 static uint8_t buf[256];
-static int p, blen;
+static uint8_t p, blen;             /* bytes: buf holds at most 255 characters and its 0 */
 
-/* ---- emitting ---- */
+/* ---- writing the VM bank: runs of consecutive bytes, one write each ---- */
+static uint8_t wbuf[128];
+static uint8_t wlen;
+static uint16_t wbase, wnext;       /* wnext: the address that continues the run */
+static void flush(void)
+{
+  if (wlen) pf->write(pf->ctx, wbase, wbuf, wlen);
+  wlen = 0;
+}
+static void out(uint16_t a, uint8_t v)
+{
+  if (!wlen || a != wnext || wlen == sizeof wbuf) {
+    flush();
+    wbase = a;
+  }
+  wbuf[wlen++] = v;
+  wnext = (uint16_t)(a + 1);
+}
+
+/* ---- emitting: pass 2 gathers the code in cbuf, written 256 bytes at a
+ * time; cbuf[0] is the byte at pc - clen ---- */
+static uint8_t cbuf[256];
+static uint8_t clen;
+static void flush_code(uint16_t n)
+{
+  if (n) pf->write(pf->ctx, (uint16_t)(pc - n), cbuf, n);
+  clen = 0;
+}
 static void emit8(uint8_t v)
 {
-  if (pass == 2) pf->wr(pf->ctx, pc, v);
   if (++pc == 0) overflow = 1;
+  if (pass == 2) {
+    cbuf[clen++] = v;
+    if (!clen) flush_code(256);
+  }
+}
+/* a byte of code already emitted */
+static void patch8(uint16_t a, uint8_t v)
+{
+  uint16_t back = (uint16_t)(pc - a);     /* 1 for the last byte */
+  if (back <= clen) cbuf[clen - back] = v;
+  else out(a, v);
 }
 static void emit16(uint16_t v) { emit8((uint8_t)v); emit8((uint8_t)(v >> 8)); }
 static void op(int o) { emit16(pf->optable[o]); }
@@ -152,16 +208,50 @@ static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
   return arrays[i].ndims == ndims ? (int)i : -1;
 }
 
-static uint16_t const_slot(const uint8_t fac[7])
+/* the constant's index in the pool, added if new */
+static uint16_t const_index(const uint8_t fac[7])
 {
+  uint8_t h = (uint8_t)((fac[0] + fac[1] + fac[2] + fac[3] + fac[4] + fac[5] + fac[6]) & (CONST_HASH - 1)), k;
   uint16_t i;
-  for (i = 0; i < nconsts; i++)
-    if (!memcmp(consts[i], fac, 7)) break;
-  if (i == nconsts) {
-    if (nconsts == MAX_CONSTS) { overflow = 1; return 0; }
-    memcpy(consts[nconsts++], fac, 7);
+  for (i = const_head[h]; i; i = const_next[i - 1]) {
+    const uint8_t *c = consts[i - 1];
+    for (k = 0; k < 7 && c[k] == fac[k]; k++) {}
+    if (k == 7) return (uint16_t)(i - 1);
   }
-  return (uint16_t)(const_base + 7 * i);
+  if (nconsts == MAX_CONSTS) { overflow = 1; return 0; }
+  memcpy(consts[nconsts], fac, 7);
+  const_next[nconsts] = const_head[h];
+  const_head[h] = ++nconsts;
+  return (uint16_t)(nconsts - 1);
+}
+static uint16_t const_slot(const uint8_t fac[7]) { return (uint16_t)(const_base + 7 * const_index(fac)); }
+
+/* a numeric literal at buf[p]: its constant's slot, and p past it; 0 for
+ * FIN's ?OVERFLOW (p not moved) */
+static int literal(uint16_t *slot)
+{
+  uint16_t at = (uint16_t)(line_at + p);
+  uint8_t fac[7];
+  uint16_t i;
+  int used;
+  if (pass == 2) {                  /* pass 1 saw it (parsing is the same in both passes) */
+    while (lit_i < nlits && lits[lit_i].at < at) lit_i++;
+    if (lit_i < nlits && lits[lit_i].at == at) {
+      *slot = (uint16_t)(const_base + 7 * lits[lit_i].slot);
+      p += lits[lit_i].used;
+      return 1;
+    }
+  }
+  used = pf->fin(pf->ctx, buf + p, blen - p, fac);
+  if (used <= 0) return 0;
+  i = const_index(fac);
+  *slot = (uint16_t)(const_base + 7 * i);
+  if (pass == 1 && nlits < MAX_LITS) {
+    lits[nlits].at = at, lits[nlits].slot = i, lits[nlits].used = (uint8_t)used;
+    nlits++;
+  }
+  p += used;
+  return 1;
 }
 
 /* a DEF FN's table entry (4 bytes, among the variables: CLEAR forgets it) */
@@ -183,8 +273,8 @@ static uint16_t str_literal(const uint8_t *s, uint8_t n)
 {
   uint16_t at = str_at, i;
   if (pass == 2) {
-    pf->wr(pf->ctx, str_at, n);
-    for (i = 0; i < n; i++) pf->wr(pf->ctx, (uint16_t)(str_at + 1 + i), s[i]);
+    out(str_at, n);
+    for (i = 0; i < n; i++) out((uint16_t)(str_at + 1 + i), s[i]);
     str_at = (uint16_t)(str_at + 1 + n);
   }
   str_bytes = (uint16_t)(str_bytes + 1 + n);
@@ -363,11 +453,9 @@ static int element(Pending *pend, int *np)
   for (;;) {
     uint8_t c = peek();
     if (is_digit(c) || c == '.') {
-      uint8_t fac[7];
-      int used = pf->fin(pf->ctx, buf + p, blen - p, fac);
-      if (used <= 0) { error_here(0x45); return TY_ERR; }  /* FIN's ?OVERFLOW, at run time */
-      p += used;
-      op16(OP_LDC, const_slot(fac));
+      uint16_t slot;
+      if (!literal(&slot)) { error_here(0x45); return TY_ERR; }  /* FIN's ?OVERFLOW, at run time */
+      op16(OP_LDC, slot);
       return TY_NUM;
     }
     if (is_letter(c)) {
@@ -669,9 +757,9 @@ static void st_data(void)
   }
   if (pass == 2) {
     int i;
-    pf->wr(pf->ctx, data_at++, (uint8_t)num), pf->wr(pf->ctx, data_at++, (uint8_t)(num >> 8));
-    for (i = s0; i < p; i++) pf->wr(pf->ctx, data_at++, buf[i]);
-    pf->wr(pf->ctx, data_at++, 0);
+    out(data_at++, (uint8_t)num), out(data_at++, (uint8_t)(num >> 8));
+    for (i = s0; i < p; i++) out(data_at++, buf[i]);
+    out(data_at++, 0);
   }
   data_bytes = (uint16_t)(data_bytes + 2 + (p - s0) + 1);
 }
@@ -763,7 +851,7 @@ static void st_def(void)
   if (t == TY_ERR) return;
   if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return; }
   op(OP_FNRET);
-  if (pass == 2) pf->wr(pf->ctx, skip_at, (uint8_t)pc), pf->wr(pf->ctx, (uint16_t)(skip_at + 1), (uint8_t)(pc >> 8));
+  if (pass == 2) patch8(skip_at, (uint8_t)pc), patch8((uint16_t)(skip_at + 1), (uint8_t)(pc >> 8));
 }
 
 /* PLOT/HLIN/VLIN's coordinates: e (checked < 80 when r), pushed */
@@ -858,31 +946,44 @@ static void statement(void)
 }
 
 /* ---- the program ---- */
-static void read_line(uint16_t at, uint16_t *link, uint16_t *num)
+/* the line at at into buf; its link, 0 after the last line */
+static uint16_t read_line(uint16_t at, uint16_t *num)
 {
-  uint16_t a = (uint16_t)(at + 4);
-  *link = (uint16_t)(pf->prog(pf->ctx, at) | pf->prog(pf->ctx, (uint16_t)(at + 1)) << 8);
-  *num = (uint16_t)(pf->prog(pf->ctx, (uint16_t)(at + 2)) | pf->prog(pf->ctx, (uint16_t)(at + 3)) << 8);
-  blen = 0;
-  while (blen < (int)sizeof buf - 1 && (buf[blen] = pf->prog(pf->ctx, a++)) != 0) blen++;
-  buf[blen] = 0;
+  uint8_t h[4];
+  uint16_t link, n;
+  pf->read(pf->ctx, at, h, 4);
+  link = (uint16_t)(h[0] | h[1] << 8);
+  if (!link) return 0;
+  *num = (uint16_t)(h[2] | h[3] << 8);
+  line_at = (uint16_t)(at + 4);
+  n = (uint16_t)(link - line_at);       /* the text and its 0 */
+  if (n > sizeof buf - 1) n = sizeof buf - 1;
+  pf->read(pf->ctx, line_at, buf, n);
+  buf[n] = 0;
+  for (blen = 0; buf[blen]; blen++) {}
   p = 0;
+  return link;
 }
 
 static void run_pass(void)
 {
   uint16_t at = 0x0801, link, num;
   pc = code_base;
-  nvars = narrays = nconsts = nfns = 0;
+  clen = 0;
+  nvars = narrays = nfns = 0;
+  if (pass == 1) {
+    nconsts = nlits = 0;
+    memset(const_head, 0, sizeof const_head);
+  }
+  lit_i = 0;
   str_bytes = 0;
   str_at = str_base;
   data_bytes = 1;                         /* the pool's leading 0 */
   data_at = data_base;
-  if (pass == 2) pf->wr(pf->ctx, data_at++, 0);
+  if (pass == 2) out(data_at++, 0);
   line_i = 0;
   for (;;) {
-    if (pf->prog(pf->ctx, at) == 0 && pf->prog(pf->ctx, (uint16_t)(at + 1)) == 0) break;
-    read_line(at, &link, &num);
+    if (!(link = read_line(at, &num))) break;
     if (line_i == MAX_LINES) { overflow = 1; break; }
     lines[line_i].num = num, lines[line_i].addr = pc;
     op16(OP_LINE, num);
@@ -898,7 +999,8 @@ static void run_pass(void)
   nlines = line_i;
   lines[nlines].num = 0xFFFF, lines[nlines].addr = pc;   /* running off the end: END */
   op(OP_END);
-  if (pass == 2) pf->wr(pf->ctx, data_at++, 0xFF), pf->wr(pf->ctx, data_at++, 0xFF);
+  if (pass == 2) flush_code(clen);
+  if (pass == 2) out(data_at++, 0xFF), out(data_at++, 0xFF);
   data_bytes = (uint16_t)(data_bytes + 2);
 }
 
@@ -906,14 +1008,11 @@ static void run_pass(void)
  * (tokens appear only as tokens: string, REM and DATA text is ASCII) */
 static int scan_onerr(void)
 {
-  uint16_t at = 0x0801;
-  while (pf->prog(pf->ctx, at) | pf->prog(pf->ctx, (uint16_t)(at + 1))) {
-    uint16_t link = (uint16_t)(pf->prog(pf->ctx, at) | pf->prog(pf->ctx, (uint16_t)(at + 1)) << 8), a = (uint16_t)(at + 4);
-    uint8_t b;
-    while ((b = pf->prog(pf->ctx, a++)) != 0)
-      if (b == T_ONERR || b == T_RESUME || b == T_TRACE) return 1;
-    at = link;
-  }
+  uint16_t at = 0x0801, num;
+  int i;
+  while ((at = read_line(at, &num)) != 0)
+    for (i = 0; i < blen; i++)
+      if (buf[i] == T_ONERR || buf[i] == T_RESUME || buf[i] == T_TRACE) return 1;
   return 0;
 }
 
@@ -965,30 +1064,30 @@ int as816_compile(const Platform *platform, CompileStats *st)
 
   /* constants; variables zero; descriptors: no storage yet, their count */
   for (i = 0; i < nconsts; i++)
-    for (a = 0; a < 7; a++) pf->wr(pf->ctx, (uint16_t)(const_base + 7 * i + a), consts[i][a]);
-  for (a = var_base; a < desc_base; a++) pf->wr(pf->ctx, a, 0);
+    for (a = 0; a < 7; a++) out((uint16_t)(const_base + 7 * i + a), consts[i][a]);
+  for (a = var_base; a < desc_base; a++) out(a, 0);
   for (i = 0; i < narrays; i++) {
     uint16_t d = desc_off[i];
     uint8_t size = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
-    pf->wr(pf->ctx, d, 0), pf->wr(pf->ctx, (uint16_t)(d + 1), 0);
-    pf->wr(pf->ctx, (uint16_t)(d + 2), arrays[i].ndims), pf->wr(pf->ctx, (uint16_t)(d + 3), size);
+    out(d, 0), out((uint16_t)(d + 1), 0);
+    out((uint16_t)(d + 2), arrays[i].ndims), out((uint16_t)(d + 3), size);
     /* the pristine copy CLEAR restores from */
-    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base), 0);
-    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 1), 0);
-    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 2), arrays[i].ndims);
-    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 3), size);
+    out((uint16_t)(d - desc_base + desc_copy_base), 0);
+    out((uint16_t)(d - desc_base + desc_copy_base + 1), 0);
+    out((uint16_t)(d - desc_base + desc_copy_base + 2), arrays[i].ndims);
+    out((uint16_t)(d - desc_base + desc_copy_base + 3), size);
   }
   /* the collector's roots: the string variables, the string arrays */
   {
     uint16_t at = svlist_base;
     for (i = 0; i < nvars; i++)
       if (vars[i].type == 2) {
-        pf->wr(pf->ctx, at, (uint8_t)var_off[i]), pf->wr(pf->ctx, (uint16_t)(at + 1), (uint8_t)(var_off[i] >> 8));
+        out(at, (uint8_t)var_off[i]), out((uint16_t)(at + 1), (uint8_t)(var_off[i] >> 8));
         at = (uint16_t)(at + 2);
       }
     for (i = 0; i < narrays; i++)
       if (arrays[i].type == 2) {
-        pf->wr(pf->ctx, at, (uint8_t)desc_off[i]), pf->wr(pf->ctx, (uint16_t)(at + 1), (uint8_t)(desc_off[i] >> 8));
+        out(at, (uint8_t)desc_off[i]), out((uint16_t)(at + 1), (uint8_t)(desc_off[i] >> 8));
         at = (uint16_t)(at + 2);
       }
   }
@@ -1002,8 +1101,8 @@ int as816_compile(const Platform *platform, CompileStats *st)
     vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
     for (i = 0; i < 17; i++) {
-      pf->wr(pf->ctx, (uint16_t)(h + 2 * i), (uint8_t)vals[i]);
-      pf->wr(pf->ctx, (uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
+      out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
+      out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }
   }
   if (st) {
@@ -1012,5 +1111,6 @@ int as816_compile(const Platform *platform, CompileStats *st)
     st->strings = str_bytes;
     st->end = heap_base;
   }
+  flush();
   return 0;
 }

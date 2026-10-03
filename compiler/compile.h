@@ -42,10 +42,10 @@ enum {
 
 typedef struct Platform {
   void *ctx;
-  /* the tokenized program as loaded at $0801: its byte at address a */
-  uint8_t (*prog)(void *ctx, uint16_t a);
-  /* write a byte of the VM bank */
-  void (*wr)(void *ctx, uint16_t a, uint8_t v);
+  /* the tokenized program as loaded at $0801: n bytes from address a */
+  void (*read)(void *ctx, uint16_t a, uint8_t *dst, uint16_t n);
+  /* n bytes into the VM bank at address a */
+  void (*write)(void *ctx, uint16_t a, const uint8_t *src, uint16_t n);
   /* FIN: the number whose first character is text[0]; fills fac[7] (exp,
    * mantissa 4, sign, rounding byte) and returns how many characters FIN
    * took, or -1 for an error (FIN's ?OVERFLOW) */

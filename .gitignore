@@ -16,3 +16,6 @@ vm/*.o
 vm/vm.lst
 vm/vm.map
 gsrun/compile.o
+cc/cc.bin
+cc/cc.bin.elf
+cc/cc.map
