@@ -69,6 +69,18 @@ VM_T4    = $B0          ; 2: scratch (a free fp816 offset)
 VM_T5    = $B2          ; 2: scratch
 VM_NEWF  = $B4          ; 2: the collector's free pointer in the new half
 VM_SDESC = $B6          ; 4: scratch descriptor (in the direct page)
+RC_A     = $BA          ; romcall's results: A, X, Y, P (8-bit)
+RC_X     = $BB
+RC_Y     = $BC
+RC_P     = $BD
+RC_TGT   = $BE          ; 3: long pointer to romcall's JSR operand in bank 0
+VM_INMODE = $CE         ; 1: INPUTFLG: 0 INPUT, $98 READ, $40 GET
+DATPTR   = $CF          ; 2: READ's place in the DATA pool (this bank)
+DATLIN   = $D1          ; 2: the line of the DATA being read
+VM_INSTMT = $D3         ; 2: the INPUT operation's IP (?REENTER starts it again)
+INPTR    = $D5          ; 3: the input text pointer between items (long)
+VM_ITYPE = $D8          ; 1: the item's type: 0 real, 1 integer, 2 string
+VM_ITGT  = $D9          ; 2: the item's variable or element (this bank)
 
 ERR_NEXT_WITHOUT_FOR  = $00
 ERR_RETURN_WITHOUT_GOSUB = $16
@@ -145,6 +157,7 @@ optable:
         .word   op_left, op_right, op_midp, op_mid2, op_mid3, op_len, op_asc, op_chr
         .word   op_str, op_val, op_fre
         .word   op_ldvi, op_stvi, op_ldai, op_stai, op_slda, op_ssta
+        .word   op_inpstart, op_readstart, op_getstart, op_item, op_inpend, op_restore
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -177,6 +190,8 @@ vm_run:
         sta     VM_CLIM
         lda     a:$000C,y       ; the string temporary stack
         sta     VM_SSP
+        lda     a:$0016,y       ; the DATA pool (RESTORE's state)
+        sta     DATPTR
         stz     SH_FREE         ; the string heap: the low half, empty
         lda     #$8000
         sta     SH_END
@@ -185,10 +200,19 @@ vm_run:
         ldx     a:$0000,y       ; entry IP
         lda     COUT_VEC        ; patch the COUT trampoline
         sta     cout_target
+        clc                     ; and romcall's: the stub block's base + offsets
+        adc     #romcall_stub - stub_start
+        sta     romcall_target
+        lda     COUT_VEC
+        clc
+        adc     #romcall_jsr + 1 - stub_start
+        sta     RC_TGT
         sep     #$20
         .a8
         lda     COUT_VEC+2
         sta     cout_target+2
+        sta     romcall_target+2
+        sta     RC_TGT+2
         stz     SH_HALF
         stz     VM_ERR
         jmp     ($0000,x)
@@ -304,6 +328,30 @@ cout_tramp:
 cout_target:
         .faraddr 0
 
+romcall_tramp:
+        .byte   $5C
+romcall_target:
+        .faraddr 0
+
+; romcall: call the ROM routine at VM_T4 in emulation mode (D = 0, DBR =
+; 0) with A, X, Y (low bytes); results in RC_A/X/Y/P.  Leaves A 8-bit,
+; X/Y 16-bit, X = VM_IP.
+romcall:
+        pha
+        rep     #$20
+        .a16
+        lda     VM_T4
+        sta     [RC_TGT]
+        sep     #$20
+        .a8
+        pla
+        phk
+        jsr     romcall_tramp
+        rep     #$10
+        .i16
+        ldx     VM_IP
+        rts
+
 crdo:   lda     #$0D
         jmp     outdo
 
@@ -350,6 +398,32 @@ stub_start:
         plb
         pld
         plp
+        rtl
+
+; romcall: JML'd to with A, X, Y (8-bit values) for the ROM routine whose
+; address vm patched into the JSR below; results into the VM's direct page
+; (RC_A, RC_X, RC_Y, RC_P).  Returns with M = X = 1.
+romcall_stub:
+        phd
+        phb
+        pea     $0000
+        pld
+        phk
+        plb
+        sec
+        xce
+romcall_jsr:
+        jsr     $0000           ; patched
+        clc
+        xce
+        plb
+        pld
+        sta     RC_A
+        stx     RC_X
+        sty     RC_Y
+        php
+        pla
+        sta     RC_P
         rtl
 stub_end:
 
@@ -1313,6 +1387,12 @@ salloc: sta     VM_T3
 gc_strings:
         phx
         phy
+        pei     (VM_T0)         ; the callers' scratch survives a collection
+        pei     (VM_T1)
+        pei     (VM_T2)
+        pei     (VM_T3)
+        pei     (VM_T4)
+        pei     (VM_T5)
         lda     SH_HALF
         and     #$00FF
         beq     @to1
@@ -1408,6 +1488,18 @@ gc_strings:
         sta     SH_HALF
         rep     #$20
         .a16
+        pla
+        sta     VM_T5
+        pla
+        sta     VM_T4
+        pla
+        sta     VM_T3
+        pla
+        sta     VM_T2
+        pla
+        sta     VM_T1
+        pla
+        sta     VM_T0
         ply
         plx
         rts
@@ -2111,6 +2203,407 @@ op_ssta:
         sep     #$20
         .a8
         NEXTOP  4
+
+
+; =========================================================================
+; INPUT, READ, GET (PROCESS.INPUT.LIST $DBEB, one item at a time)
+; =========================================================================
+
+; CHRGET/CHRGOT over FP_TXT (the ROM's, as fp816 has them)
+vchrget:
+        inc     FP_TXT
+        bne     vchrgot
+        inc     FP_TXT+1
+vchrgot:
+        lda     [FP_TXT]
+        cmp     #$3A
+        bcs     @rts
+        cmp     #$20
+        beq     vchrget
+        sec
+        sbc     #$30
+        sec
+        sbc     #$D0
+@rts:   rts
+
+; INLIN ($D52C): GETLN with prompt $80; at most 239 characters; a 0 after;
+; the high bits off.  The text pointer is left at $01FF.
+inlin:  lda     #$80
+        sta     f:$000033
+        ldy     #$FD6A
+        sty     VM_T4
+        jsr     romcall
+        lda     RC_X
+        cmp     #$EF
+        bcc     @l
+        lda     #$EF
+@l:     rep     #$20
+        .a16
+        and     #$00FF
+        tay
+        sep     #$20
+        .a8
+        lda     #$00
+        tyx
+        sta     f:$000200,x
+@strip: cpx     #$0000
+        beq     @done
+        lda     f:$0001FF,x
+        and     #$7F
+        sta     f:$0001FF,x
+        dex
+        bra     @strip
+@done:  ldx     VM_IP
+        ldy     #$01FF
+        sty     FP_TXT
+        stz     FP_TXT+2
+        rts
+
+; INPSTART p: INPUT's start: the prompt (literal p) or "?", INLIN
+op_inpstart:
+        stx     VM_INSTMT
+        stx     VM_IP
+        ldy     a:$0002,x
+        beq     @ques
+        lda     a:$0000,y       ; STRPRT the literal
+        sta     VM_T0
+@p:     lda     VM_T0
+        beq     @line
+        iny
+        lda     a:$0000,y
+        jsr     outdo
+        dec     VM_T0
+        bra     @p
+@ques:  lda     #'?'            ; OUTQUES
+        jsr     outdo
+@line:  lda     #','
+        sta     f:$0001FF
+        jsr     inlin
+        stz     VM_INMODE
+        jsr     save_inptr
+        ldx     VM_IP
+        NEXTOP  4
+
+; READSTART: from DATPTR in the pool (this bank)
+op_readstart:
+        lda     #$98
+        sta     VM_INMODE
+        ldy     DATPTR
+        sty     INPTR
+        phk
+        pla
+        sta     INPTR+2
+        NEXTOP  2
+
+; GETSTART: INPTR = $0201, a 0 there: the first item reads a key
+op_getstart:
+        lda     #$40
+        sta     VM_INMODE
+        lda     #$00
+        sta     f:$000201
+        ldy     #$0201
+        sty     INPTR
+        stz     INPTR+2
+        NEXTOP  2
+
+save_inptr:
+        ldy     FP_TXT
+        sty     INPTR
+        lda     FP_TXT+2
+        sta     INPTR+2
+        rts
+
+; ITEM t a: one variable: t = type (0 real, 1 integer, 2 string) + $80 for
+; an array element (a = its descriptor, the subscripts pushed), else a =
+; the variable
+op_item:
+        stx     VM_IP
+        lda     a:$0002,x
+        and     #$03
+        sta     VM_ITYPE
+        ldy     a:$0003,x
+        lda     a:$0002,x
+        bpl     @var
+        jsr     elem_addr       ; the element first, as PTRGET does
+        ldx     VM_IP
+@var:   sty     VM_ITGT
+        ldy     INPTR           ; TXTPTR = the input text
+        sty     FP_TXT
+        lda     INPTR+2
+        sta     FP_TXT+2
+        jsr     vchrgot
+        beq     @end
+        jmp     instart
+@end:   lda     VM_INMODE       ; the text is used up
+        bmi     @findata
+        and     #$40
+        beq     @more_input
+        ; GET: a key into $0200, the text pointer before it
+        ldy     #$FD0C
+        sty     VM_T4
+        jsr     romcall
+        lda     RC_A
+        and     #$7F
+        sta     f:$000200
+        ldy     #$01FF
+        sty     FP_TXT
+        stz     FP_TXT+2
+        jmp     instart
+@more_input:                    ; INPUT: "??" and another line
+        lda     #'?'
+        jsr     outdo
+        lda     #'?'
+        jsr     outdo
+        jsr     inlin
+        jmp     instart
+@findata:                       ; READ: the next DATA statement (FINDATA)
+        ldy     FP_TXT          ; at a record's 0: its line follows
+        iny
+        lda     a:$0001,y
+        cmp     #$FF
+        bne     @rec
+        lda     a:$0000,y
+        cmp     #$FF
+        bne     @rec
+        lda     #$2A            ; ?OUT OF DATA (in the READ's line)
+        jmp     vm_error
+@rec:   rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     DATLIN
+        sep     #$20
+        .a8
+        iny                     ; the text - 1 (the line's high byte)
+        sty     FP_TXT
+        jmp     instart
+
+; INSTART ($DC2B): the item's first character
+instart:
+        jsr     vchrget
+        lda     VM_ITYPE
+        cmp     #$02
+        beq     @string
+        jmp     in_number
+@string:
+        lda     VM_INMODE
+        and     #$40
+        beq     @notget
+        lda     #$00            ; GET: the whole buffer from $0200
+        sta     FP_TXT          ; (the ROM's INX/STX TXTPTR)
+        sta     VM_T0           ; CHARAC = ENDCHR = 0
+        sta     VM_T0+1
+        clc
+        bra     @scan
+@notget:
+        lda     [FP_TXT]
+        cmp     #'"'
+        beq     @quoted
+        lda     #':'            ; unquoted: to ":" or ","
+        sta     VM_T0
+        lda     #','
+        sta     VM_T0+1
+        clc
+        bra     @scan
+@quoted:
+        sta     VM_T0
+        sta     VM_T0+1
+        sec                     ; the text starts after the quote
+@scan:  rep     #$20
+        .a16
+        lda     FP_TXT          ; SPTR2 = the text's start
+        adc     #$0000
+        sta     SPTR2
+        sep     #$20
+        .a8
+        lda     FP_TXT+2
+        sta     SPTR2+2
+        ldy     #$0000          ; STRLT2's scan
+@s:     lda     [SPTR2],y
+        beq     @zero
+        cmp     VM_T0
+        beq     @term
+        cmp     VM_T0+1
+        beq     @term
+        iny
+        bra     @s
+@term:  cmp     #'"'            ; a closing quote is passed over (C = 1)
+        beq     @ended
+@zero:  clc                     ; (STRLT2's LE408: the 0 or another terminator)
+@ended: lda     #$00            ; C: past a closing quote
+        rol     a
+        sta     VM_T5
+        stz     VM_T5+1
+        tya
+        sta     VM_T3           ; the length
+        stz     VM_T3+1
+        rep     #$21            ; the text pointer after it (POINT)
+        .a16
+        tya
+        adc     SPTR2
+        adc     VM_T5
+        sta     FP_TXT
+        sep     #$20
+        .a8
+        ; the string: text in the input buffer (bank 0) is copied into the
+        ; heap; text in the pool (this bank) is used in place, as AppleSoft
+        ; points into its program
+        lda     SPTR2+2
+        beq     @copy
+        lda     VM_T3
+        sta     SACC
+        ldy     SPTR2
+        sty     SACC+1
+        lda     SPTR2+2
+        sta     SACC+3
+        bra     @put
+@copy:  rep     #$20
+        .a16
+        lda     SPTR2           ; (salloc may collect: the text is not in the heap)
+        pha
+        lda     VM_T3
+        beq     @empty
+        jsr     salloc
+@empty: pla
+        sta     SPTR2
+        sep     #$20
+        .a8
+        stz     SPTR2+2
+        stz     VM_T4
+        stz     VM_T4+1
+        stz     VM_T5
+        stz     VM_T5+1
+        rep     #$20
+        .a16
+        lda     SPTR
+        pha
+        sep     #$20
+        .a8
+        jsr     copy_bytes
+        rep     #$20
+        .a16
+        pla
+        sta     SACC+1
+        sep     #$20
+        .a8
+        lda     VM_T3
+        sta     SACC
+        lda     SH_BANK
+        sta     SACC+3
+@put:   ldy     VM_ITGT         ; PUTSTR
+        rep     #$20
+        .a16
+        lda     SACC
+        sta     a:$0000,y
+        lda     SACC+2
+        sta     a:$0002,y
+        sep     #$20
+        .a8
+        jmp     in_more
+
+; a number: FIN where the text is, then LET2 (INPUT.DATA $DC69)
+in_number:
+        lda     f:$000200       ; INPUT: an empty line is ?REENTER (INPFIN)
+        bne     @data
+        lda     VM_INMODE
+        bne     @data
+        jmp     reenter
+@data:  rep     #$20            ; fp_fin: CHRGET first, so the text - 1
+        .a16
+        lda     FP_TXT
+        dec     a
+        sta     FP_TXT
+        sep     #$20
+        .a8
+        FP      fp_fin
+        lda     FP_ERR
+        beq     @ok
+        jmp     vm_error
+@ok:    lda     VM_ITYPE
+        bne     @int
+        ldy     VM_ITGT         ; SETFOR: stored rounded
+        PTRY
+        FPCHK   fp_store_fac
+        bra     in_more
+@int:   FPCHK   fp_round
+        FPCHK   fp_ayint
+        ldy     VM_ITGT
+        lda     FAC+3
+        sta     a:$0000,y
+        lda     FAC+4
+        sta     a:$0001,y
+
+; INPUT.MORE ($DC72): the item must end the text or be followed by ","
+in_more:
+        jsr     vchrgot
+        beq     @ok
+        cmp     #','
+        beq     @ok
+        jmp     inputerr
+@ok:    jsr     save_inptr
+        ldx     VM_IP
+        NEXTOP  5
+
+; INPUTERR ($DB71): INPUT - ?REENTER; READ - ?SYNTAX ERROR in the DATA's
+; line; GET - ?SYNTAX ERROR, no line
+inputerr:
+        lda     VM_INMODE
+        beq     reenter
+        bmi     @read
+        ldy     #$FF40
+        sty     CURLIN
+        bra     @syn
+@read:  ldy     DATLIN
+        sty     CURLIN
+@syn:   lda     #$10
+        jmp     vm_error
+
+; RESPERR ($DB87): "?REENTER" and the INPUT statement from its start
+; (ONERR: later)
+reenter:
+        ldy     #$0000
+@m:     lda     msg_reenter,y
+        beq     @go
+        jsr     outdo
+        iny
+        bra     @m
+@go:    ldx     VM_INSTMT
+        jmp     ($0000,x)
+msg_reenter:
+        .byte   "?REENTER", $0D, 0
+msg_extra:
+        .byte   "?EXTRA IGNORED", $0D, 0
+
+; INPEND: INPDONE ($DCC6): READ keeps its place; INPUT reports what was left
+op_inpend:
+        lda     VM_INMODE
+        bpl     @inp
+        ldy     INPTR           ; READ: SETDA
+        sty     DATPTR
+        NEXTOP  2
+@inp:   ldy     INPTR
+        sty     FP_TXT
+        lda     INPTR+2
+        sta     FP_TXT+2
+        lda     [FP_TXT]
+        beq     @done
+        lda     VM_INMODE       ; (GET leaves nothing behind)
+        bne     @done
+        ldy     #$0000
+@m:     lda     msg_extra,y
+        beq     @done
+        jsr     outdo
+        iny
+        bra     @m
+@done:  NEXTOP  2
+
+; RESTORE: back to the pool's start
+op_restore:
+        ldy     VM_PROG
+        lda     a:$0016,y
+        sta     DATPTR
+        lda     a:$0017,y
+        sta     DATPTR+1
+        NEXTOP  2
 
 ; ---- the end of the VM: the program image the compiler writes starts here
         .segment "TAIL"

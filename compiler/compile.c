@@ -20,7 +20,8 @@
 
 /* ---- tokens ---- */
 enum {
-  T_END = 0x80, T_FOR = 0x81, T_NEXT = 0x82, T_DATA = 0x83, T_DIM = 0x86, T_LET = 0xAA, T_GOTO = 0xAB,
+  T_END = 0x80, T_FOR = 0x81, T_NEXT = 0x82, T_DATA = 0x83, T_INPUT = 0x84, T_DIM = 0x86, T_READ = 0x87,
+  T_RESTORE = 0xAE, T_GET = 0xBE, T_LET = 0xAA, T_GOTO = 0xAB,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
   T_MUL = 0xCA, T_DIV = 0xCB, T_POW = 0xCC, T_AND = 0xCD, T_OR = 0xCE,
@@ -39,7 +40,7 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 22
+#define HEADER_SIZE 24
 
 typedef struct { uint16_t num, addr; } Line;
 typedef struct { uint8_t c1, c2, type; } Var;              /* type: 0 real, 1 integer, 2 string */
@@ -61,6 +62,7 @@ static uint16_t nconsts;
 static uint16_t str_bytes;          /* string literal pool size, this pass */
 
 /* the layout, fixed after pass 1 */
+static uint16_t data_base, data_bytes, data_at;   /* the DATA pool */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
 static uint16_t nsvars, nsarrays;
@@ -589,6 +591,59 @@ static void st_dim(void)
   }
 }
 
+/* DATA: its text, as it stands in the program (PARSE leaves it), up to the
+ * statement's end, into the pool: [line][text][0] */
+static void st_data(void)
+{
+  int s0 = p, q = 0;
+  uint16_t num = lines[line_i].num;
+  while (p < blen && buf[p] && (q || buf[p] != ':')) {
+    if (buf[p] == '"') q = !q;
+    p++;
+  }
+  if (pass == 2) {
+    int i;
+    pf->wr(pf->ctx, data_at++, (uint8_t)num), pf->wr(pf->ctx, data_at++, (uint8_t)(num >> 8));
+    for (i = s0; i < p; i++) pf->wr(pf->ctx, data_at++, buf[i]);
+    pf->wr(pf->ctx, data_at++, 0);
+  }
+  data_bytes = (uint16_t)(data_bytes + 2 + (p - s0) + 1);
+}
+
+/* the variables of INPUT / READ / GET, each an ITEM */
+static void input_items(void)
+{
+  for (;;) {
+    Name nm;
+    if (!read_name(&nm)) { error_here(E_SYNTAX); return; }
+    if (nm.is_array) {
+      int n = subscripts(), a;
+      if (!n) { error_here(E_SYNTAX); return; }
+      a = array_slot(nm.c1, nm.c2, nm.type, (uint8_t)n);
+      if (a < 0) { error_here(E_BAD_SUBSCRIPT); return; }
+      op(OP_ITEM), emit8((uint8_t)(nm.type | 0x80)), emit16(pass == 2 ? desc_off[a] : 0);
+    } else
+      op(OP_ITEM), emit8(nm.type), emit16(var_slot(nm.c1, nm.c2, nm.type));
+    if (peek() != ',') break;
+    p++;
+  }
+  op(OP_INPEND);
+}
+
+static void st_input(void)
+{
+  uint16_t prompt = 0;
+  if (peek() == '"') {                     /* a prompt: printed instead of "?" */
+    int s0 = ++p, q = s0;
+    while (q < blen && buf[q] && buf[q] != '"') q++;
+    prompt = str_literal(buf + s0, (uint8_t)(q - s0));
+    p = q < blen && buf[q] == '"' ? q + 1 : q;
+    if (next() != ';') { error_here(E_SYNTAX); return; }
+  }
+  op16(OP_INPSTART, prompt);
+  input_items();
+}
+
 static void statement(void)
 {
   uint8_t c = peek();
@@ -607,7 +662,11 @@ static void statement(void)
   case T_NEXT: st_next(); return;
   case T_DIM: st_dim(); return;
   case T_REM: p = blen; return;
-  case T_DATA: skip_statement(); return;    /* READ: M3 */
+  case T_DATA: st_data(); return;
+  case T_INPUT: st_input(); return;
+  case T_READ: op(OP_READSTART); input_items(); return;
+  case T_GET: op(OP_GETSTART); input_items(); return;
+  case T_RESTORE: op(OP_RESTORE); return;
   default:
     op16(OP_ERR, c < 0x80 ? E_SYNTAX : E_UNIMPLEMENTED);
     skip_statement();
@@ -634,6 +693,9 @@ static void run_pass(void)
   nvars = narrays = nconsts = 0;
   str_bytes = 0;
   str_at = str_base;
+  data_bytes = 1;                         /* the pool's leading 0 */
+  data_at = data_base;
+  if (pass == 2) pf->wr(pf->ctx, data_at++, 0);
   line_i = 0;
   for (;;) {
     if (pf->prog(pf->ctx, at) == 0 && pf->prog(pf->ctx, (uint16_t)(at + 1)) == 0) break;
@@ -653,6 +715,8 @@ static void run_pass(void)
   nlines = line_i;
   lines[nlines].num = 0xFFFF, lines[nlines].addr = pc;   /* running off the end: END */
   op(OP_END);
+  if (pass == 2) pf->wr(pf->ctx, data_at++, 0xFF), pf->wr(pf->ctx, data_at++, 0xFF);
+  data_bytes = (uint16_t)(data_bytes + 2);
 }
 
 int as816_compile(const Platform *platform, CompileStats *st)
@@ -669,7 +733,8 @@ int as816_compile(const Platform *platform, CompileStats *st)
   /* the layout */
   const_base = pc;
   str_base = (uint16_t)(const_base + 7 * nconsts);
-  var_base = (uint16_t)(str_base + str_bytes);
+  data_base = (uint16_t)(str_base + str_bytes);
+  var_base = (uint16_t)(data_base + data_bytes);
   for (i = 0, a = var_base; i < nvars; i++) {
     var_off[i] = a;
     a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5));
@@ -720,11 +785,12 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[11];
+    uint16_t h = pf->prog_start, vals[12];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
     vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = 0xFFFF;
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
-    for (i = 0; i < 11; i++) {
+    vals[11] = data_base;
+    for (i = 0; i < 12; i++) {
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }
