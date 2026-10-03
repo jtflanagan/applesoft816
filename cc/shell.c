@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "parse.h"
 #include "res.h"
 #include "shell.h"
 
@@ -37,8 +38,14 @@
  * lines a frame, 15734 a second) */
 #define VERTCNT 0xC02E
 
-static uint8_t line[256];
+static uint8_t raw[256];             /* the line typed, 7-bit, 0 after (INLIN's) */
+static uint8_t line[256];            /* the same, upper case: the shell's commands */
 static uint8_t len;
+
+/* the program in the text bank: $0801 to prog_end (after its 00 00) */
+static uint16_t prog_end = 0x0803;
+static uint8_t compiled;             /* the VM bank holds it, compiled */
+static uint8_t from_file;            /* it is path's file, unedited: the cache applies */
 
 /* the program: its pathname (length first), and what the cache checks */
 static uint8_t path[65];
@@ -94,6 +101,17 @@ static uint8_t mli(uint8_t cmd, void *parms, uint8_t n)
   e = mli_call(cmd);
   from0(parms, RES_PARMS, n);
   return e;
+}
+
+/* AppleSoft's own: "?SYNTAX ERROR" and the bell */
+static void as_error(const char *m)
+{
+  crout();
+  cout('?');
+  print(m);
+  print(" ERROR");
+  cout(7);
+  crout();
 }
 
 static void error(uint8_t e)
@@ -184,11 +202,13 @@ static uint8_t load_program(void)
   }
   close_ref(ref);
   if (e) return e;
-  /* the end of the program: two zero bytes after it, whatever the file had */
+  /* the end of the program: two zero bytes after it, whatever the file had;
+   * the links made for here, wherever it was saved from (FIX.LINKS) */
   xfer_far = (text_base | at) - 1, xfer_near = (uint16_t)((uint16_t)z - 1), xfer_n = 2;
   far_out();
-  if (info.aux != 0x0801) return 0x81;   /* TODO: relink a program saved elsewhere */
-  src_len = (uint16_t)(at - 0x0801);
+  prog_end = (uint16_t)(fix_links() + 2);
+  compiled = 0, from_file = 1;
+  src_len = (uint16_t)(prog_end - 0x0801);
   hash_acc = 0;
   xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
   if (src_len) far_hash();
@@ -324,26 +344,27 @@ static void clk_start(void)
   clk_last = peek0(VERTCNT);
 }
 
-/* load and compile the program at RES_PATH; 0, having said how long the
- * compile took */
-static int compile_program(void)
+/* the program in memory, compiled (from the cache when it is a file's and
+ * the cache has it); 0, having said how long the compile took */
+static int compile_current(void)
 {
   CompileStats st;
   uint8_t e;
-  if ((e = load_program()) != 0) { error(e); return 1; }
-  if (cache_load(&st)) {
+  if (compiled) return 0;
+  if (from_file && cache_load(&st)) {
     crout();
     print_u(st.lines);
     print(" LINES, ");
     print_u(st.code_size);
     print(" BYTES: CACHED");
     crout();
+    compiled = 1;
     return 0;
   }
   clk_start();
   e = (uint8_t)compile(&st, clk_poll);
   clk_poll(0);
-  if (e) { error(0x81); return 1; }
+  if (e) { as_error("OUT OF MEMORY"); return 1; }
   crout();
   print_u(st.lines);
   print(" LINES, ");
@@ -352,13 +373,165 @@ static int compile_program(void)
   print_centi(clk_half * 200 / 15734);       /* half-lines to hundredths */
   print(" S");
   crout();
-  cache_save(&st);
+  if (from_file) cache_save(&st);
+  compiled = 1;
   return 0;
 }
 
-static void run_program(void)
+static void run_current(void)
 {
-  if (!compile_program()) vm_call();
+  if (!compile_current()) vm_call();
+}
+
+/* ---- the program in memory: lines in, out, listed ---- */
+static void to_text(uint16_t a, const void *src, uint16_t n)
+{
+  xfer_far = (text_base | a) - 1, xfer_near = (uint16_t)((uint16_t)src - 1), xfer_n = n;
+  far_out();
+}
+static void from_text(void *dst, uint16_t a, uint16_t n)
+{
+  xfer_far = (text_base | a) - 1, xfer_near = (uint16_t)((uint16_t)dst - 1), xfer_n = n;
+  far_in();
+}
+
+static void new_program(void)
+{
+  static const uint8_t z[2] = {0, 0};
+  to_text(0x0801, z, 2);
+  prog_end = 0x0803;
+  compiled = 0, from_file = 0;
+}
+
+/* FNDLIN: the first line numbered num or more (or the end); 1 if it is num */
+static int find_line(uint16_t num, uint16_t *at, uint16_t *link)
+{
+  uint8_t h[4];
+  uint16_t a = 0x0801, n;
+  for (;;) {
+    from_text(h, a, 4);
+    *at = a, *link = (uint16_t)(h[0] | h[1] << 8);
+    if (!h[1]) return 0;
+    n = (uint16_t)(h[2] | h[3] << 8);
+    if (n >= num) return n == num;
+    a = *link;
+  }
+}
+
+/* a numbered line typed: tok (n bytes, its 0 last) in place of line num's;
+ * n = 1 (nothing but the 0) takes the line out */
+static void edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
+{
+  uint16_t at, link, size = (uint16_t)(4 + n);
+  uint8_t h[4];
+  if (find_line(num, &at, &link)) {
+    xfer_far = (text_base | link) - 1, xfer_far2 = (text_base | at) - 1, xfer_n = (uint16_t)(prog_end - link);
+    far_move_up();
+    prog_end = (uint16_t)(prog_end - (link - at));
+  }
+  if (n > 1) {
+    if ((uint32_t)prog_end + size > 0xFF00) { as_error("OUT OF MEMORY"); n = 0; }
+    else {
+      xfer_far = (text_base | at) - 1, xfer_far2 = (text_base | (uint16_t)(at + size)) - 1;
+      xfer_n = (uint16_t)(prog_end - at);
+      far_move();
+      h[0] = h[1] = 0xFF, h[2] = (uint8_t)num, h[3] = (uint8_t)(num >> 8);   /* (a link, for FIX.LINKS) */
+      to_text(at, h, 4);
+      to_text((uint16_t)(at + 4), tok, n);
+      prog_end = (uint16_t)(prog_end + size);
+    }
+  }
+  prog_end = (uint16_t)(fix_links() + 2);
+  compiled = 0, from_file = 0;
+}
+
+/* LIST ($D6A5 on), as the GS ROM does it: CR, a space, the number, then
+ * each token as " WORD "; past column 33 (73 in 80 columns), a new line
+ * from column 5 */
+static int list_wrap(void)
+{
+  if (peek0(0xC01F) & 0x80) return peek0(0x057B) >= 0x49;
+  return peek0(CH) >= 0x21;
+}
+static void list_out(uint8_t c)
+{
+  cout(c);
+  if (list_wrap()) { crout(); poke0(CH, 5); }
+}
+static void list(uint16_t from, uint16_t to)
+{
+  const uint8_t *kw = as816_token_table();
+  uint8_t l[256], i, c;
+  uint16_t at, link, num, n;
+  find_line(from, &at, &link);
+  for (;;) {
+    from_text(l, at, 4);
+    link = (uint16_t)(l[0] | l[1] << 8);
+    if (!l[1]) break;
+    if (peek0(0xC000) == 0x83) {        /* ISCNTC: Ctrl-C */
+      poke0(0xC010, 0);
+      crout();
+      print("BREAK");
+      cout(7);
+      break;
+    }
+    num = (uint16_t)(l[2] | l[3] << 8);
+    if (num > to) break;
+    n = (uint16_t)(link - at - 4) < 250 ? (uint16_t)(link - at - 4) : 250;
+    from_text(l + 4, (uint16_t)(at + 4), n);
+    l[4 + n] = 0;
+    crout();
+    cout(' ');
+    print_u(num);
+    list_out(' ');
+    for (i = 4; (c = l[i]) != 0; i++) {
+      if (c < 0x80) { list_out(c); continue; }
+      {
+        uint16_t k = 0;
+        uint8_t t = (uint8_t)(c - 0x80);
+        while (t) { while (!(kw[k++] & 0x80)) {} t--; }
+        cout(' ');
+        while (!(kw[k] & 0x80)) cout(kw[k++]);
+        cout((uint8_t)(kw[k] & 0x7F));
+        list_out(' ');
+      }
+    }
+    at = link;
+  }
+  crout();
+}
+
+/* SAVE: the program as a BAS file at RES_PATH */
+static uint8_t save_program(void)
+{
+  CreateParms c;
+  PathParms d;
+  WriteParms w;
+  uint8_t e, ref;
+  uint16_t at, n;
+  d.n = 1, d.path = RES_PATH;
+  mli(MLI_DESTROY, &d, sizeof d);
+  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0xFC, c.aux = 0x0801, c.storage = 0x01, c.cdate = c.ctime = 0;
+  if ((e = mli(MLI_CREATE, &c, sizeof c)) != 0) return e;
+  if ((e = open_path(&ref)) != 0) return e;
+  w.n = 4, w.ref = ref, w.buf = RES_IOBUF;
+  for (at = 0x0801; at < prog_end && !e; at = (uint16_t)(at + n)) {
+    n = (uint16_t)(prog_end - at) < RES_IOSIZE ? (uint16_t)(prog_end - at) : RES_IOSIZE;
+    xfer_far = (text_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = n;
+    far_move();
+    w.req = n;
+    e = mli(MLI_WRITE, &w, sizeof w);
+  }
+  close_ref(ref);
+  if (!e) {                           /* it is that file now */
+    src_len = (uint16_t)(prog_end - 0x0801);
+    hash_acc = 0;
+    xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
+    far_hash();
+    src_hash = hash_acc;
+    from_file = 1;
+  }
+  return e;
 }
 
 /* ---- CATALOG ---- */
@@ -425,6 +598,109 @@ static int word(const char *w, uint8_t *after)
   return 1;
 }
 
+/* the name after i, or 0 if what follows is not a name (RUN 100, RUN) */
+static int name_at(uint8_t i)
+{
+  while (i < len && line[i] == ' ') i++;
+  return i < len && ((line[i] >= 'A' && line[i] <= 'Z') || line[i] == '/');
+}
+
+/* BASIC.SYSTEM's commands: 1 if the line was one, 2 for BYE */
+static int command(void)
+{
+  uint8_t i, e;
+  if (word("BYE", &i)) return 2;
+  if (word("CATALOG", &i) || word("CAT", &i)) { catalog(i); return 1; }
+  if (word("COMPILE", &i)) {
+    if (!set_path(i)) error(0x80);
+    else if ((e = load_program()) != 0) error(e);
+    else compile_current();
+    return 1;
+  }
+  if (word("LOAD", &i)) {
+    if (!set_path(i)) error(0x80);
+    else if ((e = load_program()) != 0) error(e);
+    return 1;
+  }
+  if (word("SAVE", &i)) {
+    if (!set_path(i)) error(0x80);
+    else if ((e = save_program()) != 0) error(e);
+    return 1;
+  }
+  if (word("-", &i) || (word("RUN", &i) && name_at(i))) {
+    if (!set_path(i)) error(0x80);
+    else if ((e = load_program()) != 0) error(e);
+    else run_current();
+    return 1;
+  }
+  return 0;
+}
+
+static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
+
+/* LINGET over the tokens at raw[*p]: a line number, digits (no spaces are
+ * left by now); 0 for none; -1 past 63999 */
+static int32_t linget(uint8_t *p)
+{
+  uint16_t n = 0;
+  while (is_digit(raw[*p])) {
+    if (n >= 6400) return -1;
+    n = (uint16_t)(n * 10 + (raw[(*p)++] - '0'));
+  }
+  return n;
+}
+
+/* an AppleSoft line: numbered, into the program; else at once */
+static void basic_line(void)
+{
+  uint8_t x = 0, y, p;
+  uint16_t num = 0;
+  int32_t a, b;
+  while (raw[x] == ' ') x++;
+  if (is_digit(raw[x])) {
+    while (is_digit(raw[x]) || raw[x] == ' ') {
+      if (raw[x] != ' ') {
+        if (num >= 6400) { as_error("SYNTAX"); return; }
+        num = (uint16_t)(num * 10 + (raw[x] - '0'));
+      }
+      x++;
+    }
+    y = as816_parse(raw, x);
+    edit_line(num, raw, (uint8_t)(y - 4));
+    return;
+  }
+  as816_parse(raw, x);
+  switch (raw[0]) {
+  case 0xBC:                            /* LIST [a][-,][b] */
+    p = 1;
+    if ((a = linget(&p)) < 0) break;
+    b = a;
+    if (raw[p] == 0xC9 || raw[p] == ',') {
+      p++;
+      if ((b = linget(&p)) < 0) break;
+    }
+    if (raw[p]) break;
+    list((uint16_t)a, b ? (uint16_t)b : 0xFFFF);
+    return;
+  case 0xBF:                            /* NEW */
+    if (raw[1]) break;
+    new_program();
+    return;
+  case 0xAC:                            /* RUN */
+    if (raw[1]) break;                  /* (RUN n: with direct mode) */
+    run_current();
+    return;
+  case 0:
+    return;
+  default:
+    crout();
+    print("DIRECT MODE: NOT YET");
+    crout();
+    return;
+  }
+  as_error("SYNTAX");
+}
+
 void shell(void)
 {
   uint8_t i;
@@ -434,6 +710,7 @@ void shell(void)
   xfer_far = vm_base - 1, xfer_n = prog_start;
   far_hash();
   vm_print = hash_acc;
+  new_program();
   print("APPLESOFT816 0.1");
   crout();
   for (;;) {
@@ -441,24 +718,17 @@ void shell(void)
     poke0(PROMPT, ']' | 0x80);
     rom_call(GETLN);
     len = peek0(RES_X);
-    from0(line, INBUF, len);
+    if (len > 239) len = 239;           /* INLIN's limit */
+    from0(raw, INBUF, len);
     for (i = 0; i < len; i++) {
-      uint8_t c = line[i] & 0x7F;
+      uint8_t c = raw[i] & 0x7F;
+      raw[i] = c;
       line[i] = c >= 'a' && c <= 'z' ? (uint8_t)(c - 32) : c;
     }
+    raw[len] = line[len] = 0;
     if (!len) continue;
-    if (word("BYE", &i)) return;
-    if (word("CATALOG", &i) || word("CAT", &i)) { catalog(i); continue; }
-    if (word("COMPILE", &i)) {
-      if (!set_path(i)) { error(0x80); continue; }
-      compile_program();
-      continue;
-    }
-    if (word("-", &i) || word("RUN", &i)) {
-      if (!set_path(i)) { error(0x80); continue; }
-      run_program();
-      continue;
-    }
-    error(0x80);
+    i = (uint8_t)command();
+    if (i == 2) return;
+    if (!i) basic_line();
   }
 }

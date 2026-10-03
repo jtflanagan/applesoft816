@@ -304,3 +304,67 @@ hash_loop:
         sta     mos16(hash_acc)
         sep     #0x30
         rts
+
+; far_move_up: as far_move, but first byte first - for a move to lower
+; addresses that overlaps (far_move, last byte first, is the one for higher)
+        .global far_move_up
+far_move_up:
+        jsr     xfer_setup
+        lda     mos16(xfer_far2)
+        sta     __rc7
+        lda     mos16(xfer_far2+1)
+        sta     __rc8
+        lda     mos16(xfer_far2+2)
+        sta     __rc9
+        sty     __rc10                  ; n (sixteen bits)
+        .byte   0xa0                    ; ldy #1
+        .short  1
+up_loop:
+        lda     [__rc2],y
+        sta     [__rc7],y
+        cpy     __rc10
+        beq     up_done
+        iny
+        bra     up_loop
+up_done:
+        sep     #0x10
+        rts
+
+; uint16_t fix_links(void): AppleSoft's FIX.LINKS over the program at $0801
+; of the text bank - each line's link from where its 0 is - up to the line
+; whose link's high byte is 0; returns that end's address
+        .global fix_links
+fix_links:
+        lda     mos16(text_base+2)
+        sta     __rc4
+        rep     #0x30
+        .byte   0xa9                    ; lda #$0801
+        .short  0x0801
+        sta     __rc2
+fl_line:
+        sep     #0x20
+        .byte   0xa0                    ; ldy #1
+        .short  1
+        lda     [__rc2],y
+        beq     fl_end
+        .byte   0xa0                    ; ldy #4
+        .short  4
+fl_scan:
+        lda     [__rc2],y
+        beq     fl_zero
+        iny
+        bra     fl_scan
+fl_zero:
+        iny                             ; the next line
+        rep     #0x20
+        tya
+        clc
+        adc     __rc2
+        sta     [__rc2]
+        sta     __rc2
+        bra     fl_line
+fl_end:
+        sep     #0x30
+        lda     __rc2
+        ldx     __rc3
+        rts

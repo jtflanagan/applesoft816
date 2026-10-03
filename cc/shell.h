@@ -19,7 +19,9 @@ extern uint32_t xfer_far, xfer_far2;   /* one below the first byte */
 extern uint16_t xfer_near, xfer_n;
 void far_in(void);                     /* xfer_far -> xfer_near */
 void far_out(void);                    /* xfer_near -> xfer_far */
-void far_move(void);                   /* xfer_far -> xfer_far2 */
+void far_move(void);                   /* xfer_far -> xfer_far2, last byte first */
+void far_move_up(void);                /* ... first byte first */
+uint16_t fix_links(void);              /* FIX.LINKS over the text bank; the end's address */
 uint8_t peek0(uint16_t a);
 void poke0(uint16_t a, uint8_t v);
 uint8_t mli_call(uint8_t cmd);
