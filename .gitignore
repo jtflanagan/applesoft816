@@ -1,3 +1,6 @@
 prof/asprof
 prof/out/
 __pycache__/
+emu816/sst_run
+emu816/*.o
+emu816/out/

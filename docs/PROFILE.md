@@ -22,8 +22,14 @@ would.  BM8 does not match: the published listing loops to 100 and runs here
 in 10.3 s; 55.5 s fits neither 100 nor 1000 iterations, so the published
 figure (or its listing) is suspect.  Not chased further.
 
-The ROM is the enhanced IIe's.  The IIgs ROM 3 carries the same AppleSoft;
-that is an assumption until checked byte for byte.
+The ROM is the enhanced IIe's.  Checked against the IIgs ROM 3 (bank `$FF`,
+`strudelworks-host/assets/apple2gs_rom3.bin`): **the float arithmetic, FIN,
+FOUT and math functions (`$E7A0-$F10A`) are byte-identical**, so the float
+results and costs carry over.  327 bytes of AppleSoft differ, all in the
+GS's 80-column / lower-case / no-cassette patches: token-table entries,
+`PARSE`, `LIST`, `PRINT` comma and `TAB`, `SCRN`, lo-res `PLOT`/`HLIN`/`VLIN`,
+`GR`, `HTAB`, `NAMOK`, and the cassette `LOAD`/`SAVE`/`STORE`/`RECALL`/
+`SHLOAD`.  (The monitor `$F800-$FFFF` differs much more.)
 
 ## Where the cycles go
 
