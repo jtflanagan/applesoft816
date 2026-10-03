@@ -2,7 +2,9 @@
 
 Bit-exact with the ROM: same 40-bit format, same FAC/ARG/rounding-byte
 behaviour, same errors.  Native mode, any direct page, long operand
-pointers, any M/X on entry (preserved).  See the header of `fp.s`.
+pointers, any M/X on entry (preserved).  Bank-independent: load the image
+at offset 0 of any bank (fptest runs it from `$05`; `FPTEST_BANK=nn`
+moves it) - no ROM, no card needed.  See the header of `fp.s`.
 
 **Stage 1 (now): a line-for-line port** of the ROM routines, so every
 intermediate state matches; **stage 2**: 16-bit rewrites, held to the same

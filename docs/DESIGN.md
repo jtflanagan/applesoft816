@@ -5,7 +5,9 @@ all), compiled to a cached bytecode and run by a 65816 interpreter that keeps
 the program and all its data outside banks 0/1.  Later, a 16-bit ProDOS 8
 underneath it.
 
-Status: **design + measurement.**  Nothing below the profiler is built yet.
+Status: **design, measurement, and the float library.**  `fp816` (every
+AppleSoft float routine, bit-exact with the ROM) is done; the compiler and
+interpreter are next.
 Decisions marked *(user)* are settled; the rest are proposals.
 
 ## Scope
@@ -21,6 +23,11 @@ Decisions marked *(user)* are settled; the rest are proposals.
   all live outside bank 0, so `LOMEM:`/`HIMEM:` stop mattering and bank 0 is
   the program's own (machine code, shape tables, both hi-res pages).
 - **65816, IIgs only** follows from that.
+- **Runs on any IIgs, card or no card** *(user)*: everything is program
+  memory - loaded from disk by our (extended) ProDOS, nothing in ROM, nothing
+  that needs the Strudelworks card.  It runs on a stock IIgs and in any IIgs
+  emulator (KEGS, GSplus, MAME); the card makes it faster, it does not make
+  it work.
 
 ### What "pure AppleSoft" covers (proposal)
 
@@ -51,9 +58,9 @@ Decisions marked *(user)* are settled; the rest are proposals.
 
 | Where | What |
 |---|---|
-| Card RAM banks in `$80-$EF` | Program text, bytecode, variables, arrays, strings.  The ROM's memory sizing stops at `$80`, so neither the Memory Manager nor ProDOS 8 ever hands these out.  Share with the enhanced-video framebuffers (`$80-$DF`) by an agreed split. |
-| A free ROM bank in `$F2-$FB` | The interpreter (and later the OS), loaded by the host like the engine runtime at `$F1`. (`$F0` panel, `$F1` engine runtime, `$FC-$FF` ROM 3.) |
-| Bank 0, unavoidably | The interpreter's direct page and stack (the 65816 cannot put them elsewhere), one reserved page below DOS, small emulation-mode stubs for calling the ROM and for `CALL`. |
+| A bank allocated at load | The interpreter and fp816, loaded by our ProDOS at offset `$0000` of whatever bank it is given.  The code is bank-independent: it finds its own bank with `PHK` (fp816 is tested from banks `$05` and `$7E`). |
+| Banks allocated as needed | Program text, bytecode, variables, arrays, strings - from the IIgs Memory Manager (stage 1, under the real ProDOS 8; to be confirmed it is usable there, in KEGS) or from our ProDOS's own allocator (stage 2).  Any RAM bank `$02-$7F` on a stock machine; on a Strudelworks card the extra banks are simply more memory. |
+| Bank 0, unavoidably | The interpreter's direct page and stack (the 65816 cannot put them elsewhere), one reserved page below DOS, small emulation-mode stubs for calling the ROM monitor and for `CALL`. |
 | Bank 0, the program's | Everything else not used by DOS/ProDOS and the screen. |
 
 ## What we own because the program is out of bank 0
@@ -77,8 +84,9 @@ ROM's `COUT`/input hooks so DOS and BASIC.SYSTEM still see `CHR$(4)` commands.
 1. The BASIC, plus our own BASIC.SYSTEM replacement (65816), on the real
    ProDOS 8.
 2. A 16-bit ProDOS 8 kernel that supports the BASIC: `$BF00` stub + global
-   page in bank 0, kernel native in our banks, language card freed, a large
-   block cache in card RAM, the card's own disk path.
+   page in bank 0, kernel native in allocated banks, language card freed, a
+   large block cache in spare RAM; on a Strudelworks card it can use the
+   card's own disk path, elsewhere the standard block devices.
 3. Grow general ProDOS 8 compatibility as we go, measured on a corpus (4cade's
    ProDOS 8 titles, the System 6 P8 apps; ProDOS 2.4.3 as the reference).
 
@@ -88,7 +96,9 @@ Proposal: "ProDOS 8 with wide pointers" - the same calls, numbers and error
 codes; `JSL` entry in native mode with call number and 24-bit parameter
 pointer inline; 4-byte pointers and 32-bit counts in the parameter blocks;
 the kernel owns file buffers (no 1K bank-0 buffer per open file); one open
-file table shared with the 8-bit MLI.  In stage 1 a shim implements it over
+file table shared with the 8-bit MLI.  Like the BASIC, the OS is loaded
+from disk into allocated memory - no ROM banks - so it too runs on any IIgs
+and in emulators.  In stage 1 a shim implements it over
 the real ProDOS 8 with bank-0 bounce buffers, so the BASIC uses the 16-bit
 MLI from day one.  A GS/OS class-1 subset at `$E1/00A8` is a later option.
 

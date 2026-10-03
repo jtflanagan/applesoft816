@@ -5,6 +5,11 @@
 ; operand pointers.  Every routine is checked against the ROM's own by
 ; fptest; the 16-bit rewrites come after, against the same oracle.
 ;
+; Placement: position-independent across banks - load the image at offset
+; $0000 of any bank (the OS allocates one); the code finds its own bank with
+; PHK, nothing depends on the bank it was linked for.  No ROM, no card: it
+; runs on any IIgs or IIgs emulator.
+;
 ; Calling: native mode (E=0), any M/X (preserved), D = the FP direct page,
 ; DBR anything (preserved; set to this bank inside).  JSL an entry in the jump table at the start of the bank;
 ; each returns with RTL.  A memory operand is a 5-byte packed float at the
@@ -102,7 +107,8 @@ ERR_ILLQTY   = $35
         sta     FP_SER
         lda     #>(addr)
         sta     FP_SER+1
-        lda     #^(addr)
+        phk                     ; the bank we are running in
+        pla
         sta     FP_SER+2
 .endmacro
 
@@ -111,7 +117,8 @@ ERR_ILLQTY   = $35
         sta     FP_PTR
         lda     #>(addr)
         sta     FP_PTR+1
-        lda     #^(addr)
+        phk                     ; the bank we are running in
+        pla
         sta     FP_PTR+2
 .endmacro
 
@@ -840,12 +847,7 @@ con_ten:
 ; DIV10 ($EA55)
 div10:
         jsr     copy_fac_to_arg_rounded
-        lda     #<con_ten
-        sta     FP_PTR
-        lda     #>con_ten
-        sta     FP_PTR+1
-        lda     #^con_ten
-        sta     FP_PTR+2
+        PTR     con_ten
         ldx     #$00
 ; DIV ($EA5E)
 div:    stx     SGNCPR
@@ -1090,12 +1092,7 @@ mkint:  lda     FACSIGN
 ayint:  lda     FAC
         cmp     #$90
         bcc     mi2
-        lda     #<neg32768
-        sta     FP_PTR
-        lda     #>neg32768
-        sta     FP_PTR+1
-        lda     #^neg32768
-        sta     FP_PTR+2
+        PTR     neg32768
         jsr     fcomp
 mi1:    bne     iqerr
 mi2:    jmp     qint

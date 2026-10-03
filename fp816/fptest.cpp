@@ -33,7 +33,8 @@ constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R
                    R_EXP = 0xEF09, R_RND = 0xEFAE, R_SIN = 0xEFF1, R_COS = 0xEFEA, R_TAN = 0xF03A,
                    R_ATN = 0xF09E, R_LOAD_ARG = 0xE9E3, R_ERROR = 0xD412, R_CHRGOT = 0x00B7, R_CHRGET_TEMPLATE = 0xF10B;
 // fp816 jump table
-constexpr uint32_t LIB = 0xF20000;
+constexpr uint32_t LIB = 0;   // entries are offsets; the image loads at lib_base
+uint32_t lib_base = 0x050000; // an ordinary RAM bank (FPTEST_BANK=nn to move it)
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
                    F_SUB = LIB + 0x10, F_MUL = LIB + 0x1C, F_DIV = LIB + 0x20, F_CMP = LIB + 0x24,
                    F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34,
@@ -272,6 +273,7 @@ struct Machine {
   // fp816: JSL entry with FP_PTR = operand, D = DP_OURS, then STP
   Outcome lib_call(uint32_t entry, const Fac& f, const uint8_t op[5], Conv conv, Res res = R_NONE)
   {
+    entry += lib_base;
     memset(&cpu.mem[DP_OURS], 0, 0x100);
     put_fac(DP_OURS, f);
     put_state(DP_OURS);
@@ -367,8 +369,9 @@ int main(int argc, char** argv)
   long cases = argc > 3 ? atol(argv[3]) : 200000;
   if (argc > 4) rng_state = strtoull(argv[4], nullptr, 0) | 1;
 
+  if (const char* b = getenv("FPTEST_BANK")) lib_base = uint32_t(strtoul(b, nullptr, 16)) << 16;
   Machine m(rom);
-  memcpy(&m.cpu.mem[LIB], lib.data(), lib.size());
+  memcpy(&m.cpu.mem[lib_base], lib.data(), lib.size());
 
   struct Test {
     const char* name;
@@ -448,7 +451,7 @@ int main(int argc, char** argv)
           c.mem[DP_OURS + FP_TXT] = uint8_t(TEXT - 1);
           c.mem[DP_OURS + FP_TXT + 1] = uint8_t((TEXT - 1) >> 8);
           c.mem[DP_OURS + FP_TXT + 2] = uint8_t((TEXT - 1) >> 16);
-          uint8_t stub[] = {0x22, uint8_t(F_FIN), uint8_t(F_FIN >> 8), uint8_t(F_FIN >> 16), 0xDB};
+          uint8_t stub[] = {0x22, uint8_t(F_FIN + lib_base), uint8_t((F_FIN + lib_base) >> 8), uint8_t((F_FIN + lib_base) >> 16), 0xDB};
           memcpy(&c.mem[STUB], stub, sizeof stub);
           c.set_regs(0, 0, 0, 0x01FF, DP_OURS, 0, 0x30, false);
           if (!m.run(STUB, false, o.err)) o.err = -1;
@@ -508,7 +511,7 @@ int main(int argc, char** argv)
           c.mem[DP_OURS + FP_BUF] = uint8_t(OUTBUF - 1);
           c.mem[DP_OURS + FP_BUF + 1] = uint8_t((OUTBUF - 1) >> 8);
           c.mem[DP_OURS + FP_BUF + 2] = uint8_t((OUTBUF - 1) >> 16);
-          uint8_t stub[] = {0x22, uint8_t(F_FOUT), uint8_t(F_FOUT >> 8), uint8_t(F_FOUT >> 16), 0xDB};
+          uint8_t stub[] = {0x22, uint8_t(F_FOUT + lib_base), uint8_t((F_FOUT + lib_base) >> 8), uint8_t((F_FOUT + lib_base) >> 16), 0xDB};
           memcpy(&c.mem[STUB], stub, sizeof stub);
           c.set_regs(0, 0, 0, 0x01FF, DP_OURS, 0x12, 0x00, false);
           if (!m.run(STUB, false, o.err)) o.err = -1;
