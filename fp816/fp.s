@@ -8,8 +8,9 @@
 ; Calling: native mode (E=0), any M/X (preserved), D = the FP direct page,
 ; DBR anything.  JSL an entry in the jump table at the start of the bank;
 ; each returns with RTL.  A memory operand is a 5-byte packed float at the
-; 24-bit address in FP_PTR.  FP_ERR is 0, or the AppleSoft error code
-; ($45 = ?OVERFLOW) when the operation failed (FAC is then undefined).
+; 24-bit address in FP_PTR (not preserved).  FP_ERR is 0, or the AppleSoft
+; error code ($45 ?OVERFLOW, $85 ?DIVISION BY ZERO) when the operation
+; failed (FAC is then undefined).  FP_RES carries a byte result (FCOMP, SIGN).
 ;
 ; The direct page uses AppleSoft's zero-page offsets for FAC and ARG so a
 ; state can be compared byte for byte with the ROM's.
@@ -27,10 +28,14 @@ ARG      = $A5          ; ARG exponent; mantissa $A6-$A9
 ARGSIGN  = $AA
 SGNCPR   = $AB          ; sign compare: ARGSIGN eor FACSIGN
 FAC_EXT  = $AC          ; FAC.EXTENSION (rounding byte)
+RESULT   = $62          ; FMULT/FDIV product/quotient, 4 bytes
 FP_SP    = $F0          ; 2 bytes: S at entry, for error unwinding (ours)
 FP_ERR   = $F2          ; error code, 0 = none (ours)
+FP_RES   = $F3          ; byte result (ours)
+FP_DPP   = $F4          ; 3 bytes: long pointer to this direct page (ours)
 
 ERR_OVERFLOW = $45
+ERR_DIVZERO  = $85
 
 ; ---- entry/exit ----
 .macro  ENTER
@@ -40,9 +45,12 @@ ERR_OVERFLOW = $45
         .i16
         tsc
         sta     FP_SP
+        tdc
+        sta     FP_DPP
         sep     #$30
         .a8
         .i8
+        stz     FP_DPP+2
         stz     FP_ERR
 .endmacro
 
@@ -67,6 +75,20 @@ ERR_OVERFLOW = $45
         jmp     fp_addt            ; +$14  FAC = ARG + FAC        (ROM FADDT)
         nop
         jmp     fp_subt            ; +$18  FAC = ARG - FAC        (ROM FSUBT)
+        nop
+        jmp     fp_mul             ; +$1C  FAC = [FP_PTR] * FAC   (ROM FMULT)
+        nop
+        jmp     fp_div             ; +$20  FAC = [FP_PTR] / FAC   (ROM FDIV)
+        nop
+        jmp     fp_cmp             ; +$24  FP_RES = FCOMP([FP_PTR]): 0 =, 1, $FF
+        nop
+        jmp     fp_mul10           ; +$28  FAC = FAC * 10         (ROM MUL10)
+        nop
+        jmp     fp_div10           ; +$2C  FAC = FAC / 10         (ROM DIV10)
+        nop
+        jmp     fp_sgn             ; +$30  FAC = SGN(FAC)         (ROM SGN)
+        nop
+        jmp     fp_abs             ; +$34  FAC = ABS(FAC)         (ROM ABS)
         nop
 
 ; ---- public entries ----
@@ -109,6 +131,44 @@ fp_addt:
 fp_subt:
         ENTER
         jsr     fsubt
+        LEAVE
+
+fp_mul:
+        ENTER
+        jsr     load_arg_from_ptr
+        jsr     fmultt
+        LEAVE
+
+fp_div:
+        ENTER
+        jsr     load_arg_from_ptr
+        jsr     fdivt
+        LEAVE
+
+fp_cmp:
+        ENTER
+        jsr     fcomp
+        sta     FP_RES
+        LEAVE
+
+fp_mul10:
+        ENTER
+        jsr     mul10
+        LEAVE
+
+fp_div10:
+        ENTER
+        jsr     div10
+        LEAVE
+
+fp_sgn:
+        ENTER
+        jsr     sgn
+        LEAVE
+
+fp_abs:
+        ENTER
+        lsr     FACSIGN         ; ABS ($EBAF)
         LEAVE
 
 ; Error: unwind to the entry's frame and return with FP_ERR set.
@@ -241,18 +301,18 @@ fadd_1:
 
 ; FADDT ($E7C1): FAC = ARG + FAC; A = FAC exponent with flags on entry
 faddt:
-        bne     @le7c6
+        bne     faddt_le7c6
         jmp     copy_arg_to_fac
-@le7c6: ldx     FAC_EXT
+faddt_le7c6: ldx     FAC_EXT
         stx     ARG_EXT
         ldx     #ARG
         lda     ARG
-        tay                     ; FADD.2
-        beq     @rts
+fadd_2: tay                     ; FADD.2 ($E7CE): A = ARG exponent
+        beq     faddt_rts
         sec
         sbc     FAC
         beq     fadd_3
-        bcc     @le7ea
+        bcc     faddt_le7ea
         sty     FAC
         ldy     ARGSIGN
         sty     FACSIGN
@@ -261,17 +321,17 @@ faddt:
         ldy     #$00
         sty     ARG_EXT
         ldx     #FAC
-        bne     @le7ee
-@le7ea: ldy     #$00
+        bne     faddt_le7ee
+faddt_le7ea: ldy     #$00
         sty     FAC_EXT
-@le7ee: cmp     #$F9
+faddt_le7ee: cmp     #$F9
         bmi     fadd_1
         tay
         lda     FAC_EXT
         lsr     $01,x
         jsr     shift_right_4
         bra     fadd_3
-@rts:   rts
+faddt_rts:   rts
 
 ; FADD.3 ($E7FA).  The ROM picks the minuend with Y ("lda $04,y" is
 ; absolute,Y on zero page - there is no zp,Y LDA) and the subtrahend with X;
@@ -482,3 +542,299 @@ shift_right_4:
 shift_right_5:
         clc
         rts
+
+; =========================================================================
+; Multiply, divide, compare
+; =========================================================================
+
+; FMULTT ($E982): FAC = ARG * FAC; A = FAC exponent with flags on entry
+fmultt:
+        bne     @le987
+        rts
+@le987: jsr     add_exponents
+        lda     #$00
+        sta     RESULT
+        sta     RESULT+1
+        sta     RESULT+2
+        sta     RESULT+3
+        lda     FAC_EXT
+        jsr     multiply_1
+        lda     FAC+4
+        jsr     multiply_1
+        lda     FAC+3
+        jsr     multiply_1
+        lda     FAC+2
+        jsr     multiply_1
+        lda     FAC+1
+        jsr     multiply_2
+        jmp     copy_result_into_fac
+
+; MULTIPLY.1 ($E9B0)
+multiply_1:
+        bne     multiply_2
+        jmp     shift_right_1
+
+; MULTIPLY.2 ($E9B5)
+multiply_2:
+        lsr     a
+        ora     #$80
+@le9b8: tay
+        bcc     @le9d4
+        clc
+        lda     RESULT+3
+        adc     ARG+4
+        sta     RESULT+3
+        lda     RESULT+2
+        adc     ARG+3
+        sta     RESULT+2
+        lda     RESULT+1
+        adc     ARG+2
+        sta     RESULT+1
+        lda     RESULT
+        adc     ARG+1
+        sta     RESULT
+@le9d4: ror     RESULT
+        ror     RESULT+1
+        ror     RESULT+2
+        ror     RESULT+3
+        ror     FAC_EXT
+        tya
+        lsr     a
+        bne     @le9b8
+        rts
+
+; ADD.EXPONENTS ($EA0E).  On underflow it drops its caller's frame (PLA PLA)
+; and zeroes FAC, returning to the caller's caller - kept as in the ROM.
+add_exponents:
+        lda     ARG
+add_exponents_1:
+        beq     zero
+        clc
+        adc     FAC
+        bcc     @lea1b
+        bmi     jov
+        clc
+        bra     @lea1d          ; ROM: .byte $2C (BIT abs) skips the BPL;
+                                ; that stray read can hit $C010 - not here
+@lea1b: bpl     zero
+@lea1d: adc     #$80
+        sta     FAC
+        bne     @lea26
+        jmp     sta_in_fac_sign
+@lea26: lda     SGNCPR
+        sta     FACSIGN
+        rts
+
+; OUTOFRNG ($EA2B) (used by EXP)
+outofrng:
+        lda     FACSIGN
+        eor     #$FF
+        bmi     jov
+; ZERO ($EA31)
+zero:   pla
+        pla
+        jmp     zero_fac
+
+jov:    jmp     overflow
+
+; MUL10 ($EA39)
+mul10:
+        jsr     copy_fac_to_arg_rounded
+        tax
+        beq     @lea4f
+        clc
+        adc     #$02
+        bcs     jov
+        ldx     #$00
+        stx     SGNCPR
+        jsr     fadd_2
+        inc     FAC
+        beq     jov
+@lea4f: rts
+
+con_ten:
+        .byte   $84, $20, $00, $00, $00
+
+; DIV10 ($EA55)
+div10:
+        jsr     copy_fac_to_arg_rounded
+        lda     #<con_ten
+        sta     FP_PTR
+        lda     #>con_ten
+        sta     FP_PTR+1
+        lda     #^con_ten
+        sta     FP_PTR+2
+        ldx     #$00
+; DIV ($EA5E)
+div:    stx     SGNCPR
+        jsr     load_fac_from_ptr
+        jmp     fdivt
+
+; FDIVT ($EA69): FAC = ARG / FAC; A = FAC exponent with flags on entry
+fdivt:
+        beq     @leae1
+        jsr     round_fac
+        lda     #$00
+        sec
+        sbc     FAC
+        sta     FAC
+        jsr     add_exponents
+        inc     FAC
+        beq     jov
+        ldx     #$FC
+        lda     #$01
+@lea80: ldy     ARG+1
+        cpy     FAC+1
+        bne     @lea96
+        ldy     ARG+2
+        cpy     FAC+2
+        bne     @lea96
+        ldy     ARG+3
+        cpy     FAC+3
+        bne     @lea96
+        ldy     ARG+4
+        cpy     FAC+4
+@lea96: php
+        rol     a
+        bcc     @leaa3
+        inx
+        ; ROM: sta $65,x with X = $FD..$01 - on the 6502 that wraps in zero
+        ; page ($62..$66); native-mode dp,X does not wrap, so store through
+        ; a long pointer to this direct page at the wrapped offset.
+        php
+        pha
+        txa
+        clc
+        adc     #$65
+        tay
+        pla
+        sta     [FP_DPP],y
+        plp
+        beq     @lead1
+        bpl     @lead5
+        lda     #$01
+@leaa3: plp
+        bcs     @leab4
+@leaa6: asl     ARG+4
+        rol     ARG+3
+        rol     ARG+2
+        rol     ARG+1
+        bcs     @lea96
+        bmi     @lea80
+        bpl     @lea96
+@leab4: tay
+        lda     ARG+4
+        sbc     FAC+4
+        sta     ARG+4
+        lda     ARG+3
+        sbc     FAC+3
+        sta     ARG+3
+        lda     ARG+2
+        sbc     FAC+2
+        sta     ARG+2
+        lda     ARG+1
+        sbc     FAC+1
+        sta     ARG+1
+        tya
+        jmp     @leaa6
+@lead1: lda     #$40
+        bne     @leaa3
+@lead5: asl     a
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     FAC_EXT
+        plp
+        jmp     copy_result_into_fac
+@leae1: lda     #ERR_DIVZERO
+        jmp     fp_error
+
+; COPY.RESULT.INTO.FAC ($EAE6)
+copy_result_into_fac:
+        lda     RESULT
+        sta     FAC+1
+        lda     RESULT+1
+        sta     FAC+2
+        lda     RESULT+2
+        sta     FAC+3
+        lda     RESULT+3
+        sta     FAC+4
+        jmp     normalize_fac_2
+
+; COPY.FAC.TO.ARG.ROUNDED ($EB63)
+copy_fac_to_arg_rounded:
+        jsr     round_fac
+maf:    ldx     #$06
+@leb68: lda     FAC-1,x
+        sta     SHIFTEXT,x
+        dex
+        bne     @leb68
+        stx     FAC_EXT
+        rts
+
+; SIGN ($EB82): A = 0, 1 or $FF
+sign:   lda     FAC
+        beq     sign_rts
+sign1:  lda     FACSIGN
+sign2:  rol     a
+        lda     #$FF
+        bcs     sign_rts
+        lda     #$01
+sign_rts:   rts
+
+; SGN ($EB90), FLOAT ($EB93)
+sgn:    jsr     sign
+float:  sta     FAC+1
+        lda     #$00
+        sta     FAC+2
+        ldx     #$88
+float_1:
+        lda     FAC+1
+        eor     #$FF
+        rol     a
+float_2:
+        lda     #$00
+        sta     FAC+4
+        sta     FAC+3
+        stx     FAC
+        sta     FAC_EXT
+        sta     FACSIGN
+        jmp     normalize_fac_1
+
+; FCOMP ($EBB2): compare [FP_PTR] with FAC -> A = 0 (equal), 1, $FF
+fcomp:
+        ldy     #$00
+        lda     [FP_PTR],y
+        iny
+        tax
+        beq     sign
+        lda     [FP_PTR],y
+        eor     FACSIGN
+        bmi     sign1
+        cpx     FAC
+        bne     @lebe9
+        lda     [FP_PTR],y
+        ora     #$80
+        cmp     FAC+1
+        bne     @lebe9
+        iny
+        lda     [FP_PTR],y
+        cmp     FAC+2
+        bne     @lebe9
+        iny
+        lda     [FP_PTR],y
+        cmp     FAC+3
+        bne     @lebe9
+        iny
+        lda     #$7F
+        cmp     FAC_EXT
+        lda     [FP_PTR],y
+        sbc     FAC+4
+        beq     @rts
+@lebe9: lda     FACSIGN
+        bcc     @lebef
+        eor     #$FF
+@lebef: jmp     sign2
+@rts:   rts

@@ -14,15 +14,28 @@ oracle.
 page, fp816 in native mode with FAC on a direct page at `$1000` - from the
 same random states (exponents equal/near/far/edge, special mantissas, raw
 sign bytes, random rounding bytes), and compares the whole FAC, the stored
-bytes, and the error outcome.  Mutation-checked: a dropped borrow, an
-off-by-one exponent difference and a wrong rounding shift each fail it.
+bytes, the error outcome, and a byte result where there is one (FCOMP's A).
+A quarter of the cases put the operand at or a hair from FAC's own value
+(equal compares, rounding-byte ties, cancellation).  Mutation-checked: a
+dropped borrow, an off-by-one exponent difference, a wrong rounding shift,
+a misplaced FDIV quotient byte, a wrong FMULT add and FCOMP's rounding
+compare each fail it.
 
 | routine | status |
 |---|---|
 | load FAC / load ARG | ported, matches |
 | store FAC rounded | ported, matches (incl. ?OVERFLOW on rounding) |
 | FADD / FSUB / FADDT / FSUBT | ported, matches (incl. ?OVERFLOW) |
-| FMULT, FDIV, FCOMP, INT/QINT, FIN, FOUT, functions | to do |
+| FMULT / FDIV (incl. ?OVERFLOW, ?DIVISION BY ZERO) | ported, matches |
+| FCOMP, SGN, ABS, MUL10, DIV10 | ported, matches |
+| INT/QINT, FIN, FOUT, functions (SQR ^ LOG EXP SIN COS TAN ATN RND) | to do |
+
+Two places where a transliteration would be wrong on the 65816: FDIV's
+`sta $65,x` (X = $FD..$01) wraps in zero page on the 6502 but not in
+native-mode dp,X, so it stores through a long pointer to the direct page;
+and FADD's `lda $04,y` is absolute,Y (there is no zp,Y LDA), which ignores
+D, so its two cases are written out.  ADD.EXPONENTS's `.byte $2C` skip (a
+stray BIT read that can land on `$C010`) is a plain branch.
 
 ROM details the port keeps (they change result bits): FADD with equal
 exponents adds one to the rounding byte (the exponent compare leaves carry

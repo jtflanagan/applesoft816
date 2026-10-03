@@ -10,6 +10,7 @@
 //   fptest ROM fp.bin [cases] [seed]     ROM = the 256K IIgs ROM 3 image
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -21,15 +22,20 @@ namespace {
 
 // zero-page / direct-page offsets (AppleSoft's)
 constexpr int FAC = 0x9D, FACSIGN = 0xA2, SHIFTEXT = 0xA4, ARG = 0xA5, ARGSIGN = 0xAA, SGNCPR = 0xAB,
-              FAC_EXT = 0xAC, ARG_EXT = 0x92, FP_PTR = 0x5E, FP_ERR = 0xF2;
+              FAC_EXT = 0xAC, ARG_EXT = 0x92, FP_PTR = 0x5E, FP_ERR = 0xF2, FP_RES = 0xF3;
 
 // ROM entries (S-C DocuMentor labels)
 constexpr uint16_t R_LOAD_FAC = 0xEAF9, R_STORE_FAC = 0xEB2B, R_FADD = 0xE7BE, R_FSUB = 0xE7A7,
-                   R_ERROR = 0xD412;
+                   R_FMULT = 0xE97F, R_FDIV = 0xEA66, R_FCOMP = 0xEBB2, R_MUL10 = 0xEA39,
+                   R_DIV10 = 0xEA55, R_SGN = 0xEB90, R_ABS = 0xEBAF, R_ERROR = 0xD412;
 // fp816 jump table
 constexpr uint32_t LIB = 0xF20000;
 constexpr uint32_t F_LOAD_FAC = LIB + 0x00, F_STORE_FAC = LIB + 0x08, F_ADD = LIB + 0x0C,
-                   F_SUB = LIB + 0x10;
+                   F_SUB = LIB + 0x10, F_MUL = LIB + 0x1C, F_DIV = LIB + 0x20, F_CMP = LIB + 0x24,
+                   F_MUL10 = LIB + 0x28, F_DIV10 = LIB + 0x2C, F_SGN = LIB + 0x30, F_ABS = LIB + 0x34;
+
+// how a ROM routine takes its operand
+enum Conv { AY, XY, NONE };
 
 constexpr uint32_t OPERAND = 0x000300; // 5 packed bytes
 constexpr uint32_t STUB = 0x000310;
@@ -46,10 +52,11 @@ struct Fac {
 struct Outcome {
   Fac fac;
   uint8_t stored[5];
-  int err; // 0, or the AppleSoft error code
+  int err;     // 0, or the AppleSoft error code
+  int res = 0; // the byte result (FCOMP's A), when the test has one
   bool operator==(const Outcome& o) const
   {
-    return fac == o.fac && !memcmp(stored, o.stored, 5) && err == o.err;
+    return fac == o.fac && !memcmp(stored, o.stored, 5) && err == o.err && res == o.res;
   }
 };
 
@@ -105,6 +112,23 @@ void random_packed(uint8_t p[5], int near)
   pick_mantissa(p + 1);
 }
 
+// an operand at (or a hair from) FAC's own value: equal compares, rounding-
+// byte ties, catastrophic cancellation in subtraction
+void packed_near(uint8_t p[5], Fac& f)
+{
+  p[0] = f.exp;
+  memcpy(p + 1, f.m, 4);
+  p[1] = uint8_t((p[1] & 0x7F) | (rndn(2) ? (f.sign & 0x80) : (~f.sign & 0x80)));
+  switch (rndn(4)) {
+  case 0: break;
+  case 1: p[4] = uint8_t(p[4] + 1); break;
+  case 2: p[4] = uint8_t(p[4] - 1); break;
+  default: p[3 + rndn(2)] ^= uint8_t(1u << rndn(8));
+  }
+  static const uint8_t exts[] = {0x7E, 0x7F, 0x80, 0x81, 0x00, 0xFF};
+  f.ext = exts[rndn(6)];
+}
+
 struct Machine {
   Cpu816 cpu;
   std::vector<uint8_t> rom; // 256K
@@ -155,9 +179,10 @@ struct Machine {
     return false;
   }
 
-  // ROM: JSR routine with A/Y = operand address, then STP
-  Outcome rom_call(uint16_t routine, const Fac& f, const uint8_t op[5], bool store)
+  // ROM: JSR routine with the operand address in A/Y or X/Y, then STP
+  Outcome rom_call(uint16_t routine, const Fac& f, const uint8_t op[5], Conv conv, bool want_res = false)
   {
+    bool store = conv == XY;
     memset(&cpu.mem[0], 0, 0x100);
     put_fac(0, f);
     memcpy(&cpu.mem[OPERAND], op, 5);
@@ -171,11 +196,12 @@ struct Machine {
     if (!run(STUB, true, o.err)) o.err = -1;
     o.fac = get_fac(0);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
+    if (want_res) o.res = cpu.a() & 0xFF;
     return o;
   }
 
   // fp816: JSL entry with FP_PTR = operand, D = DP_OURS, then STP
-  Outcome lib_call(uint32_t entry, const Fac& f, const uint8_t op[5])
+  Outcome lib_call(uint32_t entry, const Fac& f, const uint8_t op[5], bool want_res = false)
   {
     memset(&cpu.mem[DP_OURS], 0, 0x100);
     put_fac(DP_OURS, f);
@@ -194,6 +220,7 @@ struct Machine {
     if (cpu.p() != p && o.err >= 0) o.err = -2; // M/X (or anything) not restored
     o.fac = get_fac(DP_OURS);
     memcpy(o.stored, &cpu.mem[OPERAND], 5);
+    if (want_res) o.res = cpu.mem[DP_OURS + FP_RES];
     return o;
   }
 };
@@ -207,8 +234,8 @@ void show(const char* tag, const Fac& f)
 void show(const char* tag, const Outcome& o)
 {
   show(tag, o.fac);
-  printf("     stored %02X %02X %02X %02X %02X  err=%d\n", o.stored[0], o.stored[1], o.stored[2], o.stored[3],
-         o.stored[4], o.err);
+  printf("     stored %02X %02X %02X %02X %02X  err=%d res=%02X\n", o.stored[0], o.stored[1], o.stored[2],
+         o.stored[3], o.stored[4], o.err, o.res);
 }
 
 } // namespace
@@ -241,16 +268,32 @@ int main(int argc, char** argv)
     const char* name;
     std::function<Outcome(bool ours, const Fac&, const uint8_t*)> call;
   };
-  std::vector<Test> tests = {
-      {"load FAC", [&](bool o, const Fac& f, const uint8_t* p) {
-         return o ? m.lib_call(F_LOAD_FAC, f, p) : m.rom_call(R_LOAD_FAC, f, p, false); }},
-      {"store FAC rounded", [&](bool o, const Fac& f, const uint8_t* p) {
-         return o ? m.lib_call(F_STORE_FAC, f, p) : m.rom_call(R_STORE_FAC, f, p, true); }},
-      {"FADD mem+FAC", [&](bool o, const Fac& f, const uint8_t* p) {
-         return o ? m.lib_call(F_ADD, f, p) : m.rom_call(R_FADD, f, p, false); }},
-      {"FSUB mem-FAC", [&](bool o, const Fac& f, const uint8_t* p) {
-         return o ? m.lib_call(F_SUB, f, p) : m.rom_call(R_FSUB, f, p, false); }},
+  auto both = [&](uint32_t ours, uint16_t rom, Conv conv, bool res = false) {
+    return [&m, ours, rom, conv, res](bool o, const Fac& f, const uint8_t* p) {
+      return o ? m.lib_call(ours, f, p, res) : m.rom_call(rom, f, p, conv, res);
+    };
   };
+  std::vector<Test> tests = {
+      {"load FAC", both(F_LOAD_FAC, R_LOAD_FAC, AY)},
+      {"store FAC rounded", both(F_STORE_FAC, R_STORE_FAC, XY)},
+      {"FADD mem+FAC", both(F_ADD, R_FADD, AY)},
+      {"FSUB mem-FAC", both(F_SUB, R_FSUB, AY)},
+      {"FMULT mem*FAC", both(F_MUL, R_FMULT, AY)},
+      {"FDIV mem/FAC", both(F_DIV, R_FDIV, AY)},
+      {"FCOMP mem:FAC", both(F_CMP, R_FCOMP, AY, true)},
+      {"MUL10", both(F_MUL10, R_MUL10, NONE)},
+      {"DIV10", both(F_DIV10, R_DIV10, NONE)},
+      {"SGN", both(F_SGN, R_SGN, NONE)},
+      {"ABS", both(F_ABS, R_ABS, NONE)},
+  };
+
+  // optional filter: FPTEST_ONLY=substring
+  if (const char* only = getenv("FPTEST_ONLY")) {
+    std::vector<Test> keep;
+    for (auto& t : tests)
+      if (strstr(t.name, only)) keep.push_back(t);
+    tests = keep;
+  }
 
   int failed_tests = 0;
   for (auto& t : tests) {
@@ -259,7 +302,8 @@ int main(int argc, char** argv)
       int centre = int(rndn(256));
       Fac f = random_fac(centre);
       uint8_t op[5];
-      random_packed(op, f.exp ? f.exp : centre);
+      if (rndn(4) == 0 && f.exp) packed_near(op, f);
+      else random_packed(op, f.exp ? f.exp : centre);
       Outcome want = t.call(false, f, op);
       Outcome got = t.call(true, f, op);
       errs += want.err != 0;
