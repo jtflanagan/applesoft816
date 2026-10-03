@@ -25,8 +25,9 @@ enum {
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
   T_MUL = 0xCA, T_DIV = 0xCB, T_POW = 0xCC, T_AND = 0xCD, T_OR = 0xCE,
   T_GT = 0xCF, T_EQ = 0xD0, T_LT = 0xD1, T_SGN = 0xD2, T_INT = 0xD3, T_ABS = 0xD4,
-  T_SQR = 0xDA, T_RND = 0xDB, T_LOG = 0xDC, T_EXP = 0xDD, T_COS = 0xDE, T_SIN = 0xDF,
-  T_TAN = 0xE0, T_ATN = 0xE1
+  T_FRE = 0xD6, T_SQR = 0xDA, T_RND = 0xDB, T_LOG = 0xDC, T_EXP = 0xDD, T_COS = 0xDE, T_SIN = 0xDF,
+  T_TAN = 0xE0, T_ATN = 0xE1, T_LEN = 0xE3, T_STR = 0xE4, T_VAL = 0xE5, T_ASC = 0xE6, T_CHR = 0xE7,
+  T_LEFT = 0xE8, T_RIGHT = 0xE9, T_MID = 0xEA
 };
 
 /* ---- limits ---- */
@@ -36,8 +37,9 @@ enum {
 #define MAX_CONSTS 600
 #define MAX_PENDING 64
 #define FSTACK_SIZE 600
+#define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 12
+#define HEADER_SIZE 22
 
 typedef struct { uint16_t num, addr; } Line;
 typedef struct { uint8_t c1, c2, type; } Var;              /* type: 0 real, 1 integer, 2 string */
@@ -59,7 +61,9 @@ static uint16_t nconsts;
 static uint16_t str_bytes;          /* string literal pool size, this pass */
 
 /* the layout, fixed after pass 1 */
-static uint16_t code_base, const_base, str_base, var_base, desc_base, fstack_base, cstack_base, heap_base;
+static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
+    sstack_base, cstack_base, heap_base;
+static uint16_t nsvars, nsarrays;
 static uint16_t var_off[MAX_VARS], desc_off[MAX_ARRAYS];
 static uint16_t str_at;             /* pass 2: the next literal's address */
 
@@ -219,7 +223,7 @@ static int read_linenum(uint16_t *out)
 /* ---- expressions: FRMEVL ---- */
 enum { TY_NUM, TY_STR, TY_ERR };
 
-typedef struct { uint8_t prec, opcode, mask; } Pending;
+typedef struct { uint8_t prec, opcode, mask, str; } Pending;
 
 static int expr(void);
 
@@ -232,10 +236,20 @@ static int expr(void);
 #define P_UNARY 0x7F
 #define P_REL 0x64
 
-static void perform(const Pending *x)
+/* perform a pending operator, its right operand of type t now in FAC/SACC;
+ * returns the result's type.  The ROM's checks, at the same point:
+ * FRM.PERFORM.1's CHKNUM for arithmetic, RELOPS's CHKVAL for relations. */
+static int perform(const Pending *x, int t)
 {
-  if (x->opcode == OP_REL) { op(OP_REL); emit8(x->mask); }
-  else op(x->opcode);
+  if (x->opcode == OP_REL) {
+    if (t != (x->str ? TY_STR : TY_NUM)) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
+    op(x->str ? OP_SREL : OP_REL);
+    emit8(x->mask);
+    return TY_NUM;
+  }
+  if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
+  op(x->opcode);
+  return TY_NUM;
 }
 
 /* subscripts "( e [, e]... )" as IDX pushes; returns how many, 0 on error */
@@ -253,8 +267,71 @@ static int subscripts(void)
   }
 }
 
-/* FRM.ELEMENT: one operand into FAC, with the unary operators it starts
- * with left on the pending stack */
+/* a variable or array element by name: emits its load; returns its type */
+static int load_name(const Name *nm)
+{
+  if (nm->is_array) {
+    int n = subscripts(), a;
+    if (!n) { error_here(E_SYNTAX); return TY_ERR; }
+    a = array_slot(nm->c1, nm->c2, nm->type, (uint8_t)n);
+    if (a < 0) { error_here(E_BAD_SUBSCRIPT); return TY_ERR; }
+    op16(nm->type == 2 ? OP_SLDA : nm->type == 1 ? OP_LDAI : OP_LDA, pass == 2 ? desc_off[a] : 0);
+  } else
+    op16(nm->type == 2 ? OP_SLDV : nm->type == 1 ? OP_LDVI : OP_LDV, var_slot(nm->c1, nm->c2, nm->type));
+  return nm->type == 2 ? TY_STR : TY_NUM;
+}
+
+/* "( e )" of the type wanted; 0 on error (already compiled) */
+static int paren_arg(int want)
+{
+  int t;
+  if (peek() != '(') { error_here(E_SYNTAX); return 0; }
+  p++;
+  t = expr();
+  if (t == TY_ERR) return 0;
+  if (t != want) { error_here(E_TYPE_MISMATCH); return 0; }
+  if (peek() != ')') { error_here(E_SYNTAX); return 0; }
+  p++;
+  return 1;
+}
+
+/* the string functions with arguments: LEFT$ RIGHT$ MID$ (UNARY's string
+ * path: the string, then GETBYT on each numeric argument in order) */
+static int string_fn(uint8_t tok)
+{
+  int t;
+  if (peek() != '(') { error_here(E_SYNTAX); return TY_ERR; }
+  p++;
+  t = expr();
+  if (t == TY_ERR) return t;
+  if (t != TY_STR) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
+  if (peek() != ',') { error_here(E_SYNTAX); return TY_ERR; }
+  p++;
+  op(OP_SPUSH);
+  if ((t = expr()) != TY_NUM) { if (t != TY_ERR) error_here(E_TYPE_MISMATCH); return TY_ERR; }
+  if (tok == T_MID) {
+    op(OP_MIDP);
+    if (peek() == ',') {
+      p++;
+      if ((t = expr()) != TY_NUM) { if (t != TY_ERR) error_here(E_TYPE_MISMATCH); return TY_ERR; }
+      if (peek() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+      p++;
+      op(OP_MID3);
+      return TY_STR;
+    }
+    if (peek() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+    p++;
+    op(OP_MID2);
+    return TY_STR;
+  }
+  if (peek() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+  p++;
+  op(tok == T_LEFT ? OP_LEFT : OP_RIGHT);
+  return TY_STR;
+}
+
+/* FRM.ELEMENT: one operand into FAC (or SACC), with the unary operators it
+ * starts with left on the pending stack */
 static int element(Pending *pend, int *np)
 {
   for (;;) {
@@ -270,23 +347,14 @@ static int element(Pending *pend, int *np)
     if (is_letter(c)) {
       Name nm;
       read_name(&nm);
-      if (nm.type != 0) { error_here(E_UNIMPLEMENTED); return TY_ERR; }   /* % and $: M3 */
-      if (nm.is_array) {
-        int n = subscripts(), a;
-        if (!n) { error_here(E_SYNTAX); return TY_ERR; }
-        a = array_slot(nm.c1, nm.c2, nm.type, (uint8_t)n);
-        if (a < 0) { error_here(E_BAD_SUBSCRIPT); return TY_ERR; }
-        op16(OP_LDA, pass == 2 ? desc_off[a] : 0);
-        return TY_NUM;
-      }
-      op16(OP_LDV, var_slot(nm.c1, nm.c2, nm.type));
-      return TY_NUM;
+      return load_name(&nm);
     }
     if (c == T_MINUS || c == T_NOT) {     /* MIN / NOT: an operator of precedence $7F */
       p++;
-      if (*np == MAX_PENDING) { error_here(0xBF); return TY_ERR; }   /* FORMULA TOO COMPLEX */
+      if (*np == MAX_PENDING) { error_here(E_FORMULA); return TY_ERR; }
       op(OP_PUSH);
       pend[*np].prec = P_UNARY, pend[*np].opcode = c == T_MINUS ? OP_NEG : OP_NOT, pend[*np].mask = 0;
+      pend[*np].str = 0;
       (*np)++;
       continue;
     }
@@ -300,32 +368,52 @@ static int element(Pending *pend, int *np)
       p++;
       return t;
     }
+    if (c == '"') {                        /* STRTXT: a literal, used in place */
+      int s0 = ++p, q = s0;
+      while (q < blen && buf[q] && buf[q] != '"') q++;
+      op16(OP_SLIT, str_literal(buf + s0, (uint8_t)(q - s0)));
+      p = q < blen && buf[q] == '"' ? q + 1 : q;
+      return TY_STR;
+    }
     if (c >= T_SGN && c <= 0xEA) {         /* functions */
-      static const uint8_t fn_of[] = {     /* T_SGN.. : FN number, or $FF not yet */
+      static const uint8_t fn_of[] = {     /* T_SGN.. : FN number, or $FF not one of these */
         FN_SGN, FN_INT, FN_ABS, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, FN_SQR, FN_RND, FN_LOG, FN_EXP,
         FN_COS, FN_SIN, FN_TAN, FN_ATN };
       uint8_t f = (uint8_t)(c - T_SGN) < sizeof fn_of ? fn_of[c - T_SGN] : 0xFF;
-      int t;
-      if (f == 0xFF) { error_here(E_UNIMPLEMENTED); return TY_ERR; }
       p++;
-      if (peek() != '(') { error_here(E_SYNTAX); return TY_ERR; }
-      p++;
-      t = expr();
-      if (t == TY_ERR) return t;
-      if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
-      if (peek() != ')') { error_here(E_SYNTAX); return TY_ERR; }
-      p++;
-      op(OP_FN);
-      emit8(f);
-      return TY_NUM;
+      if (f != 0xFF) {
+        if (!paren_arg(TY_NUM)) return TY_ERR;
+        op(OP_FN);
+        emit8(f);
+        return TY_NUM;
+      }
+      switch (c) {
+      case T_LEN: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_LEN); return TY_NUM;
+      case T_ASC: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_ASC); return TY_NUM;
+      case T_VAL: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_VAL); return TY_NUM;
+      case T_CHR: if (!paren_arg(TY_NUM)) return TY_ERR; op(OP_CHR); return TY_STR;
+      case T_STR: if (!paren_arg(TY_NUM)) return TY_ERR; op(OP_STR); return TY_STR;
+      case T_FRE: {                        /* FRE(any) */
+        int t;
+        if (peek() != '(') { error_here(E_SYNTAX); return TY_ERR; }
+        p++;
+        if ((t = expr()) == TY_ERR) return t;
+        if (peek() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+        p++;
+        op(OP_FRE);
+        return TY_NUM;
+      }
+      case T_LEFT: case T_RIGHT: case T_MID: return string_fn(c);
+      }
+      error_here(E_UNIMPLEMENTED);
+      return TY_ERR;
     }
-    if (c == '"') { error_here(E_UNIMPLEMENTED); return TY_ERR; }   /* strings: M3 */
     error_here(E_SYNTAX);
     return TY_ERR;
   }
 }
 
-/* FRMEVL: an expression into FAC; returns its type */
+/* FRMEVL: an expression into FAC (or SACC); returns its type */
 static int expr(void)
 {
   Pending pend[MAX_PENDING];
@@ -334,6 +422,18 @@ static int expr(void)
   if (t == TY_ERR) return t;
   for (;;) {
     uint8_t c = peek(), prec = 0, opcode = 0, mask = 0;
+    if (c == T_PLUS && t == TY_STR) {      /* CAT: at once, with the next element */
+      p++;
+      op(OP_SPUSH);
+      {
+        Pending none[MAX_PENDING];
+        int nn = 0, t2 = element(none, &nn);
+        if (t2 == TY_ERR) return t2;
+        if (nn || t2 != TY_STR) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
+      }
+      op(OP_SCAT);
+      continue;
+    }
     if (c == T_GT || c == T_EQ || c == T_LT) {        /* relations: their bits accumulate */
       while (c = peek(), c == T_GT || c == T_EQ || c == T_LT) {
         uint8_t bit = c == T_GT ? 1 : c == T_EQ ? 2 : 4, m = (uint8_t)(mask ^ bit);
@@ -349,16 +449,18 @@ static int expr(void)
       p++;
     } else
       break;
-    if (t != TY_NUM) { error_here(E_UNIMPLEMENTED); return TY_ERR; }   /* string operators: M3 */
-    while (np > 0 && pend[np - 1].prec >= prec) perform(&pend[--np]);
-    if (np == MAX_PENDING) { error_here(0xBF); return TY_ERR; }
-    op(OP_PUSH);
-    pend[np].prec = prec, pend[np].opcode = opcode, pend[np].mask = mask;
+    while (np > 0 && pend[np - 1].prec >= prec)
+      if ((t = perform(&pend[--np], t)) == TY_ERR) return t;
+    if (t == TY_STR && opcode != OP_REL) { error_here(E_TYPE_MISMATCH); return TY_ERR; }   /* CHKNUM */
+    if (np == MAX_PENDING) { error_here(E_FORMULA); return TY_ERR; }
+    op(t == TY_STR ? OP_SPUSH : OP_PUSH);
+    pend[np].prec = prec, pend[np].opcode = opcode, pend[np].mask = mask, pend[np].str = t == TY_STR;
     np++;
     t = element(pend, &np);
     if (t == TY_ERR) return t;
   }
-  while (np > 0) perform(&pend[--np]);
+  while (np > 0)
+    if ((t = perform(&pend[--np], t)) == TY_ERR) return t;
   return t;
 }
 
@@ -369,23 +471,13 @@ static void st_print(void)
   if (at_end()) { op(OP_PRCR); return; }
   while (!at_end()) {
     uint8_t c = peek();
+    int t;
     if (c == ';') { p++; last_was_item = 0; continue; }
     if (c == ',') { p++; op(OP_PRCOMMA); last_was_item = 0; continue; }
-    if (c == '"') {                        /* a literal on its own: STRLIT / STRPRT */
-      int s = ++p, q = s;
-      while (q < blen && buf[q] && buf[q] != '"') q++;
-      op16(OP_PRSTR, str_literal(buf + s, (uint8_t)(q - s)));
-      p = q < blen && buf[q] == '"' ? q + 1 : q;
-      last_was_item = 1;
-      continue;
-    }
-    {
-      int t = expr();
-      if (t == TY_ERR) return;
-      if (t != TY_NUM) { error_here(E_UNIMPLEMENTED); return; }
-      op(OP_PRNUM);
-      last_was_item = 1;
-    }
+    t = expr();
+    if (t == TY_ERR) return;
+    op(t == TY_STR ? OP_SPRINT : OP_PRNUM);
+    last_was_item = 1;
   }
   if (last_was_item) op(OP_PRCR);          /* PR.STRING: at the statement's end, CRDO */
 }
@@ -397,7 +489,6 @@ static void st_let(void)
   Name nm;
   int a = -1, t;
   if (!read_name(&nm)) { error_here(E_SYNTAX); return; }
-  if (nm.type != 0) { error_here(E_UNIMPLEMENTED); return; }
   if (nm.is_array) {
     int n = subscripts();
     if (!n) { error_here(E_SYNTAX); return; }
@@ -407,9 +498,11 @@ static void st_let(void)
   if (next() != T_EQ) { error_here(E_SYNTAX); return; }
   t = expr();
   if (t == TY_ERR) return;
-  if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return; }
-  if (nm.is_array) op16(OP_STA, pass == 2 ? desc_off[a] : 0);
-  else op16(OP_STV, var_slot(nm.c1, nm.c2, nm.type));
+  if (t != (nm.type == 2 ? TY_STR : TY_NUM)) { error_here(E_TYPE_MISMATCH); return; }
+  if (nm.is_array)
+    op16(nm.type == 2 ? OP_SSTA : nm.type == 1 ? OP_STAI : OP_STA, pass == 2 ? desc_off[a] : 0);
+  else
+    op16(nm.type == 2 ? OP_SSTV : nm.type == 1 ? OP_STVI : OP_STV, var_slot(nm.c1, nm.c2, nm.type));
 }
 
 static void jump_to(int opcode, uint16_t n)
@@ -486,7 +579,6 @@ static void st_dim(void)
     Name nm;
     int n, a;
     if (!read_name(&nm) || !nm.is_array) { error_here(E_SYNTAX); return; }
-    if (nm.type != 0) { error_here(E_UNIMPLEMENTED); return; }
     n = subscripts();
     if (!n) { error_here(E_SYNTAX); return; }
     a = array_slot(nm.c1, nm.c2, nm.type, (uint8_t)n);
@@ -580,15 +672,21 @@ int as816_compile(const Platform *platform, CompileStats *st)
   var_base = (uint16_t)(str_base + str_bytes);
   for (i = 0, a = var_base; i < nvars; i++) {
     var_off[i] = a;
-    a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 3 : 5));
+    a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5));
   }
   desc_base = a;
   for (i = 0; i < narrays; i++) {
     desc_off[i] = a;
     a = (uint16_t)(a + 4 + 2 * arrays[i].ndims);
   }
-  fstack_base = a;
-  cstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
+  nsvars = nsarrays = 0;
+  for (i = 0; i < nvars; i++) nsvars += vars[i].type == 2;
+  for (i = 0; i < narrays; i++) nsarrays += arrays[i].type == 2;
+  svlist_base = a;
+  salist_base = (uint16_t)(svlist_base + 2 * nsvars);
+  fstack_base = (uint16_t)(salist_base + 2 * nsarrays);
+  sstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
+  cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
   heap_base = (uint16_t)(cstack_base + CSTACK_SIZE);
   if (heap_base < fstack_base || heap_base > 0xFF00) return -1;
 
@@ -602,15 +700,31 @@ int as816_compile(const Platform *platform, CompileStats *st)
   for (a = var_base; a < desc_base; a++) pf->wr(pf->ctx, a, 0);
   for (i = 0; i < narrays; i++) {
     uint16_t d = desc_off[i];
+    uint8_t size = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
     pf->wr(pf->ctx, d, 0), pf->wr(pf->ctx, (uint16_t)(d + 1), 0);
-    pf->wr(pf->ctx, (uint16_t)(d + 2), arrays[i].ndims), pf->wr(pf->ctx, (uint16_t)(d + 3), 0);
+    pf->wr(pf->ctx, (uint16_t)(d + 2), arrays[i].ndims), pf->wr(pf->ctx, (uint16_t)(d + 3), size);
+  }
+  /* the collector's roots: the string variables, the string arrays */
+  {
+    uint16_t at = svlist_base;
+    for (i = 0; i < nvars; i++)
+      if (vars[i].type == 2) {
+        pf->wr(pf->ctx, at, (uint8_t)var_off[i]), pf->wr(pf->ctx, (uint16_t)(at + 1), (uint8_t)(var_off[i] >> 8));
+        at = (uint16_t)(at + 2);
+      }
+    for (i = 0; i < narrays; i++)
+      if (arrays[i].type == 2) {
+        pf->wr(pf->ctx, at, (uint8_t)desc_off[i]), pf->wr(pf->ctx, (uint16_t)(at + 1), (uint8_t)(desc_off[i] >> 8));
+        at = (uint16_t)(at + 2);
+      }
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[6];
+    uint16_t h = pf->prog_start, vals[11];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
     vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = 0xFFFF;
-    for (i = 0; i < 6; i++) {
+    vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
+    for (i = 0; i < 11; i++) {
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }

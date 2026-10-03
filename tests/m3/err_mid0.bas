@@ -1,0 +1,1 @@
+10 PRINT MID$("ABC",0,1)

@@ -1,0 +1,1 @@
+10 PRINT LEFT$("ABC",0)

@@ -48,8 +48,9 @@ constexpr int CH = 0x24, CV = 0x25, WNDLFT = 0x20, WNDWDTH = 0x21, WNDTOP = 0x22
 
 // where the VM goes (any bank and pages would do)
 constexpr uint32_t VM_BANK = 0x050000, VM_DP = 0x9800, VM_STUB = 0x9900, SCRATCH = 0x0400, CALL_AT = 0x0300;
+constexpr uint8_t STRING_BANK = 0x06;
 // its direct page (vm.s / fp.s)
-constexpr int DP_COUT_VEC = 0x2A, DP_FLASH = 0x2D, DP_SPEED = 0x2E, DP_ERR = 0x2F, DP_RNDSEED = 0xC9,
+constexpr int DP_SH_BANK = 0x48, DP_COUT_VEC = 0x2A, DP_FLASH = 0x2D, DP_SPEED = 0x2E, DP_ERR = 0x2F, DP_RNDSEED = 0xC9,
               DP_FP_TXT = 0xFA, DP_FP_ERR = 0xF2, DP_FAC = 0x9D, DP_FAC_EXT = 0xAC;
 
 std::vector<uint8_t> slurp(const char* p)
@@ -308,6 +309,7 @@ int main(int argc, char** argv)
     uint8_t* dp = &m.c.mem[VM_DP];
     dp[DP_COUT_VEC] = uint8_t(VM_STUB), dp[DP_COUT_VEC + 1] = uint8_t(VM_STUB >> 8), dp[DP_COUT_VEC + 2] = 0;
     dp[DP_FLASH] = 0, dp[DP_SPEED] = 1;
+    dp[DP_SH_BANK] = STRING_BANK;
     // AppleSoft's cold start copies only $C9-$CC of its RND seed from the
     // ROM (80 4F C7 52); $CD keeps whatever memory held - 0 here, as it is in
     // the ROM run on this machine

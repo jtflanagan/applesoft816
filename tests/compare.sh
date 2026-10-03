@@ -23,7 +23,9 @@ for bas in "$@"; do
       --sym "$AW/bin/APPLE2E.SYM" --type "$bas" --dump-prog "$work/$name.tok" --lines 0 --syms 0 \
       --no-run --idle 50000 >/dev/null 2>&1
   rc=$("$root/gsrun/gsrun" "$ROM" --prog "$work/$name.tok" "${karg[@]}" --out "$work/$name.rom" 2>&1 | sed -n 's/.* \([0-9]*\) cycles in the program/\1/p')
-  vc=$("$root/gsrun/gsrun" "$ROM" --prog "$work/$name.tok" --vm "$root/vm/vm.bin" "${karg[@]}" --out "$work/$name.vm" 2>&1 | tee "$work/$name.vmlog" | sed -n 's/.* \([0-9]*\) cycles in the program/\1/p')
+  # the VM gets at most the ROM's run in instructions, and some: a hang shows
+  max=$(( ${rc:-0} + 20000000 ))
+  vc=$("$root/gsrun/gsrun" "$ROM" --prog "$work/$name.tok" --vm "$root/vm/vm.bin" "${karg[@]}" --max "$max" --out "$work/$name.vm" 2>&1 | tee "$work/$name.vmlog" | sed -n 's/.* \([0-9]*\) cycles in the program/\1/p')
   if cmp -s "$work/$name.rom" "$work/$name.vm"; then r=same; pass=$((pass+1)); else r=DIFFERENT; fail=$((fail+1)); fi
   sp=$(awk -v a="${rc:-0}" -v b="${vc:-0}" 'BEGIN { if (b > 0) printf "%.2fx", a / b; else print "-" }')
   printf '%-28s %12s %12s %8s  %s\n' "$name" "${rc:-?}" "${vc:-?}" "$sp" "$r"

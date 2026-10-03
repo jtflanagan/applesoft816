@@ -1,0 +1,7 @@
+10 DIM N$(5),Q%(3)
+20 FOR I=0 TO 5:N$(I)=STR$(I*I)+"!":NEXT
+30 FOR I=5 TO 0 STEP -1:PRINT N$(I);:NEXT:PRINT
+40 FOR I=0 TO 3:Q%(I)=I*3.7:NEXT:FOR I=0 TO 3:PRINT Q%(I);" ";:NEXT:PRINT
+50 A%=-32767:B%=7.9:C%=-7.9:PRINT A%;" ";B%;" ";C%;" ";A%/2
+60 W$(2)="TWO":PRINT W$(2);LEN(W$(0));W$(10)="":PRINT "OK"
+70 K%=K%+1:K%=K%*3:PRINT K%

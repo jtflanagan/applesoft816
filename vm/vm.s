@@ -24,6 +24,7 @@
         .import fp_sgn, fp_ayint, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
         .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_add, fp_table
         .import fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin, fp_tan, fp_atn
+        .import fp_conint, fp_fin
 
 ; ---- direct page ----
 ; fp816's (see fp.s)
@@ -38,6 +39,7 @@ FP_ERR   = $F2
 FP_RES   = $F3
 FP_INT   = $F8
 FP_BUF   = $FD
+FP_TXT   = $FA
 ; the VM's
 VM_IP    = $20          ; 2: IP saved across calls
 VM_FSP   = $22          ; 2: expression stack pointer (grows up)
@@ -54,6 +56,19 @@ VM_T2    = $34          ; 2: scratch
 VM_CLIM  = $36          ; 2: control stack limit
 VM_PROG  = $38          ; 2: the program header's address
 VM_CBASE_PTR = $3A      ; 2: the control stack's base (empty)
+SACC     = $3C          ; 4: the string accumulator: length, address (2), bank
+VM_SSP   = $40          ; 2: the string temporary stack (grows up, 4 bytes an entry)
+SPTR     = $42          ; 3: long pointer, scratch
+SPTR2    = $45          ; 3: long pointer, scratch
+SH_BANK  = $48          ; 1: the string heap's bank (set by the loader)
+SH_FREE  = $49          ; 2: the next free byte of the current half
+SH_END   = $4B          ; 2: the end of the current half
+SH_HALF  = $4D          ; 1: which half (0: $0000-$7FFF, 1: $8000-$FFFF)
+VM_T3    = $4E          ; 2: scratch
+VM_T4    = $B0          ; 2: scratch (a free fp816 offset)
+VM_T5    = $B2          ; 2: scratch
+VM_NEWF  = $B4          ; 2: the collector's free pointer in the new half
+VM_SDESC = $B6          ; 4: scratch descriptor (in the direct page)
 
 ERR_NEXT_WITHOUT_FOR  = $00
 ERR_RETURN_WITHOUT_GOSUB = $16
@@ -63,6 +78,7 @@ ERR_UNDEF_STATEMENT = $5A
 ERR_BAD_SUBSCRIPT = $6B
 ERR_REDIM   = $78
 ERR_FORMULA = $BF
+ERR_STRING_TOO_LONG = $B0
 
 FRAME_FOR   = $81       ; the ROM's FOR token, as its frames are marked
 FRAME_GOSUB = $B0       ; the ROM's GOSUB token
@@ -125,6 +141,10 @@ optable:
         .word   op_goto, op_ifnot, op_gosub, op_return
         .word   op_forbegin, op_forlim, op_forstep, op_next, op_next0
         .word   op_idx, op_lda, op_sta, op_dim, op_err, op_fn
+        .word   op_slit, op_sldv, op_sstv, op_spush, op_scat, op_srel, op_sprint
+        .word   op_left, op_right, op_midp, op_mid2, op_mid3, op_len, op_asc, op_chr
+        .word   op_str, op_val, op_fre
+        .word   op_ldvi, op_stvi, op_ldai, op_stai, op_slda, op_ssta
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -155,6 +175,11 @@ vm_run:
         sta     VM_CBASE_PTR
         lda     a:$0006,y
         sta     VM_CLIM
+        lda     a:$000C,y       ; the string temporary stack
+        sta     VM_SSP
+        stz     SH_FREE         ; the string heap: the low half, empty
+        lda     #$8000
+        sta     SH_END
         lda     #$FFFF
         sta     CURLIN
         ldx     a:$0000,y       ; entry IP
@@ -164,6 +189,7 @@ vm_run:
         .a8
         lda     COUT_VEC+2
         sta     cout_target+2
+        stz     SH_HALF
         stz     VM_ERR
         jmp     ($0000,x)
 
@@ -907,9 +933,9 @@ next_common:
 @n4:    NEXTOP  4
 
 ; ---- arrays ----
-; Array descriptor (in this bank), 2 + 2*n + 2 bytes: +0 element storage
-; (0 = not dimensioned yet), +2 dimension count n, then n bounds (DIM's
-; values), then the element size (5 real).
+; Array descriptor (in this bank), 4 + 2*n bytes: +0 element storage (0 =
+; not dimensioned yet), +2 dimension count n (byte), +3 element size (5
+; real, 2 integer, 4 string), +4 n bounds (DIM's values).
 ; IDX: the subscript in FAC as an integer (MAKINT: negative or > 32767 is
 ; ?ILLEGAL QUANTITY), pushed on the expression stack (2 bytes)
 op_idx:
@@ -939,7 +965,8 @@ elem_addr:
         bne     @have
         jsr     autodim
 @have:  ldy     VM_T1
-        lda     a:$0002,y       ; n
+        lda     a:$0002,y       ; n (byte)
+        and     #$00FF
         asl     a
         sta     VM_T2           ; 2n
         ; subscripts on the expression stack, first pushed first: walk from
@@ -985,11 +1012,11 @@ elem_addr:
         adc     VM_T0
         sta     VM_T0
         bra     @dim
-@done:  lda     VM_T0           ; * 5
-        asl     a
-        asl     a
-        clc
-        adc     VM_T0
+@done:  ldy     VM_T1           ; * the element size
+        lda     a:$0003,y
+        and     #$00FF
+        jsr     mul16
+        lda     VM_T0
         ldy     VM_T1
         clc
         adc     a:$0000,y
@@ -1029,6 +1056,7 @@ mul16:  sta     VM_T2+0
 autodim:
         ldy     VM_T1
         lda     a:$0002,y
+        and     #$00FF
         tax
         tya
         clc
@@ -1048,6 +1076,7 @@ autodim:
 alloc_array:
         ldy     VM_T1
         lda     a:$0002,y
+        and     #$00FF
         tax
         lda     #$0001
         sta     VM_T0
@@ -1064,12 +1093,10 @@ alloc_array:
         iny
         dex
         bne     @m
-        lda     VM_T0
-        asl     a
-        asl     a
-        clc
-        adc     VM_T0           ; bytes
-        sta     VM_T0
+        ldy     VM_T1           ; * the element size = bytes
+        lda     a:$0003,y
+        and     #$00FF
+        jsr     mul16
         ldy     VM_PROG
         lda     a:$0008,y       ; the array heap's free pointer
         tax
@@ -1139,6 +1166,7 @@ op_dim: stx     VM_IP
         lda     a:$0000,y
         bne     @redim
         lda     a:$0002,y
+        and     #$00FF
         asl     a
         sta     VM_T2
         lda     VM_FSP
@@ -1162,6 +1190,7 @@ op_dim: stx     VM_IP
 dim_copy:
         ldy     VM_T1
         lda     a:$0002,y
+        and     #$00FF
         tax                     ; n
         lda     VM_FSP
         sta     VM_T0
@@ -1213,6 +1242,875 @@ op_fn:  stx     VM_IP
 
 fntab:  .word   fp_sgn, fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin
         .word   fp_tan, fp_atn
+
+
+; =========================================================================
+; Strings
+; =========================================================================
+; A string is a descriptor: length, address (2), bank.  Literals live in this
+; bank (the compiler's pool: a length byte, then the text) and are used in
+; place, as AppleSoft points into the program text; everything else is in
+; the string heap's bank, each string after a 2-byte header (0, or where the
+; collector moved it).  The heap is two halves; the collector copies what is
+; live into the other half.  Its roots: the string variables and string
+; arrays (the compiler lists them in the program header), the string
+; temporary stack, and SACC.  An operation that allocates does so before it
+; reads its operands, so a collection can move them first.
+
+; salloc: A16 = the length (1-255).  SPTR = the new string's data (header 0).
+; ?OUT OF MEMORY if a collection does not make room.
+        .a16
+salloc: sta     VM_T3
+        jsr     @fits
+        bcc     @ok
+        jsr     gc_strings
+        jsr     @fits
+        bcc     @ok
+        sep     #$20
+        .a8
+        lda     #ERR_OUT_OF_MEMORY
+        jmp     vm_error
+        .a16
+@ok:    lda     SH_FREE
+        sta     SPTR
+        clc
+        adc     VM_T3
+        adc     #$0002
+        sta     SH_FREE
+        sep     #$20
+        .a8
+        lda     SH_BANK
+        sta     SPTR+2
+        lda     #$00            ; the header: not moved
+        sta     [SPTR]
+        ldy     #$0001
+        sta     [SPTR],y
+        rep     #$20
+        .a16
+        lda     SPTR
+        clc
+        adc     #$0002
+        sta     SPTR
+        rts
+; C clear if VM_T3 bytes + header fit
+@fits:  lda     SH_FREE
+        clc
+        adc     VM_T3
+        bcs     @no
+        adc     #$0002
+        bcs     @no
+        cmp     SH_END
+        beq     @yes
+        bcs     @no
+@yes:   clc
+        rts
+@no:    sec
+        rts
+        .a8
+
+; the collector
+        .a16
+gc_strings:
+        phx
+        phy
+        lda     SH_HALF
+        and     #$00FF
+        beq     @to1
+        lda     #$0000          ; to the low half
+        sta     VM_NEWF
+        lda     #$8000
+        bra     @go
+@to1:   lda     #$8000
+        sta     VM_NEWF
+        lda     #$0000          ; (the end: $10000 - wraps to 0)
+@go:    sta     VM_T5           ; the new half's end
+        ; SACC, through the scratch descriptor in the direct page... via a
+        ; bank copy: fwd_desc works on this bank, so SACC is copied out
+        lda     SACC
+        sta     sacc_copy
+        lda     SACC+2
+        sta     sacc_copy+2
+        ldy     #sacc_copy
+        jsr     fwd_desc
+        lda     sacc_copy
+        sta     SACC
+        lda     sacc_copy+2
+        sta     SACC+2
+        ; the string temporary stack
+        ldy     VM_PROG
+        lda     a:$000C,y
+@st:    cmp     VM_SSP
+        bcs     @vars
+        tay
+        pha
+        jsr     fwd_desc
+        pla
+        clc
+        adc     #$0004
+        bra     @st
+        ; string variables: a list of their addresses
+@vars:  ldy     VM_PROG
+        lda     a:$000E,y
+        sta     VM_T4           ; the list
+        lda     a:$0010,y
+        sta     VM_T0           ; how many
+@v:     lda     VM_T0
+        beq     @arrays
+        dec     VM_T0
+        ldy     VM_T4
+        lda     a:$0000,y
+        tay
+        jsr     fwd_desc
+        inc     VM_T4
+        inc     VM_T4
+        bra     @v
+        ; string arrays: a list of their descriptors
+@arrays:
+        ldy     VM_PROG
+        lda     a:$0012,y
+        sta     VM_T4
+        lda     a:$0014,y
+        sta     VM_T2           ; how many (VM_T2: mul16 is not used below)
+@a:     lda     VM_T2
+        beq     @done
+        dec     VM_T2
+        ldy     VM_T4
+        lda     a:$0000,y       ; the descriptor
+        tay
+        lda     a:$0000,y       ; its storage
+        beq     @anext
+        sta     VM_T1           ; the element pointer
+        jsr     elem_count      ; A = how many elements
+        sta     VM_T3
+@e:     lda     VM_T3
+        beq     @anext
+        dec     VM_T3
+        ldy     VM_T1
+        jsr     fwd_desc
+        lda     VM_T1
+        clc
+        adc     #$0004
+        sta     VM_T1
+        bra     @e
+@anext: inc     VM_T4
+        inc     VM_T4
+        bra     @a
+@done:  lda     VM_NEWF
+        sta     SH_FREE
+        lda     VM_T5
+        bne     @end
+        lda     #$FFFF          ; the high half ends at $FFFF
+@end:   sta     SH_END
+        sep     #$20
+        .a8
+        lda     SH_HALF
+        eor     #$01
+        sta     SH_HALF
+        rep     #$20
+        .a16
+        ply
+        plx
+        rts
+
+; A = the number of elements of descriptor Y: the product of (bound + 1)
+elem_count:
+        phx
+        lda     a:$0002,y
+        and     #$00FF
+        tax
+        lda     #$0001
+        sta     VM_T0+0
+        sty     VM_SDESC
+@m:     lda     VM_SDESC
+        clc
+        adc     #$0004
+        sta     VM_SDESC
+        tay
+        lda     a:$0000,y
+        inc     a
+        phx
+        jsr     mul16
+        plx
+        dex
+        bne     @m
+        lda     VM_T0
+        plx
+        rts
+; (elem_count uses VM_T0 as mul16's accumulator: callers keep nothing there)
+
+; move the string of descriptor Y (in this bank) into the new half, or point
+; it where it already went
+fwd_desc:
+        lda     a:$0000,y
+        and     #$00FF
+        beq     @rts            ; empty: nothing to move
+        sta     VM_SDESC+2      ; the length
+        sep     #$20
+        .a8
+        lda     a:$0003,y
+        cmp     SH_BANK
+        rep     #$20
+        .a16
+        bne     @rts            ; not in the heap: a literal
+        lda     a:$0001,y       ; the old address
+        sec
+        sbc     #$0002
+        sta     SPTR            ; its header
+        sep     #$20
+        .a8
+        lda     SH_BANK
+        sta     SPTR+2
+        sta     SPTR2+2
+        rep     #$20
+        .a16
+        lda     [SPTR]
+        beq     @copy
+        sta     a:$0001,y       ; already moved
+@rts:   rts
+@copy:  phy
+        lda     VM_NEWF         ; the new header and data
+        sta     SPTR2
+        lda     #$0000
+        sta     [SPTR2]
+        lda     VM_NEWF
+        clc
+        adc     #$0002
+        sta     VM_SDESC        ; the new address
+        sta     [SPTR]          ; the old header: where it went
+        lda     SPTR
+        clc
+        adc     #$0002
+        sta     SPTR            ; old data
+        lda     VM_SDESC
+        sta     SPTR2           ; new data
+        sep     #$20
+        .a8
+        ldy     #$0000
+@c:     lda     [SPTR],y
+        sta     [SPTR2],y
+        iny
+        cpy     VM_SDESC+2
+        bne     @c
+        rep     #$20
+        .a16
+        lda     VM_SDESC
+        clc
+        adc     VM_SDESC+2
+        sta     VM_NEWF
+        ply
+        lda     VM_SDESC
+        sta     a:$0001,y
+        rts
+        .a8
+
+sacc_copy:
+        .res    4
+
+; ---- the string operations ----
+
+; SLIT k: SACC = the literal at k (length byte, then text), in place
+op_slit:
+        ldy     a:$0002,x
+        lda     a:$0000,y
+        sta     SACC
+        iny
+        sty     SACC+1
+        phk
+        pla
+        sta     SACC+3
+        NEXTOP  4
+
+; SLDV v / SSTV v: SACC = the variable's descriptor, and back
+op_sldv:
+        ldy     a:$0002,x
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     SACC
+        lda     a:$0002,y
+        sta     SACC+2
+        sep     #$20
+        .a8
+        NEXTOP  4
+op_sstv:
+        ldy     a:$0002,x
+        rep     #$20
+        .a16
+        lda     SACC
+        sta     a:$0000,y
+        lda     SACC+2
+        sta     a:$0002,y
+        sep     #$20
+        .a8
+        NEXTOP  4
+
+; SPUSH: SACC onto the string temporary stack
+op_spush:
+        jsr     spush
+        NEXTOP  2
+spush:  ldy     VM_SSP
+        rep     #$20
+        .a16
+        lda     SACC
+        sta     a:$0000,y
+        lda     SACC+2
+        sta     a:$0002,y
+        iny
+        iny
+        iny
+        iny
+        sty     VM_SSP
+        sep     #$20
+        .a8
+        rts
+
+; pop the string temporary stack's top into VM_SDESC (Y = where it was)
+spop:   ldy     VM_SSP
+        dey
+        dey
+        dey
+        dey
+        sty     VM_SSP
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     VM_SDESC
+        lda     a:$0002,y
+        sta     VM_SDESC+2
+        sep     #$20
+        .a8
+        rts
+
+; SPTR2 = the data of descriptor VM_SDESC; SPTR... (helpers)
+sdesc_ptr2:
+        rep     #$20
+        .a16
+        lda     VM_SDESC+1
+        sta     SPTR2
+        sep     #$20
+        .a8
+        lda     VM_SDESC+3
+        sta     SPTR2+2
+        rts
+sacc_ptr2:
+        rep     #$20
+        .a16
+        lda     SACC+1
+        sta     SPTR2
+        sep     #$20
+        .a8
+        lda     SACC+3
+        sta     SPTR2+2
+        rts
+
+; copy VM_T3 (A8 count, 0-255) bytes from SPTR2+VM_T4 to SPTR+VM_T5
+copy_bytes:
+        lda     VM_T3
+        beq     @rts
+        phx
+        rep     #$20
+        .a16
+        lda     VM_T4
+        clc
+        adc     SPTR2
+        sta     SPTR2
+        lda     VM_T5
+        clc
+        adc     SPTR
+        sta     SPTR
+        sep     #$20
+        .a8
+        ldy     #$0000
+@c:     lda     [SPTR2],y
+        sta     [SPTR],y
+        iny
+        tya
+        cmp     VM_T3
+        bne     @c
+        plx
+@rts:   rts
+
+; SCAT: CAT ($E597): SACC = (the stack's top) + SACC; ?STRING TOO LONG past 255
+op_scat:
+        stx     VM_IP
+        ldy     VM_SSP
+        dey                     ; (abs,Y carries into the next bank: no $FFFC,Y)
+        dey
+        dey
+        dey
+        lda     a:$0000,y       ; the left one's length (the top entry)
+        clc
+        adc     SACC
+        bcc     @fits
+        lda     #ERR_STRING_TOO_LONG
+        jmp     vm_error
+@fits:  sta     VM_T2           ; the total
+        rep     #$20
+        .a16
+        and     #$00FF
+        beq     @empty
+        jsr     salloc          ; may move both operands
+@empty: sep     #$20
+        .a8
+        jsr     spop            ; the left one
+        lda     VM_SDESC
+        sta     VM_T3
+        jsr     sdesc_ptr2
+        stz     VM_T4
+        stz     VM_T4+1
+        stz     VM_T5
+        stz     VM_T5+1
+        jsr     copy_bytes
+        rep     #$20
+        .a16
+        lda     SPTR            ; (copy_bytes advanced SPTR by VM_T5 = 0)
+        pha
+        sep     #$20
+        .a8
+        lda     SACC
+        sta     VM_T3
+        jsr     sacc_ptr2
+        lda     VM_SDESC        ; after the left one's bytes
+        sta     VM_T5
+        jsr     copy_bytes
+        rep     #$20
+        .a16
+        pla
+        sta     SACC+1
+        sep     #$20
+        .a8
+        lda     VM_T2
+        sta     SACC
+        lda     SH_BANK
+        sta     SACC+3
+        ldx     VM_IP
+        NEXTOP  2
+
+; SREL m: STRCMP ($DF7D): the stack's top (left) against SACC (right); the
+; result as CMPDONE makes it, AND m, FAC = 0 or 1
+op_srel:
+        stx     VM_IP
+        jsr     spop
+        jsr     sdesc_ptr2      ; SPTR2 = left
+        rep     #$20
+        .a16
+        lda     SACC+1
+        sta     SPTR
+        sep     #$20
+        .a8
+        lda     SACC+3
+        sta     SPTR+2          ; SPTR = right
+        lda     VM_SDESC        ; lengths: the shorter is the count; the
+        cmp     SACC            ; result if the common part is equal
+        beq     @eqlen
+        bcc     @lshort
+        lda     SACC            ; left longer
+        sta     VM_T3
+        lda     #$FF
+        bra     @set
+@lshort:
+        lda     VM_SDESC
+        sta     VM_T3
+        lda     #$01
+        bra     @set
+@eqlen: lda     SACC
+        sta     VM_T3
+        lda     #$00
+@set:   sta     VM_T0           ; the length result
+        stz     VM_T3+1         ; the count, zero-extended (16-bit Y compares)
+        ldy     #$0000
+@cmp:   cpy     VM_T3
+        beq     @same
+        lda     [SPTR2],y
+        cmp     [SPTR],y
+        bne     @diff
+        iny
+        bra     @cmp
+@diff:  lda     #$FF            ; left > right
+        bcs     @res
+        lda     #$01
+        bra     @res
+@same:  lda     VM_T0
+@res:   ldx     VM_IP
+        clc                     ; CMPDONE: $FF -> 1, 0 -> 2, 1 -> 4
+        adc     #$01
+        asl     a
+        bne     @shifted
+        lda     #$01
+@shifted:
+        and     a:$0002,x
+        beq     @f
+        lda     #$01
+@f:     sta     FP_INT
+        FP      fp_float
+        NEXTOP  3
+
+; SPRINT: SACC through OUTDO (STRPRT)
+op_sprint:
+        jsr     sacc_ptr2
+        ldy     #$0000
+@l:     tya
+        cmp     SACC
+        beq     @done
+        lda     [SPTR2],y
+        jsr     outdo
+        iny
+        bra     @l
+@done:  NEXTOP  2
+
+; byte argument from FAC (CONINT: ?ILLEGAL QUANTITY unless 0-255) into A
+conint: FPCHK   fp_conint
+        lda     FP_RES
+        rts
+
+; LEFT$(s,n): n from FAC; s on the stack; n = 0 is ?ILLEGAL QUANTITY
+op_left:
+        stx     VM_IP
+        jsr     conint
+        beq     iq
+        sta     VM_T0           ; n
+        jsr     sub_setup       ; VM_SDESC = s (still on the stack)
+        lda     VM_T0
+        cmp     VM_SDESC
+        bcc     @n
+        lda     VM_SDESC
+@n:     sta     VM_T3
+        stz     VM_T4
+        stz     VM_T4+1
+        bra     sub_finish
+iq:     lda     #ERR_ILLQTY
+        jmp     vm_error
+
+; RIGHT$(s,n)
+op_right:
+        stx     VM_IP
+        jsr     conint
+        beq     iq
+        sta     VM_T0
+        jsr     sub_setup
+        lda     VM_T0
+        cmp     VM_SDESC
+        bcc     @n
+        lda     VM_SDESC
+@n:     sta     VM_T3
+        lda     VM_SDESC
+        sec
+        sbc     VM_T3
+        sta     VM_T4
+        stz     VM_T4+1
+        bra     sub_finish
+
+; MIDP: MID$'s position from FAC (a byte, pushed); MID2: no count; MID3: the
+; count from FAC.  Position 0 is ?ILLEGAL QUANTITY - after the count's own
+; conversion, as SUBSTRING.SETUP checks it last.
+op_midp:
+        stx     VM_IP
+        jsr     conint
+        ldy     VM_FSP
+        sta     a:$0000,y
+        iny
+        iny
+        sty     VM_FSP
+        ldx     VM_IP
+        NEXTOP  2
+op_mid2:
+        stx     VM_IP
+        lda     #$FF
+        bra     mid
+op_mid3:
+        stx     VM_IP
+        jsr     conint
+mid:    sta     VM_T0           ; the count
+        ldy     VM_FSP
+        dey
+        dey
+        sty     VM_FSP
+        lda     a:$0000,y       ; the position
+        beq     iq
+        dec     a
+        sta     VM_T4           ; offset
+        stz     VM_T4+1
+        jsr     sub_setup
+        lda     VM_T4
+        cmp     VM_SDESC
+        bcc     @in
+        stz     VM_T3           ; past the end: ""
+        bra     sub_finish
+@in:    lda     VM_SDESC
+        sec
+        sbc     VM_T4
+        cmp     VM_T0
+        bcc     @c
+        lda     VM_T0
+@c:     sta     VM_T3
+        ; fall into sub_finish
+
+; allocate, then pop s (it stayed on the stack, a root, through any
+; collection) and copy
+sub_finish:
+        rep     #$20
+        .a16
+        lda     VM_T3
+        and     #$00FF
+        beq     @e
+        jsr     salloc
+@e:     sep     #$20
+        .a8
+        jsr     spop
+        jsr     sdesc_ptr2
+        stz     VM_T5
+        stz     VM_T5+1
+        rep     #$20
+        .a16
+        lda     SPTR
+        pha
+        sep     #$20
+        .a8
+        jsr     copy_bytes
+        rep     #$20
+        .a16
+        pla
+        sta     SACC+1
+        sep     #$20
+        .a8
+        lda     VM_T3
+        sta     SACC
+        lda     SH_BANK
+        sta     SACC+3
+        ldx     VM_IP
+        NEXTOP  2
+
+; VM_SDESC = the stack's top, without popping it
+sub_setup:
+        ldy     VM_SSP
+        dey
+        dey
+        dey
+        dey
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     VM_SDESC
+        lda     a:$0002,y
+        sta     VM_SDESC+2
+        sep     #$20
+        .a8
+        rts
+
+; LEN(s): FAC = the length (SNGFLT)
+op_len: lda     SACC
+        sta     FP_INT
+        stz     FP_INT+1
+        FP      fp_givayf
+        NEXTOP  2
+
+; ASC(s): FAC = the first byte; "" is ?ILLEGAL QUANTITY
+op_asc: lda     SACC
+        bne     :+
+        brl     iq
+:       jsr     sacc_ptr2
+        lda     [SPTR2]
+        sta     FP_INT
+        stz     FP_INT+1
+        FP      fp_givayf
+        NEXTOP  2
+
+; CHR$(n): a one-byte string
+op_chr: stx     VM_IP
+        jsr     conint
+        pha
+        rep     #$20
+        .a16
+        lda     #$0001
+        jsr     salloc
+        sep     #$20
+        .a8
+        pla
+        sta     [SPTR]
+        lda     #$01
+        sta     SACC
+        rep     #$20
+        .a16
+        lda     SPTR
+        sta     SACC+1
+        sep     #$20
+        .a8
+        lda     SH_BANK
+        sta     SACC+3
+        ldx     VM_IP
+        NEXTOP  2
+
+; STR$(x): FOUT's text as a string
+op_str: stx     VM_IP
+        ldy     #fout_buf - 1
+        sty     FP_BUF
+        phk
+        pla
+        sta     FP_BUF+2
+        FP      fp_fout
+        ldy     #$0000          ; its length
+@n:     lda     fout_buf,y
+        beq     @len
+        iny
+        bra     @n
+@len:   tya
+        sta     VM_T3
+        rep     #$20
+        .a16
+        and     #$00FF
+        jsr     salloc
+        sep     #$20
+        .a8
+        ldy     #$0000
+@c:     cpy     VM_T3
+        beq     @done
+        lda     fout_buf,y
+        sta     [SPTR],y
+        iny
+        bra     @c
+@done:  lda     VM_T3
+        sta     SACC
+        rep     #$20
+        .a16
+        lda     SPTR
+        sta     SACC+1
+        sep     #$20
+        .a8
+        lda     SH_BANK
+        sta     SACC+3
+        ldx     VM_IP
+        NEXTOP  2
+
+; VAL(s): FIN over the text, a 0 put after it meanwhile and the byte put
+; back, as VAL ($E707) does
+op_val: stx     VM_IP
+        jsr     sacc_ptr2
+        ldy     SACC
+        rep     #$20            ; Y = the length
+        .a16
+        tya
+        and     #$00FF
+        tay
+        sep     #$20
+        .a8
+        lda     [SPTR2],y
+        pha
+        lda     #$00
+        sta     [SPTR2],y
+        phy
+        rep     #$20
+        .a16
+        lda     SPTR2           ; FP_TXT = the text - 1 (fp_fin's CHRGET first)
+        dec     a
+        sta     FP_TXT
+        sep     #$20
+        .a8
+        lda     SPTR2+2
+        sta     FP_TXT+2
+        FP      fp_fin
+        ply
+        jsr     sacc_ptr2
+        pla
+        sta     [SPTR2],y
+        lda     FP_ERR
+        beq     @ok
+        jmp     vm_error
+@ok:    NEXTOP  2
+
+; FRE(x): collect, FAC = the free bytes of the half (at most 32767)
+op_fre: stx     VM_IP
+        rep     #$20
+        .a16
+        jsr     gc_strings
+        lda     SH_END
+        sec
+        sbc     SH_FREE
+        bpl     @f
+        lda     #$7FFF
+@f:     sta     FP_INT
+        sep     #$20
+        .a8
+        FP      fp_givayf
+        ldx     VM_IP
+        NEXTOP  2
+
+; ---- integer variables (%) ----
+
+; LDVI v: FAC = the integer at v (high byte first), as GIVAYF
+op_ldvi:
+        ldy     a:$0002,x
+        lda     a:$0000,y
+        sta     FP_INT+1
+        lda     a:$0001,y
+        sta     FP_INT
+        FP      fp_givayf
+        NEXTOP  4
+
+; STVI v: LET2: ROUND.FAC, AYINT (?ILLEGAL QUANTITY), the two bytes
+op_stvi:
+        FPCHK   fp_round
+        FPCHK   fp_ayint
+        ldy     a:$0002,x
+        lda     FAC+3
+        sta     a:$0000,y
+        lda     FAC+4
+        sta     a:$0001,y
+        NEXTOP  4
+
+; integer and string array elements
+op_ldai:
+        stx     VM_IP
+        ldy     a:$0002,x
+        jsr     elem_addr
+        ldx     VM_IP
+        lda     a:$0000,y
+        sta     FP_INT+1
+        lda     a:$0001,y
+        sta     FP_INT
+        FP      fp_givayf
+        NEXTOP  4
+op_stai:
+        stx     VM_IP
+        ldy     a:$0002,x
+        jsr     elem_addr
+        sty     VM_T4
+        ldx     VM_IP
+        FPCHK   fp_round
+        FPCHK   fp_ayint
+        ldy     VM_T4
+        lda     FAC+3
+        sta     a:$0000,y
+        lda     FAC+4
+        sta     a:$0001,y
+        NEXTOP  4
+op_slda:
+        stx     VM_IP
+        ldy     a:$0002,x
+        jsr     elem_addr
+        ldx     VM_IP
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     SACC
+        lda     a:$0002,y
+        sta     SACC+2
+        sep     #$20
+        .a8
+        NEXTOP  4
+op_ssta:
+        stx     VM_IP
+        ldy     a:$0002,x
+        jsr     elem_addr
+        ldx     VM_IP
+        rep     #$20
+        .a16
+        lda     SACC
+        sta     a:$0000,y
+        lda     SACC+2
+        sta     a:$0002,y
+        sep     #$20
+        .a8
+        NEXTOP  4
 
 ; ---- the end of the VM: the program image the compiler writes starts here
         .segment "TAIL"
