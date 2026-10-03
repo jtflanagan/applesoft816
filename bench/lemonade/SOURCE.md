@@ -9,9 +9,9 @@
   `LEMONADE` (47 sectors, 11,750 bytes tokenized, ends at $35E7).
 - Not on any System Master we hold (680-0210-A, 680-0051-00/-01,
   680-0186-A checked).  The callapple "LC" lower-case version is a remake.
-- `LEMONADE.bas`: the tokenized program as it sits at $801
+- `LEMONADE.tok`: the tokenized program as it sits at $801
   (`tools/dsk33.py get`); `LEMONADE.lst`: `tools/detok.py` listing.
-- `play1.keys`: one player, five days, ESC, no replay (asprof script).
+- `LEMONADE.keys`: one player, five days, ESC, no replay (asprof and gsrun scripts).
 
 What it exercises: two POKEd machine-code routines (`$302` speaker tone,
 cycle-timed; `$3600` lo-res recolour, reading COLOR `$30`, CH/CV, WNDTOP,

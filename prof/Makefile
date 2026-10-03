@@ -16,7 +16,7 @@ bm: asprof
 	$(RUN) --type ../bench/rugg_feldman/BM$(N).bas --snap-end
 
 lemonade: asprof
-	$(RUN) --prog ../bench/lemonade/LEMONADE.bas --keys ../bench/lemonade/play1.keys --snap-end
+	$(RUN) --prog ../bench/lemonade/LEMONADE.tok --keys ../bench/lemonade/LEMONADE.keys --snap-end
 
 clean:
 	rm -f asprof

@@ -112,6 +112,6 @@ seed bytes (`$CD` is whatever memory held).
 |---|---|---|
 | M1 | build: the VM image (vm.s + fp816); the compiler (portable C); gsrun runs either the ROM's AppleSoft or the VM on emu816 through one virtual monitor | "PRINT 2+2" prints 4 - **done** |
 | M2 | numeric core: PRINT, LET, expressions, IF, GOTO, GOSUB/RETURN, FOR/NEXT, DIM and arrays, END, REM, the numeric functions, AppleSoft's errors | BM1-BM8 and `tests/m2` (arithmetic, loops, GOSUB, arrays, functions, PRINT layout, eight errors): output identical to the GS ROM's AppleSoft - **done**; 1.03-4.3x before any optimisation |
-| M3 | strings, arrays, DIM, INPUT/GET, DATA/READ/RESTORE, DEF FN, all functions, ONERR | Lemonade's computing lines; a string/array corpus |
-| M4 | screen and machine: HOME, VTAB/HTAB, TEXT/GR/COLOR/PLOT/HLIN/VLIN, HGR/HPLOT, PEEK/POKE/CALL (bank-0 stubs, emulation mode) | Lemonade, whole game, identical screens |
+| M3 | strings, arrays, DIM, INPUT/GET, DATA/READ/RESTORE, DEF FN, all functions, ONERR | Lemonade's computing lines; a string/array corpus - **done** |
+| M4 | screen and machine: HOME, VTAB/HTAB, TEXT/GR/COLOR/PLOT/HLIN/VLIN, HGR/HPLOT, PEEK/POKE/CALL (bank-0 stubs, emulation mode) | Lemonade, whole game, identical screens - **done (2026-10-03): byte-identical output and final screen, 84.0M vs 65.0M cycles**; HGR/HPLOT/DRAW, USR, &, 80-column double lo-res still to do |
 | M5 | the system file, immediate mode, line editor, LOAD/SAVE/RUN/CATALOG/CHR$(4) commands on ProDOS, the bytecode cache | KEGS, then the machine |

@@ -21,6 +21,8 @@
 //                 kept as COUT1 would
 //   SETWND $FB4B  TEXT's and GR's window (the GS sends it to the firmware):
 //                 the IIe's - top = A, full width, bottom 24, CV = 23 ($01 'W')
+//   INPORT $FE8B, OUTPORT $FE95: IN#/PR# - KSW/CSW to the monitor's KEYIN /
+//                 COUT1 for slot 0, $Cn00 otherwise ($01 'I'/'O' slot)
 // $C000 reads "no key"; $C0xx otherwise reads 0 and holds nothing.  A jump
 // into the firmware banks stops the run and names the last monitor entry.
 //
@@ -48,7 +50,8 @@ extern "C" {
 namespace {
 
 constexpr uint16_t COUT = 0xFDED, RDKEY = 0xFD0C, GETLN = 0xFD6A, MONWAIT = 0xFCA8, HOME = 0xFC58,
-                   CLREOP = 0xFC42, CLREOL = 0xFC9C, VTAB = 0xFC22, SETWND = 0xFB4B, BASIC_COLD = 0xE000,
+                   CLREOP = 0xFC42, CLREOL = 0xFC9C, VTAB = 0xFC22, SETWND = 0xFB4B, INPORT = 0xFE8B,
+                   OUTPORT = 0xFE95, BASIC_COLD = 0xE000,
                    RESTART = 0xD43C;
 constexpr int CH = 0x24, CV = 0x25, WNDLFT = 0x20, WNDWDTH = 0x21, WNDTOP = 0x22, WNDBTM = 0x23;
 
@@ -73,12 +76,18 @@ std::vector<uint8_t> slurp(const char* p)
 std::vector<uint8_t> parse_keys(const std::string& t)
 {
   std::vector<uint8_t> k;
+  bool bol = true;
   for (size_t i = 0; i < t.size(); i++) {
+    if (bol && t[i] == '#') { // a comment line (asprof's scripts have them)
+      while (i < t.size() && t[i] != '\n') i++;
+      continue;
+    }
+    bol = t[i] == '\n';
     if (t[i] == '\n' || t[i] == '\r') continue;
     if (t[i] == '{') {
       size_t e = t.find('}', i);
       std::string n = t.substr(i + 1, e - i - 1);
-      k.push_back(n == "CR" ? 0x0D : n == "ESC" ? 0x1B : n == "SP" ? 0x20 : 0);
+      if (n != "SNAP") k.push_back(n == "CR" ? 0x0D : n == "ESC" ? 0x1B : n == "SP" ? 0x20 : 0);
       i = e;
       continue;
     }
@@ -191,6 +200,15 @@ struct Machine {
       c.sim_rts();
       return true;
     case VTAB: record(0x01), record('V'), record(c.mem[CV]); c.sim_rts(); return true;
+    case INPORT: case OUTPORT: {
+      uint8_t slot = c.a() & 0x0F;
+      int vec = pc == INPORT ? 0x38 : 0x36;
+      uint16_t to = slot ? uint16_t(0xC000 | slot << 8) : pc == INPORT ? 0xFD1B : 0xFDF0;
+      c.mem[vec] = uint8_t(to), c.mem[vec + 1] = uint8_t(to >> 8);
+      record(0x01), record(pc == INPORT ? 'I' : 'O'), record(slot);
+      c.sim_rts();
+      return true;
+    }
     case SETWND:
       c.mem[WNDTOP] = uint8_t(c.a()), c.mem[WNDLFT] = 0, c.mem[WNDWDTH] = 40, c.mem[WNDBTM] = 24;
       c.mem[CV] = 23;
@@ -303,6 +321,7 @@ void show(const std::vector<uint8_t>& out)
       char k = char(out[++i]);
       if (k == 'V' && i + 1 < out.size()) printf("{VTAB %d}", out[++i] + 1);
       else if (k == 'W' && i + 1 < out.size()) printf("{WINDOW TOP %d}", out[++i]);
+      else if ((k == 'I' || k == 'O') && i + 1 < out.size()) printf("{%s#%d}", k == 'I' ? "IN" : "PR", out[++i]);
       else printf("{%s}", k == 'H' ? "HOME" : k == 'P' ? "CLREOP" : "CLREOL");
       continue;
     }

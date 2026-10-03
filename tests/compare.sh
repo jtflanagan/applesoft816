@@ -14,14 +14,19 @@ make -s -C "$root/prof" asprof >/dev/null && make -s -C "$root/gsrun" >/dev/null
 pass=0 fail=0
 printf '%-28s %12s %12s %8s  %s\n' program "ROM cycles" "VM cycles" speedup result
 for bas in "$@"; do
-  name=$(basename "$bas" .bas)
+  name=$(basename "$bas"); name=${name%.bas}; name=${name%.tok}
+  stem=${bas%.bas}; stem=${stem%.tok}
   keys=${KEYS:-}
-  [ -z "$keys" ] && [ -f "${bas%.bas}.keys" ] && keys="${bas%.bas}.keys"
+  [ -z "$keys" ] && [ -f "$stem.keys" ] && keys="$stem.keys"
   karg=(); [ -n "$keys" ] && karg=(--keys "$keys")
-  # tokenized by AppleSoft itself (typed in under asprof)
-  "$root/prof/asprof" --rom "$AW/resource/Apple2e_Enhanced.rom" --sym "$AW/bin/A2_BASIC.SYM" \
-      --sym "$AW/bin/APPLE2E.SYM" --type "$bas" --dump-prog "$work/$name.tok" --lines 0 --syms 0 \
-      --no-run --idle 50000 >/dev/null 2>&1
+  if [ "${bas%.tok}" != "$bas" ]; then
+    cp "$bas" "$work/$name.tok"              # already tokenized (from a disk)
+  else
+    # tokenized by AppleSoft itself (typed in under asprof)
+    "$root/prof/asprof" --rom "$AW/resource/Apple2e_Enhanced.rom" --sym "$AW/bin/A2_BASIC.SYM" \
+        --sym "$AW/bin/APPLE2E.SYM" --type "$bas" --dump-prog "$work/$name.tok" --lines 0 --syms 0 \
+        --no-run --idle 50000 >/dev/null 2>&1
+  fi
   rc=$("$root/gsrun/gsrun" "$ROM" --prog "$work/$name.tok" "${karg[@]}" --out "$work/$name.rom" 2>&1 | sed -n 's/.* \([0-9]*\) cycles in the program/\1/p')
   # the VM gets at most the ROM's run in instructions, and some: a hang shows
   max=$(( ${rc:-0} + 20000000 ))
