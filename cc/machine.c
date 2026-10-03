@@ -1,6 +1,9 @@
 /* machine.c - the shell's reach into the machine (machine.h). */
 #include <stdint.h>
 
+/* the shell runs between programs: small before fast (the compiler, -Os) */
+#pragma clang attribute push (__attribute__((minsize)), apply_to = function)
+
 #include "machine.h"
 
 /* ---- bank 0, the VM bank, the text bank ---- */
@@ -114,3 +117,5 @@ void p8_now(uint16_t *date, uint16_t *time)
   from0(d, P8_DATE, 4);
   *date = (uint16_t)(d[0] | d[1] << 8), *time = (uint16_t)(d[2] | d[3] << 8);
 }
+
+#pragma clang attribute pop

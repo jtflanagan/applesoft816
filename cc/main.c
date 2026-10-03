@@ -4,6 +4,9 @@
  * text bank's program (mode 0, gsrun), or the shell (mode 1, AS816.SYSTEM). */
 #include <stdint.h>
 
+/* the shell runs between programs: small before fast (the compiler, -Os) */
+#pragma clang attribute push (__attribute__((minsize)), apply_to = function)
+
 #include "compile.h"
 #include "shell.h"
 
@@ -94,3 +97,5 @@ int cc_main(void)
   cc_params.result = (int16_t)compile(&cc_params.st, 0);
   return 0;
 }
+
+#pragma clang attribute pop

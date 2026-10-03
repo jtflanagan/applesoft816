@@ -6,6 +6,9 @@
  * Output is checked against BASIC.SYSTEM itself in KEGS (tests/dos).
  */
 #include <stdint.h>
+
+/* the shell runs between programs: small before fast (the compiler, -Os) */
+#pragma clang attribute push (__attribute__((minsize)), apply_to = function)
 #include <string.h>
 
 #include "dos.h"
@@ -743,3 +746,5 @@ fail:
   }
   return (uint8_t)(DOS_ERROR | e);
 }
+
+#pragma clang attribute pop

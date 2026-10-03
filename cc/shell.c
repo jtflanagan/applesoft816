@@ -12,6 +12,9 @@
  * (res.h), the VM.
  */
 #include <stdint.h>
+
+/* the shell runs between programs: small before fast (the compiler, -Os) */
+#pragma clang attribute push (__attribute__((minsize)), apply_to = function)
 #include <string.h>
 
 #include "dos.h"
@@ -666,3 +669,5 @@ void shell(void)
     ran = 0;
   }
 }
+
+#pragma clang attribute pop
