@@ -54,7 +54,7 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 36
+#define HEADER_SIZE 42
 #define SV_SPARE 16                  /* string roots kept free for direct lines' variables */
 /* the direct line's area, at the top of the VM bank (the array heap ends
  * below it): an END, the line's code, its constants and strings; the
@@ -102,6 +102,7 @@ static int use_onerr;                             /* STMT marks needed */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
 static uint16_t nsvars, nsarrays, svlist_cap;
+static uint16_t stmt_base, nstmts;  /* where each statement starts (CONT after an error) */
 NOINIT static uint16_t var_off[MAX_VARS];
 static uint16_t desc_off[MAX_ARRAYS];
 static uint16_t str_at;             /* pass 2: the next literal's address */
@@ -1038,6 +1039,7 @@ static void run_pass(void)
   uint16_t at = 0x0801, link, num;
   pc = code_base;
   clen = 0;
+  nstmts = 0;
   nvars = narrays = nfns = 0;
   if (pass == 1) {
     nconsts = nlits = 0;
@@ -1057,6 +1059,8 @@ static void run_pass(void)
     op16(OP_LINE, num);
     for (;;) {
       if (pf->poll) pf->poll(pf->ctx);
+      if (pass == 2) out((uint16_t)(stmt_base + 2 * nstmts), (uint8_t)pc), out((uint16_t)(stmt_base + 2 * nstmts + 1), (uint8_t)(pc >> 8));
+      nstmts++;
       statement();
       if (p >= blen || peek() == 0) break;
       if (peek() == ':') { p++; continue; }
@@ -1124,7 +1128,8 @@ int as816_compile(const Platform *platform, CompileStats *st)
   svlist_base = a;
   svlist_cap = (uint16_t)(nsvars + SV_SPARE);
   salist_base = (uint16_t)(svlist_base + 2 * svlist_cap);
-  fstack_base = (uint16_t)(salist_base + 2 * nsarrays);
+  stmt_base = (uint16_t)(salist_base + 2 * nsarrays);
+  fstack_base = (uint16_t)(stmt_base + 2 * nstmts);
   sstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
   heap_base = (uint16_t)(cstack_base + CSTACK_SIZE);
@@ -1165,7 +1170,7 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[18];
+    uint16_t h = pf->prog_start, vals[21];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
     vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = DIRECT_BASE;
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
@@ -1173,7 +1178,8 @@ int as816_compile(const Platform *platform, CompileStats *st)
     vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
     vals[17] = 0;                          /* direct lines' variables: none yet */
-    for (i = 0; i < 18; i++) {
+    vals[18] = stmt_base, vals[19] = nstmts, vals[20] = const_base;   /* statements; the code's end */
+    for (i = 0; i < 21; i++) {
       out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }

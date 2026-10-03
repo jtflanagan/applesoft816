@@ -310,6 +310,7 @@ vm_error:
         pla
         jmp     handlerr
 @noerr: pla
+        jsr     cont_at_error
         jsr     crdo
         lda     #'?'
         jsr     outdo
@@ -335,6 +336,70 @@ vm_error:
         jsr     strout_y
         jsr     linprt
 @done:  jmp     vm_leave
+
+; cont_at_error: a running program stopped by an error goes on, at CONT,
+; from the start of the statement that failed (NEWSTT keeps OLDTEXT there;
+; OLDLIN stays what STOP/END/Ctrl-C left).  The failing operation's IP is
+; X, or VM_IP when X is not in the code (a handler borrowed it); the
+; statement is the last in the compiler's table (header +$24, +$26) that
+; starts at or before it.
+cont_at_error:
+        lda     CURLIN+1
+        cmp     #$FF
+        beq     @rts8
+        ldy     VM_PROG
+        rep     #$20
+        .a16
+        txa
+        cmp     a:$0000,y       ; the code: from the entry to header +$28
+        bcc     @ip
+        cmp     a:$0028,y
+        bcc     @have
+@ip:    lda     VM_IP
+        cmp     a:$0000,y
+        bcc     @none
+        cmp     a:$0028,y
+        bcs     @none
+@have:  sta     VM_T0
+        lda     a:$0024,y
+        sta     VM_T1
+        lda     a:$0026,y
+        sta     VM_T4           ; hi
+        stz     VM_T3           ; lo: entries below lo start at or before T0
+@bs:    lda     VM_T3
+        cmp     VM_T4
+        bcs     @done
+        clc
+        adc     VM_T4
+        lsr     a
+        sta     VM_T5
+        asl     a
+        clc
+        adc     VM_T1
+        tay
+        lda     a:$0000,y
+        cmp     VM_T0
+        beq     @le
+        bcs     @gt
+@le:    lda     VM_T5
+        inc     a
+        sta     VM_T3
+        bra     @bs
+@gt:    lda     VM_T5
+        sta     VM_T4
+        bra     @bs
+@done:  lda     VM_T3
+        beq     @none
+        dec     a
+        asl     a
+        clc
+        adc     VM_T1
+        tay
+        lda     a:$0000,y
+        sta     VM_CONTIP
+@none:  sep     #$20
+        .a8
+@rts8:  rts
 
 ; LINPRT: CURLIN through FOUT
 linprt: rep     #$20
