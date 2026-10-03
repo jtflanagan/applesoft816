@@ -12,6 +12,7 @@
 #define COUT 0xFDED
 #define GETLN 0xFD6A
 #define HOME 0xFC58
+#define RDKEY 0xFD0C
 #define INPORT 0xFE8B
 #define OUTPORT 0xFE95
 #define CH 0x24

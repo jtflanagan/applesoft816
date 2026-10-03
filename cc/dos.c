@@ -398,6 +398,7 @@ static uint8_t catalog(Cmd *c, int wide)
 #define VMH_OUTBUF 0x1C
 #define IO_WRITE 1
 #define IO_READ 2
+#define IO_EXEC 4
 
 typedef struct {
   uint8_t ref;                      /* 0: free */
@@ -406,8 +407,9 @@ typedef struct {
 } File;
 static File files[RES_NTBUF];
 static uint8_t io_file;             /* files[] + 1 that READ/WRITE is on (0: none) */
+static uint8_t exec_file;           /* files[] + 1 that EXEC reads (0: none) */
 
-static void io_mode(uint8_t m) { poke0((uint16_t)(vm_dp + VM_IOMODE), m); }
+static void io_mode(uint8_t m) { poke0((uint16_t)(vm_dp + VM_IOMODE), (uint8_t)(m | (exec_file ? IO_EXEC : 0))); }
 
 static File *find_file(const uint8_t *full)
 {
@@ -435,6 +437,7 @@ static uint8_t io_flush(void)
 static void close_file(File *f)
 {
   if (!f->ref) return;
+  if (exec_file && &files[exec_file - 1] == f) exec_file = 0, io_mode(0);
   if (io_file && &files[io_file - 1] == f) io_file = 0, io_mode(0);
   close_ref(f->ref);
   f->ref = 0;
@@ -489,34 +492,84 @@ static uint8_t io_start(Cmd *c, uint8_t mode)
   return 0;
 }
 
-/* the VM's WRITE flush, READ line (into $0200, its length in RC_X) and
- * READ character (RC_A): 0, or BASIC.SYSTEM's error */
-uint8_t dos_io(uint8_t req)
+/* the next line of a file (NEWLINE mode on): 7-bit, no CR, a 0 after; its
+ * length, or -1 at the end (or an MLI error in *err) */
+static int16_t read_line(uint8_t ref, uint8_t *line, uint8_t *err)
 {
   ReadParms r;
-  uint8_t e, k, line[240];
-  if (req == 1) return io_flush();
-  if (!io_file) return B_FILE_NOT_OPEN;
-  r.n = 4, r.ref = files[io_file - 1].ref, r.buf = RES_IOBUF, r.trans = 0;
-  if (req == 3) {                         /* GET */
-    r.req = 1;
-    e = mli(MLI_READ, &r, sizeof r);
-    if (e && e != MLI_EOF) return dos_error(e);
-    from0(line, RES_IOBUF, 1);
-    poke0((uint16_t)(vm_dp + VM_RC_A), r.trans ? line[0] : 0x0D);   /* (at the end: no error, as 1.7) */
-    return 0;
-  }
-  r.req = 239;
+  uint8_t e, k;
+  r.n = 4, r.ref = ref, r.buf = RES_IOBUF, r.req = 239, r.trans = 0;
+  *err = 0;
   e = mli(MLI_READ, &r, sizeof r);
-  if (e == MLI_EOF || (!e && !r.trans)) return B_END_OF_DATA;
-  if (e) return dos_error(e);
+  if (e == MLI_EOF || (!e && !r.trans)) return -1;
+  if (e) { *err = e; return -1; }
   from0(line, RES_IOBUF, r.trans);
   k = (uint8_t)r.trans;
   if (k && (line[k - 1] & 0x7F) == 0x0D) k--;
   for (e = 0; e < k; e++) line[e] &= 0x7F;
   line[k] = 0;
-  to0(INBUF, line, (uint16_t)(k + 1));
-  poke0((uint16_t)(vm_dp + VM_RC_X), k);
+  return k;
+}
+
+static void exec_end(void)
+{
+  if (exec_file) close_file(&files[exec_file - 1]);
+}
+
+int dos_execing(void) { return exec_file != 0; }
+
+/* EXEC at the prompt: its next line into line (0 at the file's end: EXEC
+ * is over, the keyboard again) */
+int dos_exec_line(uint8_t *line, uint8_t *len)
+{
+  uint8_t e;
+  int16_t n;
+  if (!exec_file) return 0;
+  n = read_line(files[exec_file - 1].ref, line, &e);
+  if (n < 0) { exec_end(); return 0; }
+  *len = (uint8_t)n;
+  return 1;
+}
+
+/* the VM's WRITE flush, READ line (into $0200, its length in RC_X) and
+ * READ character (RC_A): 0, or BASIC.SYSTEM's error */
+uint8_t dos_io(uint8_t req)
+{
+  ReadParms r;
+  uint8_t e, line[240], ref;
+  int16_t n;
+  int exec = 0;
+  if (req == 1) return io_flush();
+  if (io_file && (peek0((uint16_t)(vm_dp + VM_IOMODE)) & IO_READ)) ref = files[io_file - 1].ref;
+  else if (exec_file) ref = files[exec_file - 1].ref, exec = 1;
+  else return B_FILE_NOT_OPEN;
+  r.n = 4, r.ref = ref, r.buf = RES_IOBUF, r.trans = 0;
+  if (req == 3) {                         /* GET */
+    r.req = 1;
+    e = mli(MLI_READ, &r, sizeof r);
+    if (e && e != MLI_EOF) return dos_error(e);
+    if (!r.trans && exec) {               /* EXEC is over: the keyboard */
+      exec_end();
+      poke0((uint16_t)(vm_dp + VM_RC_A), rom_call(RDKEY));
+      return 0;
+    }
+    from0(line, RES_IOBUF, 1);
+    poke0((uint16_t)(vm_dp + VM_RC_A), r.trans ? line[0] : 0x0D);   /* (at the end: no error, as 1.7) */
+    return 0;
+  }
+  n = read_line(ref, line, &e);
+  if (e) return dos_error(e);
+  if (n < 0) {
+    if (!exec) return B_END_OF_DATA;
+    exec_end();                           /* EXEC is over: the keyboard */
+    poke0(PROMPT, 0x80);
+    rom_call(GETLN);
+    poke0((uint16_t)(vm_dp + VM_RC_X), peek0(RES_X));
+    return 0;
+  }
+  to0(INBUF, line, (uint16_t)(n + 1));
+  poke0((uint16_t)(vm_dp + VM_RC_X), (uint8_t)n);
+  if (exec) crout();                      /* (EXEC shows the Return, not the text) */
   return 0;
 }
 
@@ -542,7 +595,7 @@ void dos_prompt(int after_run)
   io_mode(0);
   if (!after_run) return;
   for (k = 0; k < RES_NTBUF; k++)
-    if (files[k].ref) close_file(&files[k]), any = 1;
+    if (files[k].ref && k + 1 != exec_file) close_file(&files[k]), any = 1;
   if (any) dos_message(B_STILL_OPEN);
 }
 
@@ -584,6 +637,16 @@ static uint8_t command(Cmd *c, int deferred)
       }
     break;
   case C_WRITE: e = io_start(c, IO_WRITE); break;
+  case C_EXEC: {
+    NewlineParms nl;
+    exec_end();
+    if ((e = open_file(c, &f)) != 0) break;
+    nl.n = 3, nl.ref = f->ref, nl.mask = 0x7F, nl.ch = 0x0D;
+    mli(MLI_NEWLINE, &nl, sizeof nl);
+    exec_file = (uint8_t)(f - files + 1);
+    io_mode(0);
+    break;
+  }
   case C_READ: e = io_start(c, IO_READ); break;
   case C_APPEND: {
     uint8_t full[65];
@@ -674,6 +737,10 @@ static uint8_t command(Cmd *c, int deferred)
       if ((e = bload(c, &addr)) == 0) rom_call(addr);
       break;
     }
+    if (info.type == 0x04) {              /* a text file: EXEC it */
+      c->cmd = C_EXEC;
+      return command(c, deferred);
+    }
     e = B_FILE_TYPE;
     break;
   case C_PRN: case C_INN:
@@ -686,7 +753,7 @@ static uint8_t command(Cmd *c, int deferred)
     }
     break;
   case C_FRE: case C_MON: case C_NOMON: break;
-  default: e = B_SYNTAX; break;           /* (EXEC, CHAIN, STORE, RESTORE: next) */
+  default: e = B_SYNTAX; break;           /* (CHAIN, STORE, RESTORE: next) */
   }
   return e ? (uint8_t)(DOS_ERROR | e) : DOS_OK;
 }

@@ -28,6 +28,9 @@ uint8_t dos_io(uint8_t req);
 /* WRITE is on: RESTART's CR goes to the file */
 int dos_writing(void);
 void dos_put_cr(void);
+/* EXEC's next line for the prompt (0: none, the keyboard) */
+int dos_exec_line(uint8_t *line, uint8_t *len);
+int dos_execing(void);
 /* back at the prompt: READ/WRITE off; after a program, FILE(S) STILL OPEN */
 void dos_prompt(int after_run);
 

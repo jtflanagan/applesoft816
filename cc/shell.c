@@ -329,6 +329,7 @@ static uint8_t pending, pending_path[65];
 static int32_t pending_line;
 static int bye;
 static uint8_t ran;                  /* a program ran: FILE(S) STILL OPEN is due */
+static uint8_t from_exec;            /* the line came from EXEC (RUN's CR is not seen) */
 
 void prog_pending(uint8_t what, const uint8_t *p, int32_t line)
 {
@@ -343,7 +344,7 @@ static void run_from(int32_t line)
 {
   say_time = timing;
   ran = 1;
-  crout();                                /* (BASIC.SYSTEM's RUN starts a line) */
+  if (!from_exec) crout();                /* (BASIC.SYSTEM's RUN starts a line) */
   if (line < 0) {
     if (!compile_current()) vm_call(0);
     return;
@@ -649,11 +650,19 @@ void shell(void)
   print("APPLESOFT816 0.1");
   crout();
   while (!bye) {
-    poke0(PROMPT, ']' | 0x80);
-    rom_call(GETLN);
-    len = peek0(RES_X);
-    if (len > 239) len = 239;           /* INLIN's limit */
-    from0(raw, INBUF, len);
+    from_exec = 0;
+    if (dos_execing()) {                  /* EXEC: the prompt and the Return show, */
+      cout(']');                          /* and at its end the keyboard's prompt follows */
+      from_exec = (uint8_t)dos_exec_line(raw, &len);
+      crout();
+    }
+    if (!from_exec) {
+      poke0(PROMPT, ']' | 0x80);
+      rom_call(GETLN);
+      len = peek0(RES_X);
+      if (len > 239) len = 239;           /* INLIN's limit */
+      from0(raw, INBUF, len);
+    }
     for (i = 0; i < len; i++) raw[i] &= 0x7F;
     raw[len] = 0;
     for (i = 0; i < len && raw[i] == ' '; i++) {}

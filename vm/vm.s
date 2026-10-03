@@ -42,7 +42,8 @@ FP_BUF   = $FD
 FP_TXT   = $FA
 ; the VM's
 VM_IOMODE = $10         ; 1: text files (the shell sets it): bit 0 WRITE (OUTDO to the
-                        ;    file), bit 1 READ (INPUT/GET from the file)
+                        ;    file), bit 1 READ (INPUT/GET from the file), bit 2 EXEC
+                        ;    (INPUT/GET from the EXEC file, unless READ)
 VM_IOQUIET = $11        ; 1: an INPUT/GET reading a file: nothing shows (prompts, echo)
 VM_CBREQ = $12          ; 1: what the shell is called for: 0 a command, 1 out_buf to the
                         ;    file, 2 a line into $0200 (length in RC_X), 3 a key (RC_A)
@@ -2551,8 +2552,8 @@ vchrgot:
 
 ; INLIN ($D52C): GETLN with prompt $80; at most 239 characters; a 0 after;
 ; the high bits off.  The text pointer is left at $01FF.
-inlin:  lda     VM_IOMODE       ; READ: the line from the file (the shell)
-        and     #$02
+inlin:  lda     VM_IOMODE       ; READ, EXEC: the line from the file (the shell)
+        and     #$06
         beq     @kbd
         lda     #2
         sta     VM_CBREQ
@@ -2671,8 +2672,8 @@ op_item:
         and     #$40
         beq     @more_input
         ; GET: a key into $0200, the text pointer before it
-        lda     VM_IOMODE       ; READ: the file's next character
-        and     #$02
+        lda     VM_IOMODE       ; READ, EXEC: the file's next character
+        and     #$06
         beq     @key
         lda     #3
         sta     VM_CBREQ
