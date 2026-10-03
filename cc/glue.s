@@ -371,3 +371,57 @@ fl_end:
         lda     __rc2
         ldx     __rc3
         rts
+
+; cmd_entry: the VM's JSL for a CHR$(4) command (vm/vm.s outdo), with A =
+; this data bank, D = the VM's page, DBR = its bank, M = 1, X = 0.  C's
+; registers come back into page zero (the VM had the machine's there) for
+; vm_command(); its answer goes back in A.  Everything else as it was.
+cmd_entry:
+        php
+        phb
+        phd
+        phx
+        phy
+        pha
+        plb
+        .byte   0xf4                    ; pea 0
+        .short  0
+        pld
+        sep     #0x30
+        jsr     zp_swap
+        jsr     vm_command
+        sta     mos16(cmd_answer)
+        jsr     zp_swap
+        lda     mos16(cmd_answer)
+        rep     #0x10
+        ply
+        plx
+        pld
+        plb
+        plp
+        rtl
+
+; void vm_hook(void): tell the VM (its page: VM_CMDDBR, VM_CMDVEC) where
+; cmd_entry is
+        .global vm_hook
+vm_hook:
+        lda     mos16(vm_dp)
+        sta     __rc2
+        lda     mos16(vm_dp+1)
+        sta     __rc3
+        stz     __rc4
+        phb                             ; VM_CMDDBR ($1A): this data bank
+        pla
+        ldy     #0x1a
+        sta     [__rc2],y
+        lda     #mos16lo(cmd_entry)     ; VM_CMDVEC ($1B): this bank's cmd_entry
+        iny
+        sta     [__rc2],y
+        lda     #mos16hi(cmd_entry)
+        iny
+        sta     [__rc2],y
+        phk
+        pla
+        iny
+        sta     [__rc2],y
+        rts

@@ -41,6 +41,12 @@ FP_INT   = $F8
 FP_BUF   = $FD
 FP_TXT   = $FA
 ; the VM's
+VM_CMDLEN = $18         ; 1: a CHR$(4) command being gathered: its length ($FF: none)
+VM_LASTCR = $19         ; 1: the last character out was a return (a Ctrl-D starts a command)
+VM_CMDDBR = $1A         ; 1: the shell's data bank, for its command entry
+VM_CMDVEC = $1B         ; 3: the shell's command entry (JSL; bank 0: no shell, Ctrl-D prints)
+VM_CH    = $1E          ; 1: outdo's character, 7-bit
+VM_CHRAW = $1F          ; 1: ... as it came
 VM_IP    = $20          ; 2: IP saved across calls
 VM_FSP   = $22          ; 2: expression stack pointer (grows up)
 VM_CSP   = $24          ; 2: control stack pointer (FOR/GOSUB frames, grows up)
@@ -155,6 +161,7 @@ GOSUB_SIZE  = 5         ; return IP 2, line 2, mark 1
         .word   msgtab          ; +$14
         .word   fp_table        ; +$16  fp816's jump table (fp.s), for the platform's FIN
         .word   vm_direct       ; +$18  JSL here for a direct line (see vm_direct)
+        .word   cmd_buf         ; +$1A  a CHR$(4) command for the shell: length, then text
 
         .segment "CODE"
 
@@ -264,6 +271,18 @@ vm_setup:
         sta     cout_target+2
         sta     romcall_target+2
         sta     RC_TGT+2
+        rep     #$20            ; the shell's command entry
+        .a16
+        lda     VM_CMDVEC
+        sta     cmd_target
+        sep     #$20
+        .a8
+        lda     VM_CMDVEC+2
+        sta     cmd_target+2
+        lda     #$FF            ; no command being gathered; a line starts
+        sta     VM_CMDLEN
+        lda     #1
+        sta     VM_LASTCR
         rts
 
 ; leave: VM_ERR set
@@ -368,8 +387,69 @@ msg_break:
 
 ; OUTDO: A = the character; high bit set, FLASH applied to printables, COUT,
 ; then the monitor's WAIT with SPEEDZ.  A, X, Y kept.
+;
+; With a shell (VM_CMDVEC), BASIC.SYSTEM's commands first: a Ctrl-D as the
+; first character of a line starts one, the return ends it; none of it is
+; printed.  The shell runs it (cmd_tramp: A = 0 on, else leave: VM_ERR $FC).
 outdo:  pha
         phy
+        sta     VM_CHRAW
+        lda     VM_CMDVEC+2
+        beq     @show
+        lda     VM_CHRAW
+        and     #$7F
+        sta     VM_CH
+        lda     VM_CMDLEN
+        cmp     #$FF
+        beq     @line
+        lda     VM_CH           ; gathering a command
+        cmp     #$0D
+        beq     @run
+        lda     VM_CMDLEN
+        cmp     #$FE
+        bcs     @done           ; (too long: the rest is dropped)
+        rep     #$20
+        .a16
+        and     #$00FF
+        tay
+        sep     #$20
+        .a8
+        lda     VM_CH
+        sta     cmd_buf+1,y
+        inc     VM_CMDLEN
+        bra     @done
+@run:   lda     VM_CMDLEN
+        sta     cmd_buf
+        lda     #$FF
+        sta     VM_CMDLEN
+        lda     #1
+        sta     VM_LASTCR
+        lda     VM_CMDDBR
+        phk
+        jsr     cmd_tramp
+        cmp     #0
+        beq     @done
+        lda     #$FC            ; the shell takes over (RUN another, ...)
+        sta     VM_ERR
+        jmp     vm_leave
+@line:  lda     VM_CH
+        cmp     #$04
+        bne     @plain
+        lda     VM_LASTCR
+        beq     @plain
+        stz     VM_CMDLEN       ; a command starts
+        bra     @done
+@plain: stz     VM_LASTCR
+        cmp     #$0D
+        bne     @show
+        inc     VM_LASTCR
+@show:  lda     VM_CHRAW
+        jmp     outdo_show
+@done:  ply
+        pla
+        rts
+
+outdo_show:
         ora     #$80
         cmp     #$A0
         bcc     @raw
@@ -388,6 +468,11 @@ outdo:  pha
 cout_tramp:
         .byte   $5C             ; JML long
 cout_target:
+        .faraddr 0
+
+cmd_tramp:
+        .byte   $5C
+cmd_target:
         .faraddr 0
 
 romcall_tramp:
@@ -3477,5 +3562,9 @@ op_resume:
         jmp     ($0000,x)
 
 ; ---- the end of the VM: the program image the compiler writes starts here
+; a CHR$(4) command for the shell (outdo): its length, then its text
+cmd_buf:
+        .res    256
+
         .segment "TAIL"
 prog_start:

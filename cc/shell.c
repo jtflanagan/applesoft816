@@ -42,6 +42,7 @@
 #define VM_DENTRY 0xE6
 #define VM_FRESH 0xE8
 #define VMH_DIRECT 0x18
+#define VMH_CMDBUF 0x1A
 
 static uint8_t raw[256];             /* the line typed, 7-bit, 0 after (INLIN's) */
 static uint8_t line[256];            /* the same, upper case: the shell's commands */
@@ -412,9 +413,25 @@ static int compile_current(void)
   return 0;
 }
 
+static uint8_t pending;               /* a CHR$(4) RUN (1) or LOAD (2) for after the VM */
+static int word(const char *w, uint8_t *after);
+static int is_digit(uint8_t c);
+
+/* after the VM: what a program's CHR$(4) RUN or LOAD asked for */
+static void after_vm(void)
+{
+  uint8_t what, e;
+  while ((what = pending) != 0) {
+    pending = 0;
+    if ((e = load_program()) != 0) { error(e); return; }
+    if (what == 1 && !compile_current()) vm_call(0);
+  }
+}
+
 static void run_current(void)
 {
   if (!compile_current()) vm_call(0);
+  after_vm();
 }
 
 /* ---- the program in memory: lines in, out, listed ---- */
@@ -694,6 +711,55 @@ static void direct_line(void)
   poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)entry);
   poke0((uint16_t)(vm_dp + VM_DENTRY + 1), (uint8_t)(entry >> 8));
   vm_call(vm_read16(VMH_DIRECT));
+  after_vm();
+}
+
+/* ---- CHR$(4) commands from a running program: vm_command, called by the
+ * VM (glue.s cmd_entry) with the command in its buffer; 0 to go on, else
+ * the program stops (and a RUN or LOAD is pending) ---- */
+uint8_t cmd_answer;
+
+static void port(uint16_t rom, uint8_t at)
+{
+  uint8_t n = 0;
+  while (at < len && line[at] == ' ') at++;
+  while (at < len && is_digit(line[at])) n = (uint8_t)(n * 10 + (line[at++] - '0'));
+  poke0(RES_A, n);
+  rom_call(rom);
+}
+
+uint8_t vm_command(void)
+{
+  uint8_t n, i, k;
+  uint16_t b = vm_read16(VMH_CMDBUF);
+  xfer_far = (vm_base | b) - 1, xfer_near = (uint16_t)((uint16_t)&n - 1), xfer_n = 1;
+  far_in();
+  xfer_far = (vm_base | (uint16_t)(b + 1)) - 1, xfer_near = (uint16_t)((uint16_t)raw - 1), xfer_n = n;
+  if (n) far_in();
+  for (k = 0; k < n && raw[k] == ' '; k++) {}
+  len = 0;
+  for (i = k; i < n; i++) {
+    uint8_t c = raw[i] & 0x7F;
+    line[len++] = c >= 'a' && c <= 'z' ? (uint8_t)(c - 32) : c;
+  }
+  line[len] = 0;
+  if (!len) return 0;
+  if (word("CATALOG", &i) || word("CAT", &i)) { catalog(i); return 0; }
+  if (word("PR#", &i)) { port(0xFE95, i); return 0; }      /* OUTPORT */
+  if (word("IN#", &i)) { port(0xFE8B, i); return 0; }      /* INPORT */
+  if (word("NOMON", &i) || word("MON", &i)) return 0;
+  if (word("-", &i) || word("RUN", &i)) {
+    if (!set_path(i)) { error(0x80); return 1; }
+    pending = 1;
+    return 1;
+  }
+  if (word("LOAD", &i)) {
+    if (!set_path(i)) { error(0x80); return 1; }
+    pending = 2;
+    return 1;
+  }
+  error(0x80);
+  return 1;
 }
 
 /* an AppleSoft line: numbered, into the program; else at once */
@@ -755,6 +821,7 @@ void shell(void)
   far_hash();
   vm_print = hash_acc;
   new_program();
+  vm_hook();
   print("APPLESOFT816 0.1");
   crout();
   for (;;) {
