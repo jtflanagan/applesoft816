@@ -17,7 +17,10 @@
 //   RDKEY  $FD0C  the next key of the script, high bit set
 //   WAIT   $FCA8  SPEED='s per-character delay: returns at once
 //   HOME $FC58, CLREOP $FC42, CLREOL $FC9C, VTAB $FC22: recorded as markers
-//                 ($01 'H'/'P'/'L', $01 'V' row) and the cursor moved
+//                 ($01 'H'/'P'/'L', $01 'V' row) and the screen and cursor
+//                 kept as COUT1 would
+//   SETWND $FB4B  TEXT's and GR's window (the GS sends it to the firmware):
+//                 the IIe's - top = A, full width, bottom 24, CV = 23 ($01 'W')
 // $C000 reads "no key"; $C0xx otherwise reads 0 and holds nothing.  A jump
 // into the firmware banks stops the run and names the last monitor entry.
 //
@@ -31,7 +34,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -43,11 +48,12 @@ extern "C" {
 namespace {
 
 constexpr uint16_t COUT = 0xFDED, RDKEY = 0xFD0C, GETLN = 0xFD6A, MONWAIT = 0xFCA8, HOME = 0xFC58,
-                   CLREOP = 0xFC42, CLREOL = 0xFC9C, VTAB = 0xFC22, BASIC_COLD = 0xE000, RESTART = 0xD43C;
+                   CLREOP = 0xFC42, CLREOL = 0xFC9C, VTAB = 0xFC22, SETWND = 0xFB4B, BASIC_COLD = 0xE000,
+                   RESTART = 0xD43C;
 constexpr int CH = 0x24, CV = 0x25, WNDLFT = 0x20, WNDWDTH = 0x21, WNDTOP = 0x22, WNDBTM = 0x23;
 
 // where the VM goes (any bank and pages would do)
-constexpr uint32_t VM_BANK = 0x050000, VM_DP = 0x9800, VM_STUB = 0x9900, SCRATCH = 0x0400, CALL_AT = 0x0300;
+constexpr uint32_t VM_BANK = 0x050000, VM_DP = 0x9800, VM_STUB = 0x9900, SCRATCH = 0x9A00, CALL_AT = 0x9B80;
 constexpr uint8_t STRING_BANK = 0x06;
 // its direct page (vm.s / fp.s)
 constexpr int DP_SH_BANK = 0x48, DP_COUT_VEC = 0x2A, DP_FLASH = 0x2D, DP_SPEED = 0x2E, DP_ERR = 0x2F, DP_RNDSEED = 0xC9,
@@ -90,7 +96,10 @@ struct Machine {
   uint32_t last_monitor = 0;
   const char* why = "instruction limit";
   std::function<void()> on_getln_first; // ROM mode: install the program
+  std::vector<uint8_t> screen;           // the text page when the program ended
+  void snap() { if (screen.empty()) screen.assign(&c.mem[0x400], &c.mem[0x800]); }
   long long trace = 0;                   // GSRUN_TRACE=n: the VM run's first n instructions
+  std::map<uint32_t, long>* hist = nullptr; // GSRUN_HIST: where the VM run spent its instructions
 
   explicit Machine(const std::vector<uint8_t>& rom)
   {
@@ -101,17 +110,53 @@ struct Machine {
       return false;
     };
     c.on_write = [](uint32_t a, uint8_t) { return a >= 0xC000 && a <= 0xFFFF; };
-    // the monitor's text window, as INIT leaves it
+    // the monitor's text window and a clear screen, as INIT leaves them
     c.mem[WNDLFT] = 0, c.mem[WNDWDTH] = 40, c.mem[WNDTOP] = 0, c.mem[WNDBTM] = 24;
+    c.mem[0x32] = 0xFF; // INVFLG: normal
+    for (int a = 0x400; a < 0x800; a++) c.mem[a] = 0xA0;
   }
 
   void record(uint8_t b) { if (recording && !done) out.push_back(b); }
+
+  // the text page as the monitor keeps it: row r's address, the window's left
+  // edge added (BASL), CH counting from there
+  uint32_t row(int r) { return 0x400 + (r & 7) * 0x80 + (r >> 3) * 0x28 + c.mem[WNDLFT]; }
+  void clear_line(int r, int from)
+  {
+    for (int x = from; x < c.mem[WNDWDTH]; x++) c.mem[row(r) + x] = 0xA0;
+  }
+  void line_feed()
+  {
+    if (++c.mem[CV] < c.mem[WNDBTM]) return;
+    c.mem[CV] = uint8_t(c.mem[WNDBTM] - 1);
+    for (int r = c.mem[WNDTOP]; r + 1 < c.mem[WNDBTM]; r++) // SCROLL
+      for (int x = 0; x < c.mem[WNDWDTH]; x++) c.mem[row(r) + x] = c.mem[row(r + 1) + x];
+    clear_line(c.mem[WNDBTM] - 1, 0);
+  }
+  // COUT1 ($FDF0): printable characters through INVFLG onto the screen,
+  // CR, LF, BS, BELL
   void cout(uint8_t ch)
   {
     record(ch);
-    if ((ch & 0x7F) == 0x0D) c.mem[CH] = c.mem[WNDLFT], c.mem[CV]++;
-    else if (++c.mem[CH] >= c.mem[WNDWDTH]) c.mem[CH] = c.mem[WNDLFT], c.mem[CV]++;
-    if (c.mem[CV] >= c.mem[WNDBTM]) c.mem[CV] = c.mem[WNDBTM] - 1; // scrolled
+    uint8_t b = ch | 0x80;
+    if (b >= 0xA0) {
+      c.mem[row(c.mem[CV]) + c.mem[CH]] = b & c.mem[0x32];
+      if (++c.mem[CH] >= c.mem[WNDWDTH]) c.mem[CH] = 0, line_feed();
+      return;
+    }
+    switch (b) {
+    case 0x8D: c.mem[CH] = 0; line_feed(); break;
+    case 0x8A: line_feed(); break;
+    case 0x88:
+      if (c.mem[CH] > 0) c.mem[CH]--;
+      else if (c.mem[CV] > c.mem[WNDTOP]) c.mem[CH] = uint8_t(c.mem[WNDWDTH] - 1), c.mem[CV]--;
+      break;
+    }
+  }
+  void home()
+  {
+    for (int r = c.mem[WNDTOP]; r < c.mem[WNDBTM]; r++) clear_line(r, 0);
+    c.mem[CH] = 0, c.mem[CV] = c.mem[WNDTOP];
   }
   bool next_key(uint8_t& k)
   {
@@ -137,10 +182,21 @@ struct Machine {
     case MONWAIT: c.sim_rts(); return true;
     case HOME: case CLREOP: case CLREOL:
       record(0x01), record(pc == HOME ? 'H' : pc == CLREOP ? 'P' : 'L');
-      if (pc == HOME) c.mem[CH] = c.mem[WNDLFT], c.mem[CV] = c.mem[WNDTOP];
+      if (pc == HOME) home();
+      else {
+        clear_line(c.mem[CV], c.mem[CH]);
+        if (pc == CLREOP)
+          for (int r = c.mem[CV] + 1; r < c.mem[WNDBTM]; r++) clear_line(r, 0);
+      }
       c.sim_rts();
       return true;
     case VTAB: record(0x01), record('V'), record(c.mem[CV]); c.sim_rts(); return true;
+    case SETWND:
+      c.mem[WNDTOP] = uint8_t(c.a()), c.mem[WNDLFT] = 0, c.mem[WNDWDTH] = 40, c.mem[WNDBTM] = 24;
+      c.mem[CV] = 23;
+      record(0x01), record('W'), record(c.mem[WNDTOP]);
+      c.sim_rts();
+      return true;
     case GETLN: {
       if (on_getln_first) { auto f = on_getln_first; on_getln_first = nullptr; f(); }
       cout(c.mem[0x33]); // the prompt
@@ -177,12 +233,14 @@ struct Machine {
     uint8_t stub[] = {0x22, uint8_t(entry), uint8_t(entry >> 8), uint8_t(entry >> 16), 0xDB};
     memcpy(&c.mem[CALL_AT], stub, sizeof stub);
     c.reset_regs();
-    c.set_regs(0, 0, 0, 0x01FF, dp, 0, 0x30, false);
+    // S below $01FC, as AppleSoft keeps it: INPUT puts a ',' at $01FF
+    c.set_regs(0, 0, 0, 0x01FB, dp, 0, 0x30, false);
     c.set_pc(CALL_AT);
     for (long long n = 0; n < max; n++) {
       if (trace > 0 && n < trace)
         fprintf(stderr, "%06X a=%04X x=%04X y=%04X s=%04X d=%04X b=%02X p=%02X\n", c.pc(), c.a(), c.x(), c.y(),
                 c.s(), c.d(), c.dbr(), c.p());
+      if (hist) (*hist)[c.pc()]++;
       if (!step()) return c.halted();
     }
     return false;
@@ -229,9 +287,22 @@ void show(const std::vector<uint8_t>& out)
 {
   for (size_t i = 0; i < out.size(); i++) {
     uint8_t b = out[i];
+    if (b == 0x01 && i + 1 < out.size() && out[i + 1] == 'S' && i + 2 + 1024 <= out.size()) {
+      printf("\n---- the screen at the end ----\n");
+      for (int r = 0; r < 24; r++) {
+        for (int x = 0; x < 40; x++) {
+          uint8_t ch = out[i + 2 + (r & 7) * 0x80 + (r >> 3) * 0x28 + x] & 0x7F;
+          putchar(ch < 0x20 ? ch + 0x40 : ch);
+        }
+        putchar('\n');
+      }
+      i += 1 + 1024;
+      continue;
+    }
     if (b == 0x01 && i + 1 < out.size()) {
       char k = char(out[++i]);
       if (k == 'V' && i + 1 < out.size()) printf("{VTAB %d}", out[++i] + 1);
+      else if (k == 'W' && i + 1 < out.size()) printf("{WINDOW TOP %d}", out[++i]);
       else printf("{%s}", k == 'H' ? "HOME" : k == 'P' ? "CLREOP" : "CLREOL");
       continue;
     }
@@ -291,8 +362,11 @@ int main(int argc, char** argv)
     uint64_t start = 0;
     for (long long n = 0; n < max_insns; n++) {
       uint32_t pc = m.c.pc();
-      if (!m.recording && m.kpos == 4 && pc != GETLN) m.recording = true, start = m.c.cycles; // RUN is in
-      if (pc == RESTART && m.recording && !m.done) m.done = true, run_cycles = m.c.cycles - start;
+      if (!m.recording && m.kpos == 4 && pc != GETLN) { // RUN is in: from a clear screen, as the VM
+        m.recording = true, start = m.c.cycles;
+        m.home();
+      }
+      if (pc == RESTART && m.recording && !m.done) m.done = true, run_cycles = m.c.cycles - start, m.snap();
       if (!m.step()) break;
     }
   } else {
@@ -326,8 +400,17 @@ int main(int argc, char** argv)
             st.lines, st.code_size, st.vars, st.arrays, st.consts);
     m.recording = true;
     if (getenv("GSRUN_TRACE")) m.trace = atoll(getenv("GSRUN_TRACE"));
+    std::map<uint32_t, long> hist;
+    if (getenv("GSRUN_HIST")) m.hist = &hist;
     uint64_t start = m.c.cycles;
     m.call_native(VM_BANK, uint16_t(VM_DP), max_insns);
+    if (m.hist) {
+      std::vector<std::pair<long, uint32_t>> v;
+      for (auto& [k, n] : hist) v.push_back({n, k});
+      std::sort(v.rbegin(), v.rend());
+      for (size_t i = 0; i < 20 && i < v.size(); i++)
+        fprintf(stderr, "  %06X %ld (VM %04X)\n", v[i].second, v[i].first, (v[i].second & 0xFFFF) - 0x18);
+    }
     run_cycles = m.c.cycles - start;
     if (m.c.halted()) {
       uint8_t e = dp[DP_ERR];
@@ -335,7 +418,11 @@ int main(int argc, char** argv)
     }
   }
 
-  fprintf(stderr, "gsrun: %s; %zu output bytes; %llu cycles in the program\n", m.why, m.out.size(),
+  // the text / lo-res page when the program ended, compared too
+  m.snap();
+  m.out.push_back(0x01), m.out.push_back('S');
+  m.out.insert(m.out.end(), m.screen.begin(), m.screen.end());
+  fprintf(stderr, "gsrun: %s; %zu output bytes; %llu cycles in the program\n", m.why, m.out.size() - 1026,
           (unsigned long long)run_cycles);
   if (out_path) {
     FILE* f = fopen(out_path, "wb");

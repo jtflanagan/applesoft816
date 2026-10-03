@@ -1,0 +1,2 @@
+10 ON 2 GOTO 20,99
+20 PRINT "X"

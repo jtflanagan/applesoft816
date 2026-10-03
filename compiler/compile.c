@@ -22,6 +22,12 @@
 enum {
   T_END = 0x80, T_FOR = 0x81, T_NEXT = 0x82, T_DATA = 0x83, T_INPUT = 0x84, T_DIM = 0x86, T_READ = 0x87,
   T_RESTORE = 0xAE, T_GET = 0xBE, T_LET = 0xAA, T_GOTO = 0xAB,
+  T_GR = 0x88, T_TEXT = 0x89, T_PRN = 0x8A, T_INN = 0x8B, T_CALL = 0x8C, T_PLOT = 0x8D, T_HLIN = 0x8E,
+  T_VLIN = 0x8F, T_HTAB = 0x96, T_HOME = 0x97, T_TRACE = 0x9B, T_NOTRACE = 0x9C, T_NORMAL = 0x9D,
+  T_INVERSE = 0x9E, T_FLASH = 0x9F, T_COLOR = 0xA0, T_POP = 0xA1, T_VTAB = 0xA2, T_HIMEM = 0xA3,
+  T_LOMEM = 0xA4, T_ONERR = 0xA5, T_RESUME = 0xA6, T_SPEED = 0xA9, T_RUN = 0xAC, T_STOP = 0xB3,
+  T_ON = 0xB4, T_WAIT = 0xB5, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
+  T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
   T_MUL = 0xCA, T_DIV = 0xCB, T_POW = 0xCC, T_AND = 0xCD, T_OR = 0xCE,
@@ -40,7 +46,8 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 24
+#define HEADER_SIZE 34
+#define MAX_FNS 64
 
 typedef struct { uint16_t num, addr; } Line;
 typedef struct { uint8_t c1, c2, type; } Var;              /* type: 0 real, 1 integer, 2 string */
@@ -63,6 +70,9 @@ static uint16_t str_bytes;          /* string literal pool size, this pass */
 
 /* the layout, fixed after pass 1 */
 static uint16_t data_base, data_bytes, data_at;   /* the DATA pool */
+static Var fns[MAX_FNS];                          /* DEF FN names */
+static uint16_t nfns, fn_base, desc_copy_base, desc_bytes;
+static int use_onerr;                             /* STMT marks needed */
 static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
     sstack_base, cstack_base, heap_base;
 static uint16_t nsvars, nsarrays;
@@ -152,6 +162,20 @@ static uint16_t const_slot(const uint8_t fac[7])
     memcpy(consts[nconsts++], fac, 7);
   }
   return (uint16_t)(const_base + 7 * i);
+}
+
+/* a DEF FN's table entry (4 bytes, among the variables: CLEAR forgets it) */
+static uint16_t fn_slot(uint8_t c1, uint8_t c2)
+{
+  uint16_t i;
+  for (i = 0; i < nfns; i++)
+    if (fns[i].c1 == c1 && fns[i].c2 == c2) break;
+  if (i == nfns) {
+    if (nfns == MAX_FNS) { overflow = 1; return 0; }
+    fns[nfns].c1 = c1, fns[nfns].c2 = c2, fns[nfns].type = 0;
+    nfns++;
+  }
+  return pass == 2 ? (uint16_t)(fn_base + 4 * i) : 0;
 }
 
 /* a string literal: length byte, then the text */
@@ -377,6 +401,36 @@ static int element(Pending *pend, int *np)
       p = q < blen && buf[q] == '"' ? q + 1 : q;
       return TY_STR;
     }
+    if (c == T_FN) {                       /* FUNCT: FN name(argument) */
+      Name nm;
+      p++;
+      if (!read_name(&nm) || nm.type != 0 || !nm.is_array) { error_here(E_SYNTAX); return TY_ERR; }
+      if (!paren_arg(TY_NUM)) return TY_ERR;
+      op16(OP_FNCALL, fn_slot(nm.c1, nm.c2));
+      return TY_NUM;
+    }
+    if (c == T_SCRN) {                     /* SCRN(x,y): PLOTFNS */
+      int t;
+      p++;
+      if ((t = expr()) != TY_NUM) { if (t != TY_ERR) error_here(E_TYPE_MISMATCH); return TY_ERR; }
+      op(OP_BYTEPUSH), emit8(1);
+      if (next() != ',') { error_here(E_SYNTAX); return TY_ERR; }
+      if ((t = expr()) != TY_NUM) { if (t != TY_ERR) error_here(E_TYPE_MISMATCH); return TY_ERR; }
+      if (next() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+      op(OP_SCRN);
+      return TY_NUM;
+    }
+    if (c == T_POS || c == T_PEEK) {
+      int t;
+      p++;
+      if (peek() != '(') { error_here(E_SYNTAX); return TY_ERR; }
+      p++;
+      if ((t = expr()) == TY_ERR) return t;
+      if (c == T_PEEK && t != TY_NUM) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
+      if (next() != ')') { error_here(E_SYNTAX); return TY_ERR; }
+      op(c == T_POS ? OP_POS : OP_PEEK);
+      return TY_NUM;
+    }
     if (c >= T_SGN && c <= 0xEA) {         /* functions */
       static const uint8_t fn_of[] = {     /* T_SGN.. : FN number, or $FF not one of these */
         FN_SGN, FN_INT, FN_ABS, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, FN_SQR, FN_RND, FN_LOG, FN_EXP,
@@ -467,6 +521,9 @@ static int expr(void)
 }
 
 /* ---- statements ---- */
+static int num_then(int o);
+static int want(uint8_t c);
+
 static void st_print(void)
 {
   int last_was_item = 0;
@@ -476,6 +533,13 @@ static void st_print(void)
     int t;
     if (c == ';') { p++; last_was_item = 0; continue; }
     if (c == ',') { p++; op(OP_PRCOMMA); last_was_item = 0; continue; }
+    if (c == T_TABP || c == T_SPCP) {       /* GTBYTC, ')', the spaces; no CR after */
+      p++;
+      if (!num_then(-1) || !want(')')) return;
+      op(c == T_TABP ? OP_TAB : OP_SPC);
+      last_was_item = 0;
+      continue;
+    }
     t = expr();
     if (t == TY_ERR) return;
     op(t == TY_STR ? OP_SPRINT : OP_PRNUM);
@@ -523,6 +587,8 @@ static void st_goto(int opcode)
 }
 
 static void statement(void);
+static int num_then(int o);
+static int want(uint8_t c);
 
 static void st_if(void)
 {
@@ -644,10 +710,75 @@ static void st_input(void)
   input_items();
 }
 
+/* a numeric expression then an operation (COLOR= HTAB VTAB ...) */
+static int num_then(int o)
+{
+  int t = expr();
+  if (t == TY_ERR) return 0;
+  if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return 0; }
+  if (o >= 0) op(o);
+  return 1;
+}
+
+static int want(uint8_t c)
+{
+  if (next() != c) { error_here(E_SYNTAX); return 0; }
+  return 1;
+}
+
+static void st_on(void)
+{
+  uint8_t tok, k = 0;
+  uint16_t at, nums[256];
+  if (!num_then(-1)) return;
+  tok = next();
+  if (tok != T_GOTO && tok != T_GOSUB) { error_here(E_SYNTAX); return; }
+  for (;;) {
+    int r = read_linenum(&nums[k]);
+    if (r <= 0) { error_here(E_SYNTAX); return; }
+    k++;
+    if (peek() != ',' || k == 255) break;
+    p++;
+  }
+  op(OP_ON), emit8(k), emit8(tok == T_GOSUB);
+  for (at = 0; at < k; at++) emit16(line_addr(nums[at]));
+}
+
+static void st_def(void)
+{
+  Name fn, prm;
+  uint16_t entry, skip_at;
+  int t;
+  if (!want(T_FN)) return;
+  if (!read_name(&fn) || fn.type != 0 || !fn.is_array) { error_here(E_SYNTAX); return; }
+  p++;                                     /* '(' */
+  if (!read_name(&prm) || prm.type != 0 || prm.is_array) { error_here(E_SYNTAX); return; }
+  if (!want(')') || !want(T_EQ)) return;
+  entry = fn_slot(fn.c1, fn.c2);
+  op16(OP_DEFFN, entry);
+  emit16(var_slot(prm.c1, prm.c2, 0));
+  skip_at = pc;
+  emit16(0);                               /* past the body: patched below */
+  t = expr();
+  if (t == TY_ERR) return;
+  if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return; }
+  op(OP_FNRET);
+  if (pass == 2) pf->wr(pf->ctx, skip_at, (uint8_t)pc), pf->wr(pf->ctx, (uint16_t)(skip_at + 1), (uint8_t)(pc >> 8));
+}
+
+/* PLOT/HLIN/VLIN's coordinates: e (checked < 80 when r), pushed */
+static int coord(int r)
+{
+  if (!num_then(-1)) return 0;
+  op(OP_BYTEPUSH), emit8((uint8_t)r);
+  return 1;
+}
+
 static void statement(void)
 {
   uint8_t c = peek();
   if (c == 0 || c == ':') return;
+  if (use_onerr) op(OP_STMT);
   if (is_letter(c)) { st_let(); return; }
   p++;
   switch (c) {
@@ -667,6 +798,58 @@ static void statement(void)
   case T_READ: op(OP_READSTART); input_items(); return;
   case T_GET: op(OP_GETSTART); input_items(); return;
   case T_RESTORE: op(OP_RESTORE); return;
+  case T_ON: st_on(); return;
+  case T_POP: op(OP_POP); return;
+  case T_DEF: st_def(); return;
+  case T_POKE: if (num_then(OP_ADR) && want(',')) num_then(OP_POKE); return;
+  case T_WAIT:
+    if (!num_then(OP_ADR) || !want(',') || !coord(0)) return;
+    if (peek() == ',') { p++; if (!coord(0)) return; }
+    else {
+      static const uint8_t zero[7] = {0};
+      op16(OP_LDC, const_slot(zero));
+      op(OP_BYTEPUSH), emit8(0);
+    }
+    op(OP_WAIT);
+    return;
+  case T_CALL: num_then(OP_CALL); return;
+  case T_PRN: num_then(OP_PRN); return;
+  case T_INN: num_then(OP_INN); return;
+  case T_HTAB: num_then(OP_HTAB); return;
+  case T_VTAB: num_then(OP_VTAB); return;
+  case T_COLOR: num_then(OP_COLOR); return;
+  case T_SPEED: num_then(OP_SPEED); return;
+  case T_HOME: op(OP_HOME); return;
+  case T_NORMAL: op(OP_NORMAL); return;
+  case T_INVERSE: op(OP_INVERSE); return;
+  case T_FLASH: op(OP_FLASH); return;
+  case T_TRACE: op(OP_TRACE); return;
+  case T_NOTRACE: op(OP_NOTRACE); return;
+  case T_TEXT: op(OP_TEXT); return;
+  case T_GR: op(OP_GR); return;
+  case T_CLEAR: op(OP_CLEAR); return;
+  case T_STOP: op(OP_STOP); return;
+  case T_RESUME: op(OP_RESUME); return;
+  case T_LOMEM: num_then(OP_LOMEM); return;
+  case T_HIMEM: num_then(OP_HIMEM); return;
+  case T_PLOT: if (coord(1) && want(',')) num_then(OP_PLOT); return;
+  case T_HLIN: if (coord(1) && want(',') && coord(0) && want(T_AT)) num_then(OP_HLIN); return;
+  case T_VLIN: if (coord(1) && want(',') && coord(0) && want(T_AT)) num_then(OP_VLIN); return;
+  case T_RUN: {
+    uint16_t n;
+    int r = read_linenum(&n);
+    if (r < 0) { error_here(E_SYNTAX); return; }
+    if (r == 0) op16(OP_RUN, code_base);
+    else jump_to(OP_RUN, n);
+    return;
+  }
+  case T_ONERR: {
+    uint16_t n;
+    if (!want(T_GOTO) || read_linenum(&n) <= 0) { error_here(E_SYNTAX); return; }
+    jump_to(OP_ONERR, n);
+    p = blen;                              /* REMN: the rest of the line is skipped */
+    return;
+  }
   default:
     op16(OP_ERR, c < 0x80 ? E_SYNTAX : E_UNIMPLEMENTED);
     skip_statement();
@@ -690,7 +873,7 @@ static void run_pass(void)
 {
   uint16_t at = 0x0801, link, num;
   pc = code_base;
-  nvars = narrays = nconsts = 0;
+  nvars = narrays = nconsts = nfns = 0;
   str_bytes = 0;
   str_at = str_base;
   data_bytes = 1;                         /* the pool's leading 0 */
@@ -719,11 +902,27 @@ static void run_pass(void)
   data_bytes = (uint16_t)(data_bytes + 2);
 }
 
+/* does the program use ONERR, RESUME or TRACE (statement marks needed)?
+ * (tokens appear only as tokens: string, REM and DATA text is ASCII) */
+static int scan_onerr(void)
+{
+  uint16_t at = 0x0801;
+  while (pf->prog(pf->ctx, at) | pf->prog(pf->ctx, (uint16_t)(at + 1))) {
+    uint16_t link = (uint16_t)(pf->prog(pf->ctx, at) | pf->prog(pf->ctx, (uint16_t)(at + 1)) << 8), a = (uint16_t)(at + 4);
+    uint8_t b;
+    while ((b = pf->prog(pf->ctx, a++)) != 0)
+      if (b == T_ONERR || b == T_RESUME || b == T_TRACE) return 1;
+    at = link;
+  }
+  return 0;
+}
+
 int as816_compile(const Platform *platform, CompileStats *st)
 {
   uint16_t i, a;
   pf = platform;
   overflow = 0;
+  use_onerr = scan_onerr();
   code_base = (uint16_t)(pf->prog_start + HEADER_SIZE);
   const_base = str_base = 0;
   pass = 1;
@@ -739,11 +938,16 @@ int as816_compile(const Platform *platform, CompileStats *st)
     var_off[i] = a;
     a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5));
   }
+  fn_base = a;
+  a = (uint16_t)(a + 4 * nfns);
   desc_base = a;
   for (i = 0; i < narrays; i++) {
     desc_off[i] = a;
     a = (uint16_t)(a + 4 + 2 * arrays[i].ndims);
   }
+  desc_bytes = (uint16_t)(a - desc_base);
+  desc_copy_base = a;
+  a = (uint16_t)(a + desc_bytes);
   nsvars = nsarrays = 0;
   for (i = 0; i < nvars; i++) nsvars += vars[i].type == 2;
   for (i = 0; i < narrays; i++) nsarrays += arrays[i].type == 2;
@@ -768,6 +972,11 @@ int as816_compile(const Platform *platform, CompileStats *st)
     uint8_t size = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
     pf->wr(pf->ctx, d, 0), pf->wr(pf->ctx, (uint16_t)(d + 1), 0);
     pf->wr(pf->ctx, (uint16_t)(d + 2), arrays[i].ndims), pf->wr(pf->ctx, (uint16_t)(d + 3), size);
+    /* the pristine copy CLEAR restores from */
+    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base), 0);
+    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 1), 0);
+    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 2), arrays[i].ndims);
+    pf->wr(pf->ctx, (uint16_t)(d - desc_base + desc_copy_base + 3), size);
   }
   /* the collector's roots: the string variables, the string arrays */
   {
@@ -785,12 +994,14 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[12];
+    uint16_t h = pf->prog_start, vals[17];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
     vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = 0xFFFF;
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
     vals[11] = data_base;
-    for (i = 0; i < 12; i++) {
+    vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
+    vals[16] = desc_bytes;
+    for (i = 0; i < 17; i++) {
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       pf->wr(pf->ctx, (uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }

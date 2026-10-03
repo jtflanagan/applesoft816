@@ -24,7 +24,7 @@
         .import fp_sgn, fp_ayint, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
         .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_add, fp_table
         .import fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin, fp_tan, fp_atn
-        .import fp_conint, fp_fin
+        .import fp_conint, fp_fin, fp_getadr
 
 ; ---- direct page ----
 ; fp816's (see fp.s)
@@ -81,6 +81,13 @@ VM_INSTMT = $D3         ; 2: the INPUT operation's IP (?REENTER starts it again)
 INPTR    = $D5          ; 3: the input text pointer between items (long)
 VM_ITYPE = $D8          ; 1: the item's type: 0 real, 1 integer, 2 string
 VM_ITGT  = $D9          ; 2: the item's variable or element (this bank)
+VM_TRACE = $DB          ; 1: TRACE on ($80)
+VM_STMTIP = $DC         ; 2: the current statement's IP (STMT, when ONERR is used)
+VM_STMTCSP = $DE        ; 2: ... and the control stack then
+VM_ERRIP = $E0          ; 2: RESUME's statement
+VM_ERRCSP = $E2         ; 2: ... and its control stack
+VM_ONERR = $E4          ; 2: the ONERR handler's IP (0: none)
+LINNUM   = $50          ; 2: GETADR's result (fp816)
 
 ERR_NEXT_WITHOUT_FOR  = $00
 ERR_RETURN_WITHOUT_GOSUB = $16
@@ -158,6 +165,11 @@ optable:
         .word   op_str, op_val, op_fre
         .word   op_ldvi, op_stvi, op_ldai, op_stai, op_slda, op_ssta
         .word   op_inpstart, op_readstart, op_getstart, op_item, op_inpend, op_restore
+        .word   op_on, op_pop, op_deffn, op_fncall, op_fnret, op_pos, op_peek, op_adr, op_poke
+        .word   op_wait, op_call, op_prn, op_inn, op_htab, op_vtab, op_home, op_normal
+        .word   op_inverse, op_flash, op_speed, op_trace, op_notrace, op_text, op_gr, op_color
+        .word   op_plot, op_hlin, op_vlin, op_scrn, op_stop, op_clear, op_run, op_onerr
+        .word   op_resume, op_stmt, op_tab, op_spc, op_bytepush, op_lomem, op_himem
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -165,7 +177,8 @@ OP_COUNT = (* - optable) / 2
 ; =========================================================================
 
 ; vm_run: JSL with D = the VM's direct page (COUT_VEC, VM_FLASH, VM_SPEED
-; set), native mode, any M/X, S in page 1.  Runs the program from its entry
+; set), native mode, any M/X, S in page 1 and below $01FC: AppleSoft keeps
+; $01FC-$01FF (INPUT puts a ',' at $01FF, the byte before its buffer).  Runs the program from its entry
 ; to END or an error; returns with VM_ERR = 0 (END) or the error code, the
 ; caller's P and DBR restored.
 vm_run:
@@ -234,6 +247,14 @@ vm_leave:
 ; (ONERR: M3.)
 vm_error:
         sta     VM_ERR
+        pha                     ; ONERR set ($D8 bit 7) and a handler: HANDLERR
+        lda     f:$0000D8
+        bpl     @noerr
+        ldy     VM_ONERR
+        beq     @noerr
+        pla
+        jmp     handlerr
+@noerr: pla
         jsr     crdo
         lda     #'?'
         jsr     outdo
@@ -257,15 +278,18 @@ vm_error:
         beq     @done
         ldy     #msg_in - msgtab
         jsr     strout_y
-        rep     #$20            ; LINPRT: the line through FOUT
+        jsr     linprt
+@done:  jmp     vm_leave
+
+; LINPRT: CURLIN through FOUT
+linprt: rep     #$20
         .a16
         lda     CURLIN
         sta     FP_INT
         sep     #$20
         .a8
         FP      fp_uint16
-        jsr     prfac
-@done:  jmp     vm_leave
+        jmp     prfac
 
 ; print the 0-terminated text at msgtab+Y
 strout_y:
@@ -299,6 +323,8 @@ msgtab:
 msg_error:
         .byte   " ERROR", $07, 0
 msg_in: .byte   " IN ", 0
+msg_break:
+        .byte   $0D, "BREAK", $07, 0
 
 ; =========================================================================
 ; Output: OUTDO ($DB5C), CRDO ($DAFB), through the bank-0 COUT stub
@@ -2604,6 +2630,765 @@ op_restore:
         lda     a:$0017,y
         sta     DATPTR+1
         NEXTOP  2
+
+
+; =========================================================================
+; More statements
+; =========================================================================
+
+; ON k f a1..ak: GETBYT; 1..k picks a(n), else on (ONGOTO $D9EC); f = 0
+; GOTO, 1 GOSUB; a = 0: the line does not exist
+op_on:  stx     VM_IP
+        jsr     conint
+        sta     VM_T0
+        ldx     VM_IP
+        lda     a:$0002,x       ; k
+        sta     VM_T1
+        stz     VM_T1+1
+        lda     VM_T0
+        beq     @next
+        cmp     VM_T1
+        beq     @pick
+        bcs     @next
+@pick:  rep     #$20
+        .a16
+        and     #$00FF
+        asl     a
+        clc
+        adc     VM_IP
+        tay                     ; Y + 2 = a(n): the table starts at +4
+        lda     a:$0002,y
+        beq     @undef
+        sta     VM_T2           ; the target
+        lda     VM_T1           ; this operation's length: 4 + 2k
+        asl     a
+        clc
+        adc     #$0004
+        adc     VM_IP
+        sta     VM_T3           ; the return point
+        sep     #$20
+        .a8
+        ldx     VM_IP
+        lda     a:$0003,x
+        beq     @goto
+        ldy     VM_CSP          ; GOSUB: the frame [return, CURLIN, $B0]
+        rep     #$20
+        .a16
+        tya
+        clc
+        adc     #GOSUB_SIZE
+        cmp     VM_CLIM
+        bcs     @full
+        sta     VM_CSP
+        lda     VM_T3
+        sta     a:$0000,y
+        lda     CURLIN
+        sta     a:$0002,y
+        sep     #$20
+        .a8
+        lda     #FRAME_GOSUB
+        sta     a:$0004,y
+@goto:  ldx     VM_T2
+        jmp     ($0000,x)
+        .a16
+@full:  sep     #$20
+        .a8
+        lda     #ERR_OUT_OF_MEMORY
+        jmp     vm_error
+        .a16
+@undef: sep     #$20
+        .a8
+        lda     #ERR_UNDEF_STATEMENT
+        jmp     vm_error
+@next:  rep     #$20            ; past the table
+        .a16
+        lda     VM_T1
+        asl     a
+        clc
+        adc     #$0004
+        adc     VM_IP
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+
+; POP: the GOSUB frame (and FOR frames above it) dropped, no return
+op_pop: stx     VM_IP
+@scan:  jsr     frame_top_mark
+        cmp     #FRAME_GOSUB
+        beq     @found
+        cmp     #FRAME_FOR
+        bne     @none
+        jsr     drop_frame
+        bra     @scan
+@found: jsr     drop_frame
+        ldx     VM_IP
+        NEXTOP  2
+@none:  lda     #ERR_RETURN_WITHOUT_GOSUB
+        jmp     vm_error
+
+; DEFFN e v s: function entry e (in the table) = this body (at +8),
+; parameter v; then on at s (past the body)
+op_deffn:
+        ldy     a:$0002,x       ; the entry
+        rep     #$20
+        .a16
+        txa
+        clc
+        adc     #$0008
+        sta     a:$0000,y
+        lda     a:$0004,x
+        sta     a:$0002,y
+        lda     a:$0006,x
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+
+; FNCALL e: FUNCT ($E354) - ?UNDEF'D FUNCTION if not DEFined; the
+; parameter's value kept, the argument (FAC) stored in it rounded, the body
+; run; FNRET puts the parameter back
+op_fncall:
+        ldy     a:$0002,x
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        bne     @def
+        sep     #$20
+        .a8
+        lda     #$E0
+        jmp     vm_error
+        .a16
+@def:   sta     VM_T2           ; the body
+        lda     a:$0002,y
+        sta     VM_T1           ; the parameter
+        ldy     VM_FSP          ; frame: saved value (5), parameter, return
+        tya
+        clc
+        adc     #$000C
+        sta     VM_FSP
+        phy
+        ldy     VM_T1
+        lda     a:$0000,y
+        ply
+        sta     a:$0000,y
+        phy
+        ldy     VM_T1
+        lda     a:$0002,y
+        ply
+        sta     a:$0002,y
+        phy
+        ldy     VM_T1
+        lda     a:$0004,y
+        ply
+        sta     a:$0004,y
+        lda     VM_T1
+        sta     a:$0006,y
+        txa
+        clc
+        adc     #$0004
+        sta     a:$0008,y
+        sep     #$20
+        .a8
+        ldy     VM_T1
+        PTRY
+        FPCHK   fp_store_fac
+        ldx     VM_T2
+        jmp     ($0000,x)
+
+op_fnret:
+        rep     #$20
+        .a16
+        lda     VM_FSP
+        sec
+        sbc     #$000C
+        sta     VM_FSP
+        tay
+        lda     a:$0006,y
+        sta     VM_T1
+        lda     a:$0000,y
+        phy
+        ldy     VM_T1
+        sta     a:$0000,y
+        ply
+        lda     a:$0002,y
+        phy
+        ldy     VM_T1
+        sta     a:$0002,y
+        ply
+        lda     a:$0004,y
+        phy
+        ldy     VM_T1
+        sep     #$20
+        .a8
+        sta     a:$0004,y       ; (5 bytes: the low one of this word)
+        ply
+        rep     #$20
+        .a16
+        lda     a:$0008,y
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+
+; POS: FAC = CH (SNGFLT)
+op_pos: lda     f:$000024
+sngflt_a:
+        sta     FP_INT
+        stz     FP_INT+1
+        FP      fp_givayf
+        NEXTOP  2
+
+; PEEK: GETADR, then the byte in bank 0
+op_peek:
+        FPCHK   fp_getadr
+        ldy     LINNUM
+        sty     SPTR
+        stz     SPTR+2
+        lda     [SPTR]
+        bra     sngflt_a
+
+; ADR: GETADR, the address pushed (POKE, WAIT, CALL take it)
+op_adr: FPCHK   fp_getadr
+        ldy     VM_FSP
+        rep     #$20
+        .a16
+        lda     LINNUM
+        sta     a:$0000,y
+        sep     #$20
+        .a8
+        iny
+        iny
+        sty     VM_FSP
+        NEXTOP  2
+
+; pop a pushed address or byte into VM_T0
+pop2:   ldy     VM_FSP
+        dey
+        dey
+        sty     VM_FSP
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     VM_T0
+        sep     #$20
+        .a8
+        rts
+
+; BYTEPUSH r: GETBYT, pushed; r = 1: ?ILLEGAL QUANTITY unless < 80 (the
+; lo-res coordinate checks)
+op_bytepush:
+        stx     VM_IP
+        jsr     conint
+        ldx     VM_IP
+        pha
+        lda     a:$0002,x
+        beq     @ok
+        pla
+        pha
+        cmp     #$50
+        bcc     @ok
+        brl     iq
+@ok:    pla
+        ldy     VM_FSP
+        sta     a:$0000,y
+        lda     #$00
+        sta     a:$0001,y
+        iny
+        iny
+        sty     VM_FSP
+        NEXTOP  3
+
+; POKE: the byte (FAC) to the pushed address, in bank 0
+op_poke:
+        stx     VM_IP
+        jsr     conint
+        pha
+        jsr     pop2
+        ldy     VM_T0
+        sty     SPTR
+        stz     SPTR+2
+        pla
+        sta     [SPTR]
+        ldx     VM_IP
+        NEXTOP  2
+
+; WAIT: address, mask, xor pushed (xor 0 if absent): until (byte EOR xor)
+; AND mask is not 0
+op_wait:
+        jsr     pop2
+        lda     VM_T0
+        sta     VM_T5           ; xor
+        jsr     pop2
+        lda     VM_T0
+        sta     VM_T5+1         ; mask
+        jsr     pop2
+        ldy     VM_T0
+        sty     SPTR
+        stz     SPTR+2
+@w:     lda     [SPTR]
+        eor     VM_T5
+        and     VM_T5+1
+        beq     @w
+        NEXTOP  2
+
+; CALL: the machine code at the address, in emulation mode, bank 0 - except
+; AppleSoft's own stack fixes, which have nothing to fix here
+op_call:
+        stx     VM_IP
+        FPCHK   fp_getadr
+        ldy     LINNUM
+        cpy     #$F328          ; CALL -3288: the ONERR stack fix
+        beq     @done
+        cpy     #$D683          ; CALL 54915 (STKINI): the stack emptied
+        bne     @go
+        ldy     VM_CBASE_PTR
+        sty     VM_CSP
+        bra     @done
+@go:    sty     VM_T4
+        lda     LINNUM+1        ; A = the address's high byte, Y = low (GETADR)
+        ldy     LINNUM
+        jsr     romcall
+@done:  ldx     VM_IP
+        NEXTOP  2
+
+; PR# n / IN# n: OUTPORT / INPORT
+op_prn: ldy     #$FE95
+        bra     port
+op_inn: ldy     #$FE8B
+port:   stx     VM_IP
+        sty     VM_T5
+        jsr     conint
+        ldy     VM_T5
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+; HTAB n (the GS's $F7E7): n-1 into CH, a carriage return for each full
+; width (40, or WNDWDTH if wider)
+op_htab:
+        stx     VM_IP
+        jsr     conint
+        dec     a
+        sta     VM_T0           ; X
+@l:     lda     f:$000021
+        cmp     #$28
+        bcs     @w
+        lda     #$28
+@w:     sta     VM_T1           ; the width: max(40, WNDWDTH)
+        lda     VM_T0
+        sec
+        sbc     VM_T1
+        bcc     @set
+        sta     VM_T0
+        jsr     crdo
+        bra     @l
+@set:   lda     VM_T0
+        sta     f:$000024
+        ldx     VM_IP
+        NEXTOP  2
+
+; VTAB n: n-1 < 24 or ?ILLEGAL QUANTITY; TABV
+op_vtab:
+        stx     VM_IP
+        jsr     conint
+        dec     a
+        cmp     #$18
+        bcc     @ok
+        brl     iq
+@ok:    ldy     #$FB5B
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+op_home:
+        stx     VM_IP
+        ldy     #$FC58
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+; NORMAL / INVERSE / FLASH: INVFLG ($32) and FLASH.BIT
+op_normal:
+        lda     #$FF
+        sta     f:$000032
+        stz     VM_FLASH
+        NEXTOP  2
+op_inverse:
+        lda     #$3F
+        sta     f:$000032
+        stz     VM_FLASH
+        NEXTOP  2
+op_flash:
+        lda     #$7F
+        sta     f:$000032
+        lda     #$40
+        sta     VM_FLASH
+        NEXTOP  2
+
+; SPEED= n: SPEEDZ = 256 - n
+op_speed:
+        stx     VM_IP
+        jsr     conint
+        eor     #$FF
+        inc     a
+        sta     VM_SPEED
+        ldx     VM_IP
+        NEXTOP  2
+
+op_trace:
+        lda     #$80
+        sta     VM_TRACE
+        NEXTOP  2
+op_notrace:
+        stz     VM_TRACE
+        NEXTOP  2
+
+; TEXT: $C054, SETTXT; GR: $C056 $C053, SETGR
+op_text:
+        stx     VM_IP
+        lda     f:$00C054
+        ldy     #$FB39
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+op_gr:  stx     VM_IP
+        lda     f:$00C056
+        lda     f:$00C053
+        ldy     #$FB40
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+; COLOR= n: SETCOL
+op_color:
+        stx     VM_IP
+        jsr     conint
+        ldy     #$F864
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+; PLOT x,y: x pushed (< 80), y (FAC) < 48; x < 40 (40 columns); PLOT
+op_plot:
+        stx     VM_IP
+        jsr     conint
+        cmp     #$30
+        bcs     @iq
+        pha
+        jsr     pop2
+        lda     VM_T0
+        cmp     #$28
+        bcs     @iq
+        tay                     ; Y = x
+        pla                     ; A = y
+        phx
+        ldx     #$F800
+        stx     VM_T4
+        plx
+        jsr     romcall
+        NEXTOP  2
+@iq:    brl     iq
+
+; HLIN a,b AT y: a (< 80) and b pushed; y (FAC) < 80; the ends in order,
+; the right one < 40, y < 48; HLINE
+op_hlin:
+        stx     VM_IP
+        jsr     conint
+        cmp     #$50
+        bcs     @iq
+        sta     VM_T5           ; y
+        jsr     pop2
+        lda     VM_T0
+        sta     VM_T1           ; b
+        jsr     pop2
+        lda     VM_T0           ; a
+        cmp     VM_T1
+        bcc     @ord
+        ldy     VM_T1           ; swap: FIRST the smaller
+        sta     VM_T1
+        tya
+@ord:   sta     f:$0000F0       ; FIRST
+        lda     VM_T1
+        sta     f:$00002C       ; H2
+        sta     f:$00002D
+        cmp     #$28
+        bcs     @iq
+        lda     VM_T5
+        cmp     #$30
+        bcs     @iq
+        lda     f:$0000F0
+        tay
+        lda     VM_T5
+        phx
+        ldx     #$F819
+        stx     VM_T4
+        plx
+        jsr     romcall
+        NEXTOP  2
+@iq:    brl     iq
+
+; VLIN a,b AT x: a (< 80) and b (< 48) pushed; x (FAC) < 80; ordered; x
+; < 40; VLINE
+op_vlin:
+        stx     VM_IP
+        jsr     conint
+        cmp     #$50
+        bcs     @iq
+        sta     VM_T5           ; x
+        jsr     pop2
+        lda     VM_T0
+        cmp     #$30
+        bcs     @iq
+        sta     VM_T1           ; b
+        jsr     pop2
+        lda     VM_T0
+        cmp     VM_T1
+        bcc     @ord
+        ldy     VM_T1
+        sta     VM_T1
+        tya
+@ord:   sta     f:$0000F0       ; FIRST = the top
+        lda     VM_T1
+        sta     f:$00002D       ; V2 = the bottom
+        sta     f:$00002C
+        lda     VM_T5
+        cmp     #$28
+        bcs     @iq
+        tay
+        lda     f:$0000F0
+        phx
+        ldx     #$F828
+        stx     VM_T4
+        plx
+        jsr     romcall
+        NEXTOP  2
+@iq:    brl     iq
+
+; SCRN(x,y): x pushed, y (FAC); SCRN
+op_scrn:
+        stx     VM_IP
+        jsr     conint
+        cmp     #$30
+        bcs     @iq
+        pha
+        jsr     pop2
+        lda     VM_T0
+        cmp     #$28
+        bcs     @iq
+        tay
+        pla
+        phx
+        ldx     #$F871
+        stx     VM_T4
+        plx
+        jsr     romcall
+        lda     RC_A
+        brl     sngflt_a
+@iq:    brl     iq
+
+; TAB(n): to column n-1 (LF7CB: target - CH spaces, none if behind)
+op_tab: stx     VM_IP
+        jsr     conint
+        dec     a
+        sec
+        sbc     f:$000024
+        bcc     spc_done
+        bra     spaces
+; SPC(n): n spaces
+op_spc: stx     VM_IP
+        jsr     conint
+spaces: sta     VM_T0
+@s:     lda     VM_T0
+        beq     spc_done
+        lda     #' '
+        jsr     outdo
+        dec     VM_T0
+        bra     @s
+spc_done:
+        ldx     VM_IP
+        NEXTOP  2
+
+; STOP: "\rBREAK" and the bell, " IN n"
+op_stop:
+        ldy     #msg_break - msgtab
+        jsr     strout_y
+        ldy     #msg_in - msgtab
+        jsr     strout_y
+        jsr     linprt
+        lda     #$FD            ; (VM_ERR: STOP)
+        sta     VM_ERR
+        jmp     vm_leave
+
+; CLEAR: variables zero, arrays undimensioned, strings and DATA reset, the
+; stacks empty (CLEARC)
+op_clear:
+        stx     VM_IP
+        jsr     clear_all
+        ldx     VM_IP
+        NEXTOP  2
+
+clear_all:
+        ldy     VM_PROG
+        rep     #$20
+        .a16
+        lda     a:$001A,y       ; the variables: start, end (the descriptors)
+        sta     VM_T0
+        lda     a:$001C,y
+        sta     VM_T1
+        sep     #$20
+        .a8
+        ldy     VM_T0
+@z:     cpy     VM_T1
+        beq     @desc
+        lda     #$00
+        sta     a:$0000,y
+        iny
+        bra     @z
+@desc:  ldy     VM_PROG         ; descriptors keep their dimension counts:
+        rep     #$20            ; the compiler's copy is restored
+        .a16
+        lda     a:$001E,y       ; the pristine descriptors' copy, and count
+        sta     VM_T0
+        lda     a:$0020,y
+        sta     VM_T2
+        lda     a:$001C,y
+        sta     VM_T1           ; where they live
+        sep     #$20
+        .a8
+        ldy     #$0000
+@d:     cpy     VM_T2
+        beq     @heap
+        phy
+        rep     #$20
+        .a16
+        tya
+        clc
+        adc     VM_T0
+        tay
+        sep     #$20
+        .a8
+        lda     a:$0000,y
+        ply
+        phy
+        pha
+        rep     #$20
+        .a16
+        tya
+        clc
+        adc     VM_T1
+        tay
+        sep     #$20
+        .a8
+        pla
+        sta     a:$0000,y
+        ply
+        iny
+        bra     @d
+@heap:  ldy     VM_PROG         ; the array heap from its start
+        rep     #$20
+        .a16
+        lda     a:$0018,y
+        sta     a:$0008,y
+        lda     a:$000C,y
+        sta     VM_SSP
+        lda     a:$0002,y
+        sta     VM_FSP
+        lda     a:$0016,y
+        sta     DATPTR
+        lda     VM_CBASE_PTR
+        sta     VM_CSP
+        stz     SH_FREE         ; strings: the low half, empty
+        lda     #$8000
+        sta     SH_END
+        sep     #$20
+        .a8
+        stz     SH_HALF
+        rts
+
+; RUN a: CLEAR, then the program from a
+op_run: ldy     a:$0002,x
+        sty     VM_T5
+        jsr     clear_all
+        ldx     VM_T5
+        jmp     ($0000,x)
+
+; LOMEM: n: GETADR (range), then CLEAR (LOMEM $F2A6); HIMEM: n: GETADR
+op_lomem:
+        stx     VM_IP
+        FPCHK   fp_getadr
+        jsr     clear_all
+        ldx     VM_IP
+        NEXTOP  2
+op_himem:
+        FPCHK   fp_getadr
+        NEXTOP  2
+
+; ONERR GOTO a: ONERR's flag ($D8 bit 7) and the handler
+op_onerr:
+        ldy     a:$0002,x
+        sty     VM_ONERR
+        lda     f:$0000D8
+        ora     #$80
+        sta     f:$0000D8
+        NEXTOP  4
+
+; STMT: a statement starts (in programs with ONERR, RESUME or TRACE): its
+; place and the control stack's, for RESUME; TRACE's "#n " (TRACE. $D805,
+; which NEWSTT passes for every statement)
+op_stmt:
+        stx     VM_STMTIP
+        ldy     VM_CSP
+        sty     VM_STMTCSP
+        bit     VM_TRACE
+        bpl     @go
+        stx     VM_IP
+        lda     #'#'
+        jsr     outdo
+        jsr     linprt
+        lda     #' '
+        jsr     outdo
+        ldx     VM_IP
+@go:    NEXTOP  2
+
+; HANDLERR ($F2E9): A = the code: $DE, the line in $DA/$DB, RESUME's
+; statement; the expression stacks emptied; the handler
+handlerr:
+        sta     f:$0000DE
+        lda     CURLIN
+        sta     f:$0000DA
+        lda     CURLIN+1
+        sta     f:$0000DB
+        ldy     VM_STMTIP
+        sty     VM_ERRIP
+        ldy     VM_STMTCSP
+        sty     VM_ERRCSP
+        ldy     VM_PROG
+        rep     #$20
+        .a16
+        lda     a:$0002,y
+        sta     VM_FSP
+        lda     a:$000C,y
+        sta     VM_SSP
+        lda     VM_S            ; the machine stack as at dispatch
+        tcs
+        sep     #$20
+        .a8
+        rep     #$10
+        .i16
+        ldx     VM_ONERR
+        jmp     ($0000,x)
+
+; RESUME: the statement that failed, again
+op_resume:
+        lda     f:$0000DA
+        sta     CURLIN
+        lda     f:$0000DB
+        sta     CURLIN+1
+        ldy     VM_ERRCSP
+        sty     VM_CSP
+        ldx     VM_ERRIP
+        jmp     ($0000,x)
 
 ; ---- the end of the VM: the program image the compiler writes starts here
         .segment "TAIL"
