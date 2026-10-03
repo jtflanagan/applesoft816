@@ -35,6 +35,21 @@ struct Cpu816 : ares::WDC65816 {
   void set_regs(uint16_t a, uint16_t x, uint16_t y, uint16_t s, uint16_t d, uint8_t dbr, uint8_t p,
                 bool e);
   bool halted() const { return r.stp || r.wai; }
+  uint8_t pbr() const { return uint8_t(r.pc.d >> 16); }
+
+  // finish a JSR'd routine from outside: pull its return address, as RTS
+  void sim_rts()
+  {
+    uint32_t lo, hi;
+    if (r.e) {
+      r.s.l = r.s.l + 1, lo = mem[0x0100 | r.s.l];
+      r.s.l = r.s.l + 1, hi = mem[0x0100 | r.s.l];
+    } else {
+      r.s.w = r.s.w + 1, lo = mem[r.s.w];
+      r.s.w = r.s.w + 1, hi = mem[r.s.w];
+    }
+    r.pc.d = (r.pc.d & 0xFF0000) | (((lo | hi << 8) + 1) & 0xFFFF);
+  }
 
   // ares::WDC65816
   void idle() override { cycles++; }
