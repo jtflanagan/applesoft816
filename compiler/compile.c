@@ -34,7 +34,9 @@ enum {
   T_VLIN = 0x8F, T_HTAB = 0x96, T_HOME = 0x97, T_TRACE = 0x9B, T_NOTRACE = 0x9C, T_NORMAL = 0x9D,
   T_INVERSE = 0x9E, T_FLASH = 0x9F, T_COLOR = 0xA0, T_POP = 0xA1, T_VTAB = 0xA2, T_HIMEM = 0xA3,
   T_LOMEM = 0xA4, T_ONERR = 0xA5, T_RESUME = 0xA6, T_SPEED = 0xA9, T_RUN = 0xAC, T_STOP = 0xB3,
-  T_ON = 0xB4, T_WAIT = 0xB5, T_CONT = 0xBB, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
+  T_ON = 0xB4, T_WAIT = 0xB5, T_CONT = 0xBB,
+  T_HGR2 = 0x90, T_HGR = 0x91, T_HCOLOR = 0x92, T_HPLOT = 0x93, T_DRAW = 0x94, T_XDRAW = 0x95,
+  T_ROT = 0x98, T_SCALE = 0x99, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
   T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
@@ -959,6 +961,39 @@ static int coord(int r)
   return 1;
 }
 
+/* HFNS ($F6B9): x (GETADR, < 280, checked before y is looked at), ','
+ * and y left in FAC (the operation after takes it: GETBYT, < 192) */
+static int hfns(void)
+{
+  return num_then(OP_HX) && want(',') && num_then(-1);
+}
+
+/* HPLOT x,y [TO x,y]... / HPLOT TO x,y...: HPLOT0 then HGLIN for each TO */
+static void st_hplot(void)
+{
+  if (peek() != T_TO) {
+    if (!hfns()) return;
+    op(OP_HPLOT);
+  }
+  while (peek() == T_TO) {
+    p++;
+    if (!hfns()) return;
+    op(OP_HPLOTTO);
+  }
+}
+
+/* DRAW/XDRAW n [AT x,y] (DRWPNT): the shape, then the place, then it */
+static void st_draw(int o)
+{
+  if (!num_then(OP_SHAPE)) return;
+  if (peek() == T_AT) {
+    p++;
+    if (!hfns()) return;
+    op(OP_HPOSN);
+  }
+  op(o);
+}
+
 /* INPUT, GET and DEF in a direct line: ?ILLEGAL DIRECT when it runs */
 static void illegal_direct(void)
 {
@@ -1021,6 +1056,14 @@ static void statement(void)
   case T_GR: op(OP_GR); return;
   case T_CLEAR: op(OP_CLEAR); return;
   case T_STOP: op(OP_STOP); return;
+  case T_HGR: op(OP_HGR); return;
+  case T_HGR2: op(OP_HGR2); return;
+  case T_HCOLOR: num_then(OP_HCOLOR); return;
+  case T_HPLOT: st_hplot(); return;
+  case T_DRAW: st_draw(OP_DRAW); return;
+  case T_XDRAW: st_draw(OP_XDRAW); return;
+  case T_ROT: num_then(OP_ROT); return;
+  case T_SCALE: num_then(OP_SCALE); return;
   case T_CONT: op(OP_CONT); return;
   case T_RESUME: op(OP_RESUME); return;
   case T_LOMEM: num_then(OP_LOMEM); return;
@@ -1200,6 +1243,7 @@ int as816_compile(const Platform *platform, CompileStats *st)
         out(at, (uint8_t)var_off[i]), out((uint16_t)(at + 1), (uint8_t)(var_off[i] >> 8));
         at = (uint16_t)(at + 2);
       }
+    at = salist_base;                     /* (after the string variables' spare roots) */
     for (i = 0; i < narrays; i++)
       if (arrays[i].type == 2) {
         out(at, (uint8_t)desc_off[i]), out((uint16_t)(at + 1), (uint8_t)(desc_off[i] >> 8));
@@ -1276,32 +1320,25 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
 
 /* the compiler's tables (direct lines need them), out to the cache or back
  * in from it: io moves n bytes between p and the file, in order */
-typedef struct {
-  uint16_t nlines, nvars, narrays, nconsts, nfns, nsvars, nsarrays, svlist_cap, salist_cap, use_onerr;
-  uint16_t code_base, const_base, str_base, data_base, var_base, fn_base, desc_base, desc_copy_base,
-      desc_bytes, svlist_base, salist_base, fstack_base, sstack_base, cstack_base, heap_base;
-} State;
+/* (the layout and counts, as a table: compact on the 65816) */
+static uint16_t *const state_words[] = {
+  &nlines, &nvars, &narrays, &nconsts, &nfns, &nsvars, &nsarrays, &svlist_cap, &salist_cap,
+  &code_base, &const_base, &str_base, &data_base, &var_base, &fn_base, &desc_base, &desc_copy_base,
+  &desc_bytes, &svlist_base, &salist_base, &fstack_base, &sstack_base, &cstack_base, &heap_base
+};
+#define NSTATE (sizeof state_words / sizeof state_words[0])
 
 void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx)
 {
-  State t;
-  uint16_t i;
+  uint16_t t[NSTATE + 1], i;
   if (save) {
-    t.nlines = nlines, t.nvars = nvars, t.narrays = narrays, t.nconsts = nconsts, t.nfns = nfns;
-    t.nsvars = nsvars, t.nsarrays = nsarrays, t.svlist_cap = svlist_cap, t.salist_cap = salist_cap, t.use_onerr = (uint16_t)use_onerr;
-    t.code_base = code_base, t.const_base = const_base, t.str_base = str_base, t.data_base = data_base;
-    t.var_base = var_base, t.fn_base = fn_base, t.desc_base = desc_base, t.desc_copy_base = desc_copy_base;
-    t.desc_bytes = desc_bytes, t.svlist_base = svlist_base, t.salist_base = salist_base;
-    t.fstack_base = fstack_base, t.sstack_base = sstack_base, t.cstack_base = cstack_base, t.heap_base = heap_base;
+    for (i = 0; i < NSTATE; i++) t[i] = *state_words[i];
+    t[NSTATE] = (uint16_t)use_onerr;
   }
-  io(ctx, &t, sizeof t);
+  io(ctx, t, sizeof t);
   if (!save) {
-    nlines = t.nlines, nvars = t.nvars, narrays = t.narrays, nconsts = t.nconsts, nfns = t.nfns;
-    nsvars = t.nsvars, nsarrays = t.nsarrays, svlist_cap = t.svlist_cap, salist_cap = t.salist_cap, use_onerr = t.use_onerr;
-    code_base = t.code_base, const_base = t.const_base, str_base = t.str_base, data_base = t.data_base;
-    var_base = t.var_base, fn_base = t.fn_base, desc_base = t.desc_base, desc_copy_base = t.desc_copy_base;
-    desc_bytes = t.desc_bytes, svlist_base = t.svlist_base, salist_base = t.salist_base;
-    fstack_base = t.fstack_base, sstack_base = t.sstack_base, cstack_base = t.cstack_base, heap_base = t.heap_base;
+    for (i = 0; i < NSTATE; i++) *state_words[i] = t[i];
+    use_onerr = t[NSTATE];
     if (nlines > MAX_LINES || nvars > MAX_VARS || narrays > MAX_ARRAYS || nconsts > MAX_CONSTS || nfns > MAX_FNS)
       nlines = nvars = narrays = nconsts = nfns = 0;
   }

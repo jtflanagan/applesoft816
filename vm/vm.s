@@ -192,6 +192,8 @@ optable:
         .word   op_plot, op_hlin, op_vlin, op_scrn, op_stop, op_clear, op_run, op_onerr
         .word   op_resume, op_stmt, op_tab, op_spc, op_bytepush, op_lomem, op_himem
         .word   op_cont
+        .word   op_hgr, op_hgr2, op_hcolor, op_hx, op_hplot, op_hplotto, op_hposn, op_shape
+        .word   op_draw, op_xdraw, op_rot, op_scale
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -1774,7 +1776,7 @@ gc_strings:
         lda     a:$0012,y
         sta     VM_T4
         lda     a:$0014,y
-        sta     VM_T2           ; how many (VM_T2: mul16 is not used below)
+        sta     VM_T2           ; how many (kept across elem_count: mul16 uses VM_T2)
 @a:     lda     VM_T2
         beq     @done
         dec     VM_T2
@@ -1784,8 +1786,11 @@ gc_strings:
         lda     a:$0000,y       ; its storage
         beq     @anext
         sta     VM_T1           ; the element pointer
+        pei     (VM_T2)
         jsr     elem_count      ; A = how many elements
         sta     VM_T3
+        pla
+        sta     VM_T2
 @e:     lda     VM_T3
         beq     @anext
         dec     VM_T3
@@ -1836,10 +1841,13 @@ elem_count:
         tax
         lda     #$0001
         sta     VM_T0+0
-        sty     VM_SDESC
+        tya
+        clc
+        adc     #$0002
+        sta     VM_SDESC        ; (the bounds: +4, +6, ...)
 @m:     lda     VM_SDESC
         clc
-        adc     #$0004
+        adc     #$0002
         sta     VM_SDESC
         tay
         lda     a:$0000,y
@@ -3538,6 +3546,173 @@ op_stop:
         inx
         jsr     cont_here
         jmp     break_msg
+
+; ---- hi-res: AppleSoft's checks, the ROM's routines (bit for bit theirs) ----
+
+; HGR, HGR2: the ROM's ($F3E2, $F3D8): switches, HGR.PAGE, the page cleared
+op_hgr: stx     VM_IP
+        ldy     #$F3E2
+        bra     hgr_call
+op_hgr2:
+        stx     VM_IP
+        ldy     #$F3D8
+hgr_call:
+        sty     VM_T4
+        jsr     romcall
+        NEXTOP  2
+
+; HCOLOR= n (< 8): HGR.COLOR ($E4) from the ROM's COLORTBL ($F6F6)
+op_hcolor:
+        stx     VM_IP
+        jsr     conint
+        cmp     #$08
+        bcs     @iq
+        rep     #$20
+        .a16
+        and     #$00FF
+        tax
+        sep     #$20
+        .a8
+        lda     f:$FFF6F6,x
+        sta     f:$0000E4
+        ldx     VM_IP
+        NEXTOP  2
+@iq:    brl     iq
+
+; HX: HFNS's x - GETADR, < 280 - pushed
+op_hx:  stx     VM_IP
+        FPCHK   fp_getadr
+        lda     LINNUM+1
+        beq     @ok
+        cmp     #$01
+        bne     @iq
+        lda     LINNUM
+        cmp     #$18
+        bcs     @iq
+@ok:    ldy     VM_FSP
+        rep     #$20
+        .a16
+        lda     LINNUM
+        sta     a:$0000,y
+        sep     #$20
+        .a8
+        iny
+        iny
+        sty     VM_FSP
+        NEXTOP  2
+@iq:    brl     iq
+
+; HPLOT x,y: y (FAC: GETBYT, < 192), x pushed (HX); HPLOT0 ($F457), with A
+; = y, X/Y = x.  HPOSN ($F411) the same, the place only.  HPLOT TO x,y:
+; HGLIN ($F53A), with A/X = x, Y = y.
+op_hplot:
+        ldy     #$F457
+        bra     hplot_xy
+op_hposn:
+        ldy     #$F411
+hplot_xy:
+        sty     VM_T4
+        jsr     hfns_y
+        rep     #$20
+        .a16
+        lda     VM_T0
+        and     #$00FF
+        tax                     ; X = x low
+        lda     VM_T0
+        xba
+        and     #$00FF
+        tay                     ; Y = x high
+        sep     #$20
+        .a8
+        lda     VM_T5           ; A = y
+        jsr     romcall
+        NEXTOP  2
+op_hplotto:
+        ldy     #$F53A
+        sty     VM_T4
+        jsr     hfns_y
+        rep     #$20
+        .a16
+        lda     VM_T0+1
+        and     #$00FF
+        tax                     ; X = x high
+        lda     VM_T5
+        and     #$00FF
+        tay                     ; Y = y
+        sep     #$20
+        .a8
+        lda     VM_T0           ; A = x low
+        jsr     romcall
+        NEXTOP  2
+
+; hfns_y: y (FAC, GETBYT) < 192 into VM_T5, x (pushed) into VM_T0
+hfns_y: stx     VM_IP
+        jsr     conint
+        cmp     #$C0
+        bcs     @iq
+        sta     VM_T5
+        jmp     pop2
+@iq:    pla                     ; (this call's return)
+        pla
+        brl     iq
+
+; SHAPE n: DRWPNT ($F72D): n (GETBYT) against the table's count, the shape's
+; address (the table, $E8, + its entry n) into HGR.SHAPE ($1A)
+op_shape:
+        stx     VM_IP
+        jsr     conint
+        sta     VM_T5
+        lda     f:$0000E8
+        sta     SPTR
+        lda     f:$0000E9
+        sta     SPTR+1
+        stz     SPTR+2
+        lda     VM_T5
+        cmp     [SPTR]
+        beq     @ok
+        bcs     @iq
+@ok:    rep     #$20
+        .a16
+        lda     VM_T5
+        and     #$00FF
+        asl     a
+        tay
+        lda     [SPTR],y
+        clc
+        adc     SPTR
+        sta     f:$00001A
+        sep     #$20
+        .a8
+        ldx     VM_IP
+        NEXTOP  2
+@iq:    brl     iq
+
+; DRAW / XDRAW: DRAW1 ($F605) / XDRAW1 ($F661) with A = HGR.ROTATION ($F9)
+op_draw:
+        stx     VM_IP
+        ldy     #$F605
+        bra     draw_call
+op_xdraw:
+        stx     VM_IP
+        ldy     #$F661
+draw_call:
+        sty     VM_T4
+        lda     f:$0000F9
+        jsr     romcall
+        NEXTOP  2
+
+; ROT= n, SCALE= n: GETBYT into HGR.ROTATION ($F9), HGR.SCALE ($E7)
+op_rot: stx     VM_IP
+        jsr     conint
+        sta     f:$0000F9
+        ldx     VM_IP
+        NEXTOP  2
+op_scale:
+        stx     VM_IP
+        jsr     conint
+        sta     f:$0000E7
+        ldx     VM_IP
+        NEXTOP  2
 
 ; CONT: on from where END, STOP or Ctrl-C left the program (CONT, $D898)
 op_cont:

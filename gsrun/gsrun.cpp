@@ -110,19 +110,47 @@ struct Machine {
   const char* why = "instruction limit";
   std::function<void()> on_getln_first; // ROM mode: install the program
   std::vector<uint8_t> screen;           // the text page when the program ended
-  void snap() { if (screen.empty()) screen.assign(&c.mem[0x400], &c.mem[0x800]); }
+  // the text/lo-res page when the program ended; the hi-res pages too if it
+  // touched HIRES ($C057; not always: ROM AppleSoft's variables may live there)
+  bool hires = false;
+  std::vector<uint8_t> hgr;
+  void snap()
+  {
+    if (!screen.empty()) return;
+    screen.assign(&c.mem[0x400], &c.mem[0x800]);
+    if (hires) hgr.assign(&c.mem[0x2000], &c.mem[0x6000]);
+  }
   long long trace = 0;                   // GSRUN_TRACE=n: the VM run's first n instructions
+  uint32_t ring[64] = {0};
+  uint32_t break_pc = getenv("GSRUN_BREAK") ? strtoul(getenv("GSRUN_BREAK"), nullptr, 16) : 0;
+  int break_n = 0;
+  uint32_t guard_end = 0;                // GSRUN_GUARD: report writes into the VM image below this
+  int guard_n = 0;
+  unsigned ring_i = 0;
   std::map<uint32_t, long>* hist = nullptr; // GSRUN_HIST/GSRUN_CCPROF: cycles spent at each PC
 
   explicit Machine(const std::vector<uint8_t>& rom)
   {
     memcpy(&c.mem[0xFC0000], rom.data(), rom.size());
     c.on_read = [this](uint32_t a, uint8_t& v) {
+      if ((a & 0xFFFF) == 0xC057 && (a >> 16 == 0 || a >> 16 == 0xE0)) hires = true;
       if (a >= 0xC100 && a <= 0xFFFF) { v = c.mem[0xFF0000 | a]; return true; } // ROM / firmware
       if (a >= 0xC000 && a <= 0xC0FF) { v = 0; return true; }                    // I/O: no key, 40 col
       return false;
     };
-    c.on_write = [](uint32_t a, uint8_t) { return a >= 0xC000 && a <= 0xFFFF; };
+    c.on_write = [this](uint32_t a, uint8_t) {
+      if (a == 0xC057) hires = true;
+      if (guard_end && a >= VM_BANK && a < VM_BANK + guard_end && guard_n < 400000) {   // GSRUN_GUARD
+        guard_n++;
+        fprintf(stderr, "guard: write $%06X at PC $%06X\n", a, c.pc());
+        if (getenv("GSRUN_GUARD_PC") && c.pc() == strtoul(getenv("GSRUN_GUARD_PC"), nullptr, 16) && guard_n < 400000) {
+          for (int k = 0; k < 64; k++) fprintf(stderr, "%06X%c", ring[(ring_i + k) & 63], k % 16 == 15 ? '\n' : ' ');
+          fprintf(stderr, "x=%04X y=%04X s=%04X\n", c.x(), c.y(), c.s());
+          guard_n = 400000;
+        }
+      }
+      return a >= 0xC000 && a <= 0xFFFF;
+    };
     // the monitor's text window and a clear screen, as INIT leaves them
     c.mem[WNDLFT] = 0, c.mem[WNDWDTH] = 40, c.mem[WNDTOP] = 0, c.mem[WNDBTM] = 24;
     c.mem[0x32] = 0xFF; // INVFLG: normal
@@ -264,7 +292,18 @@ struct Machine {
                 c.s(), c.d(), c.dbr(), c.p());
       uint32_t pc = c.pc();
       uint64_t c0 = c.cycles;
-      if (!step()) return c.halted();
+      ring[ring_i++ & 63] = pc;
+      if (break_pc && pc == break_pc && break_n++ < 60) {   // GSRUN_BREAK=pc: registers there
+        fprintf(stderr, "break %06X: a=%04X x=%04X y=%04X d=%04X dp20-4F:", pc, c.a(), c.x(), c.y(), c.d());
+        for (int k = 0x30; k < 0x50; k++) fprintf(stderr, " %02X", c.mem[c.d() + k]);
+        fprintf(stderr, "\n");
+      }
+      if (!step()) {
+        if (getenv("GSRUN_LAST")) {               // the last 64 PCs before it stopped
+          for (int k = 0; k < 64; k++) fprintf(stderr, "%06X%c", ring[(ring_i + k) & 63], k % 16 == 15 ? '\n' : ' ');
+        }
+        return c.halted();
+      }
       if (hist) (*hist)[pc] += long(c.cycles - c0);
     }
     return false;
@@ -474,6 +513,7 @@ int main(int argc, char** argv)
       if (!ok || res != 0 || diffs) return 1;
     }
     m.recording = true;
+    if (getenv("GSRUN_GUARD")) m.guard_end = prog_start;
     if (getenv("GSRUN_TRACE")) m.trace = atoll(getenv("GSRUN_TRACE"));
     std::map<uint32_t, long> hist;
     if (getenv("GSRUN_HIST")) m.hist = &hist;
@@ -484,7 +524,12 @@ int main(int argc, char** argv)
       for (auto& [k, n] : hist) v.push_back({n, k});
       std::sort(v.rbegin(), v.rend());
       for (size_t i = 0; i < 20 && i < v.size(); i++)
-        fprintf(stderr, "  %06X %ld (VM %04X)\n", v[i].second, v[i].first, (v[i].second & 0xFFFF) - 0x18);
+        fprintf(stderr, "  %06X %ld\n", v[i].second, v[i].first);
+      if (strcmp(getenv("GSRUN_HIST"), "1")) {    // GSRUN_HIST=FILE: every PC, "pc cycles"
+        FILE* f = fopen(getenv("GSRUN_HIST"), "w");
+        for (auto& [k, n] : hist) fprintf(f, "%06X %ld\n", k, n);
+        fclose(f);
+      }
     }
     run_cycles = m.c.cycles - start;
     if (m.c.halted()) {
@@ -497,7 +542,11 @@ int main(int argc, char** argv)
   m.snap();
   m.out.push_back(0x01), m.out.push_back('S');
   m.out.insert(m.out.end(), m.screen.begin(), m.screen.end());
-  fprintf(stderr, "gsrun: %s; %zu output bytes; %llu cycles in the program\n", m.why, m.out.size() - 1026,
+  if (!m.hgr.empty()) {
+    m.out.push_back(0x01), m.out.push_back('H');
+    m.out.insert(m.out.end(), m.hgr.begin(), m.hgr.end());
+  }
+  fprintf(stderr, "gsrun: %s; %zu output bytes; %llu cycles in the program\n", m.why, m.out.size() - 1026 - (m.hgr.empty() ? 0 : m.hgr.size() + 2),
           (unsigned long long)run_cycles);
   if (out_path) {
     FILE* f = fopen(out_path, "wb");
