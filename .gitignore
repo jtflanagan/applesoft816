@@ -19,6 +19,9 @@ gsrun/compile.o
 cc/cc.bin
 cc/cc.bin.elf
 cc/cc.map
+cc/sh.bin
+cc/sh.bin.elf
+cc/sh.map
 build/
 sys/AS816.SYSTEM
 sys/sys.o

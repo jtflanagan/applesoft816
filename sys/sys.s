@@ -6,12 +6,14 @@
 ; AS816.VM and AS816.CC
 ; into them, sets up the resident bank-0 block (res.inc: the VM's direct
 ; page and stubs, the MLI and ROM trampolines, I/O buffers) and calls the
-; shell (cc/, crt0's entry).  When the shell returns: the banks back, QUIT.
+; shell (cc/, crt0's entry).  When the shell returns: the banks back, QUIT -
+; or, if it left a SYS file in the CHAIN bank ("-"), that run at $2000.
 
         .p816
         .smart  off
         .include "res.inc"
         .import __RESIDENT_LOAD__, __RESIDENT_RUN__, __RESIDENT_SIZE__
+        .import __LAUNCH_LOAD__, __LAUNCH_RUN__, __LAUNCH_SIZE__
 
 COUT     = $FDED
 CROUT    = $FD8E
@@ -37,13 +39,17 @@ DP_RNDSEED = $C9
 ; the shell image's header (cc/crt0.s)
 CCH_PARAMS = $08
 ; its parameter block (cc/main.c, struct CcParams)
-CCP_VM_BANK = 0
-CCP_TEXT_BANK = 1
-CCP_VM_DP = 2
-CCP_MODE = 20
-CCP_STR_BANK = 21
-CCP_USER_ID = 22
-CCP_XFER_BANK = 24
+; the shell's parameter block (cc/main_sh.c, struct ShParams)
+SHP_VM_BANK = 0
+SHP_TEXT_BANK = 1
+SHP_VM_DP = 2
+SHP_STR_BANK = 4
+SHP_XFER_BANK = 5
+SHP_STAGE_BANK = 6
+SHP_CC_BANK = 7
+SHP_CC_DATA = 8
+SHP_USER_ID = 9
+SHP_LAUNCH = 11         ; 2: out, a SYS file's length in the CHAIN bank (0: QUIT)
 
         .segment "LOADER"
 start:
@@ -80,7 +86,7 @@ start:
         jmp     fail_native
 @id:    pla
         sta     user_id
-        ldx     #0              ; vm_bank, str_bank, cc_bank, cc_data, text_bank, xfer_bank
+        ldx     #0              ; vm_bank ... stage_bank (banks:)
 @alloc: phx
         jsr     alloc_bank
         plx
@@ -90,7 +96,7 @@ start:
         rep     #$20
         .a16
         inx
-        cpx     #6
+        cpx     #NBANKS
         bne     @alloc
         sec
         xce
@@ -100,6 +106,10 @@ start:
         lda     #<name_vm
         ldx     #>name_vm
         ldy     vm_bank
+        jsr     load_file
+        lda     #<name_sh
+        ldx     #>name_sh
+        ldy     sh_bank
         jsr     load_file
         lda     #<name_cc
         ldx     #>name_cc
@@ -153,7 +163,7 @@ start:
 @stubbed:
 
         ; the shell's parameters: its data bank, the header's block address
-        lda     cc_bank
+        lda     sh_bank
         sta     HND+2
         stz     HND
         stz     HND+1
@@ -164,44 +174,70 @@ start:
         sta     HND
         sep     #$20
         .a8
-        lda     cc_data
+        lda     sh_data
         sta     HND+2
-        ldy     #CCP_VM_BANK
-        lda     vm_bank
+        sep     #$10            ; (byte tables: 8-bit index registers)
+        .i8
+        ldx     #0              ; the banks the shell is told about
+@sp:    ldy     shp_from,x
+        lda     banks,y
+        ldy     shp_to,x
         sta     [HND],y
-        ldy     #CCP_TEXT_BANK
-        lda     text_bank
-        sta     [HND],y
-        ldy     #CCP_VM_DP
+        inx
+        cpx     #SHP_N
+        bne     @sp
+        rep     #$10
+        .i16
+        ldy     #SHP_VM_DP
         lda     #<RES_DP
         sta     [HND],y
         iny
         lda     #>RES_DP
         sta     [HND],y
-        ldy     #CCP_MODE
-        lda     #1
-        sta     [HND],y
-        ldy     #CCP_STR_BANK
-        lda     str_bank
-        sta     [HND],y
-        ldy     #CCP_USER_ID
+        ldy     #SHP_USER_ID
         lda     user_id
         sta     [HND],y
         iny
         lda     user_id+1
         sta     [HND],y
-        ldy     #CCP_XFER_BANK
-        lda     xfer_bank
-        sta     [HND],y
 
-        ; the shell: JSL its bank's $0000 with A = its data bank
-        lda     cc_bank
+        ; the shell: JSL its bank's $0000 with A = its data bank, X cold
+        lda     sh_bank
         sta     shell_call + 3
-        lda     cc_data
+        ldx     #0
+        lda     sh_data
 shell_call:
         jsl     $000000         ; bank patched above
+        rep     #$30
+        .a16
+        .i16
+        ldy     #SHP_LAUNCH
+        lda     [HND],y
+        bne     launch
         sep     #$30
         jmp     quit_native
+
+; ---- "-" on a SYS file: the launcher to $1F00 (the file goes over this
+; loader), told the length, the bank, the ID; native, 16-bit ----
+launch: pha
+        ldx     #0
+@cp:    lda     __LAUNCH_LOAD__,x
+        sta     __LAUNCH_RUN__,x
+        inx
+        inx
+        cpx     #__LAUNCH_SIZE__ + 1
+        bcc     @cp
+        pla
+        sta     t_len
+        lda     user_id
+        sta     t_id
+        sep     #$20
+        .a8
+        lda     xfer_bank
+        sta     t_mvn + 2       ; MVN's operands: destination, source
+        rep     #$20
+        .a16
+        jmp     tramp
 
 ; ---- a whole bank from the Memory Manager: A (16-bit) = its bank ----
         .a16
@@ -367,16 +403,69 @@ quit_native:
         .word   quit_parms
         brk
 
+; ---- the launcher, at $1F00: the file to $2000, the banks back, ProDOS
+; 8's bitmap as at a system program's start, the file run in emulation ----
+        .segment "LAUNCH"
+        .a16
+        .i16
+tramp:  lda     t_len
+        dec     a
+        ldx     #0
+        ldy     #$2000
+        phb
+t_mvn:  .byte   $54, $00, $00   ; MVN source bank (patched) to bank 0
+        plb
+        lda     t_id            ; DisposeAll, DeleteID
+        pha
+        ldx     #$1102
+        jsl     TOOLS
+        lda     t_id
+        pha
+        ldx     #$2103
+        jsl     TOOLS
+        lda     #0
+        tcd
+        sep     #$30
+        .a8
+        .i8
+        ldx     #$17
+        lda     #0
+@bm:    sta     $BF58,x
+        dex
+        bpl     @bm
+        lda     #$CF            ; pages 0, 1, 4-7
+        sta     $BF58
+        lda     #$01            ; $BF
+        sta     $BF6F
+        sec
+        xce
+        ldx     #$FF
+        txs
+        jmp     $2000
+t_len:  .word   0
+t_id:   .word   0
+
+        .segment "LOADER"
 ; ---- data ----
 user_id: .word  0
 err_code: .word 0
 banks:
 vm_bank:   .byte 0
 str_bank:  .byte 0
-cc_bank:   .byte 0
+sh_bank:   .byte 0              ; the shell image (AS816.SH): code, data
+sh_data:   .byte 0
+cc_bank:   .byte 0              ; the compiler image (AS816.CC): code, data
 cc_data:   .byte 0
 text_bank: .byte 0
-xfer_bank: .byte 0
+xfer_bank: .byte 0              ; CHAIN's variables
+stage_bank: .byte 0             ; the compiler's tables to and from the cache
+NBANKS = * - banks
+; which of banks: the shell gets, and where in its block
+shp_from: .byte vm_bank - banks, text_bank - banks, str_bank - banks, xfer_bank - banks
+        .byte   stage_bank - banks, cc_bank - banks, cc_data - banks
+shp_to: .byte   SHP_VM_BANK, SHP_TEXT_BANK, SHP_STR_BANK, SHP_XFER_BANK
+        .byte   SHP_STAGE_BANK, SHP_CC_BANK, SHP_CC_DATA
+SHP_N = * - shp_to
 dest:    .word  0
 
 open_parms:
@@ -408,11 +497,12 @@ quit_parms:
 
 name_vm: .byte  8, "AS816.VM"
 name_cc: .byte  8, "AS816.CC"
+name_sh: .byte  8, "AS816.SH"
 msgs:
 msg_notgs: .byte "APPLESOFT816 NEEDS AN APPLE IIGS", 0
 msg_mm:    .byte "AS816: NO USER ID", 0
 msg_mem:   .byte "AS816: NOT ENOUGH MEMORY", 0
-msg_load:  .byte "AS816: CANNOT LOAD AS816.VM/.CC", 0
+msg_load:  .byte "AS816: CANNOT LOAD AS816.VM/.SH/.CC", 0
 
 ; =========================================================================
 ; The resident trampolines, run at RES_MLI (bank 0).  Both are JSL'd from

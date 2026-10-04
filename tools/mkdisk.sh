@@ -38,6 +38,7 @@ $pd "$P8" get PRODOS "$work/PRODOS"
 $pd "$img" put PRODOS FF 0000 "$work/PRODOS"
 $pd "$img" put AS816.SYSTEM FF 2000 "$root/sys/AS816.SYSTEM"
 $pd "$img" put AS816.VM 06 0000 "$root/vm/vm.bin"
+$pd "$img" put AS816.SH 06 0000 "$root/cc/sh.bin"
 $pd "$img" put AS816.CC 06 0000 "$root/cc/cc.bin"
 for f in "$root/bench/lemonade/LEMONADE.tok" "$root"/bench/rugg_feldman/BM*.bas "$@"; do
   name=$(tok "$f")

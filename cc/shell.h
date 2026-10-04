@@ -8,13 +8,20 @@
 
 void shell(void);
 
-/* main.c */
-int compile(CompileStats *st, void (*poll)(void *));
+/* main_sh.c */
+extern uint32_t text_base, vm_base, xfer_base, stage_base;
+extern uint8_t vm_bank, cc_bank, cc_data;
+extern uint16_t vm_dp;
+
+/* cccall.c: the compiler image's services */
+void cc_init(void);
+int compile(CompileStats *st, uint32_t *clk);
 int compile_direct(const uint8_t *tok, uint16_t *entry);
 uint16_t compile_adopt(const uint8_t name[3], uint8_t ndims);
-extern uint32_t text_base, vm_base, xfer_base;
-extern uint8_t vm_bank;
-extern uint16_t vm_dp;
+void cc_tables(uint16_t *vars, uint16_t *arrays);
+void cc_entry(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *slot);
+uint16_t cc_state_save(void);
+int cc_state_load(uint16_t len);
 
 /* glue.s */
 extern uint32_t xfer_far, xfer_far2;   /* one below the first byte */
@@ -29,6 +36,7 @@ void poke0(uint16_t a, uint8_t v);
 uint8_t mli_call(uint8_t cmd);
 uint8_t rom_call(uint16_t addr);
 uint8_t vm_call(uint16_t entry);
+void cc_call(uint8_t warm);            /* the compiler image (cccall.c) */
 void vm_hook(void);                    /* the VM's CHR$(4) commands come to vm_command */
 uint8_t vm_command(void);       /* vm_run ($0000) or vm_direct; VM_ERR */
 extern uint16_t hash_acc;

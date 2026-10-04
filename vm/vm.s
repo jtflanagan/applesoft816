@@ -193,7 +193,7 @@ optable:
         .word   op_resume, op_stmt, op_tab, op_spc, op_bytepush, op_lomem, op_himem
         .word   op_cont
         .word   op_hgr, op_hgr2, op_hcolor, op_hx, op_hplot, op_hplotto, op_hposn, op_shape
-        .word   op_draw, op_xdraw, op_rot, op_scale
+        .word   op_draw, op_xdraw, op_rot, op_scale, op_usr, op_amper, op_list, op_new, op_del
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -3281,6 +3281,118 @@ op_call:
         ldy     LINNUM
         jsr     romcall
 @done:  ldx     VM_IP
+        NEXTOP  2
+
+; USR(x): JSR $000A, FAC in page zero: ours ($9D-$AC: FAC, ARG, the
+; rounding byte) there and back around the call
+op_usr: stx     VM_IP
+        ldx     #$000F
+@out:   lda     FAC,x
+        sta     f:$00009D,x
+        dex
+        bpl     @out
+        ldy     #$000A
+        sty     VM_T4
+        jsr     romcall
+        ldx     #$000F
+@in:    lda     f:$00009D,x
+        sta     FAC,x
+        dex
+        bpl     @in
+        ldx     VM_IP
+        NEXTOP  2
+
+; AMPER n, token, text: & - and the GS's SHLOAD, RECALL, STORE, SAVE, LOAD,
+; which its AppleSoft sends the same way - JMPs to $3F5 with A and the
+; flags CHRGOT's and TXTPTR after the token.  The statement's text (the
+; token first, then a 0) goes to the input buffer, after a stub
+; (JSR CHRGOT, JMP $3F5); CHRGET from the ROM into page zero.  After it,
+; as NEWSTT: the statement's end (TXTPTR at the 0), or SYNTAX ERROR.
+AMP_BUF  = $0200
+op_amper:
+        stx     VM_IP
+        ldx     #$0017          ; CHRGET ($F10B, as COLDST copies it)
+@cg:    lda     f:$FFF10B,x
+        sta     f:$0000B1,x
+        dex
+        bpl     @cg
+        ldx     #$0005
+@st:    lda     amp_stub,x
+        sta     f:AMP_BUF,x
+        dex
+        bpl     @st
+        ldy     VM_IP
+        lda     a:$0002,y       ; the text's length
+        sta     VM_T0
+        stz     VM_T0+1
+        ldx     #$0000
+@t:     cpx     VM_T0
+        beq     @t0
+        lda     a:$0003,y
+        sta     f:AMP_BUF+6,x
+        iny
+        inx
+        bra     @t
+@t0:    lda     #$00
+        sta     f:AMP_BUF+6,x
+        rep     #$20
+        .a16
+        lda     #AMP_BUF+7      ; TXTPTR: after the token
+        sta     f:$0000B8
+        sep     #$20
+        .a8
+        ldy     #AMP_BUF
+        sty     VM_T4
+        jsr     romcall
+        rep     #$20
+        .a16
+        lda     f:$0000B8
+        sta     SPTR
+        sep     #$20
+        .a8
+        stz     SPTR+2
+        lda     [SPTR]
+        beq     @next
+        lda     #$10            ; SYNTAX
+        jmp     vm_error
+@next:  rep     #$20
+        .a16
+        lda     VM_T0
+        clc
+        adc     VM_IP
+        adc     #$0003
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+amp_stub:
+        .byte   $20, $B7, $00   ; JSR CHRGOT
+        .byte   $4C, $F5, $03   ; JMP $3F5
+
+; LIST a b, NEW, DEL a b: the program's text is the shell's (VM_CBREQ 4,
+; 5, 6, the line numbers in VM_T0/VM_T1).  LIST goes on; NEW and DEL
+; end at the prompt (the shell leaves), DEL goes on if no line is in range.
+op_list:
+        lda     #$04
+        bra     textop
+op_del: lda     #$06
+textop: pha
+        jsr     io_flush        ; what WRITE gathered goes first
+        rep     #$20
+        .a16
+        lda     a:$0002,x
+        sta     VM_T0
+        lda     a:$0004,x
+        sta     VM_T1
+        sep     #$20
+        .a8
+        pla
+        sta     VM_CBREQ
+        jsr     shell_call
+        NEXTOP  6
+op_new: lda     #$05
+        sta     VM_CBREQ
+        jsr     shell_call
         NEXTOP  2
 
 ; PR# n / IN# n: OUTPORT / INPORT

@@ -18,11 +18,14 @@ make -s -C "$tools" prodisk
 # the test files both disks get
 printf 'HELLO\rWORLD\r' > "$work/NOTES"
 head -c 300 "$root/vm/vm.bin" > "$work/CODE"
+ca65 -o "$work/sysprog.o" "$here/sysprog.s" && ld65 -t none -o "$work/SYSPROG" "$work/sysprog.o" || exit 2
 files() {   # in /BSYS/T: sessions start with PREFIX T, so listings hold only these
   "$pd" "$1" mkdir T
   "$pd" "$1" put T/LEMONADE FC 0801 "$root/bench/lemonade/LEMONADE.tok"
   "$pd" "$1" put T/NOTES 04 0000 "$work/NOTES"
   "$pd" "$1" put T/CODE 06 0300 "$work/CODE"
+  "$pd" "$1" put T/ORIG FD 95A8 "$here/orig.var"
+  "$pd" "$1" put T/SYSPROG FF 2000 "$work/SYSPROG"
 }
 
 oracle_disk() {

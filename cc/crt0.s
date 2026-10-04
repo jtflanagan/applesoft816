@@ -1,7 +1,9 @@
 ; crt0.s - the compiler's way in and out on the 65816 (cc/link.ld).
 ;
 ; JSL to the code bank's $0000 with A's low byte = the data bank (0: the
-; code bank's next).  What the
+; code bank's next) and X's = $5A for a warm call: the image has run
+; before and keeps its .data and .bss (the shell calling the compiler);
+; anything else is a cold one.  What the
 ; caller gets back: every register (P, A, X, Y, DBR, D) and page zero's
 ; $00-$1F.  What C gets: D = 0 (its imaginary registers), DBR = the data
 ; bank, M = X = 1, .rodata/.data copied in, .bss cleared, the soft stack.
@@ -48,8 +50,13 @@ save_zp:
         sta     mos16(zp_save),x
         dex
         bpl     save_zp
+        lda     6,s                     ; X's low byte: $5A, warm
+        cmp     #$5a
+        beq     warm
         jsr     crt_init
-        jsr     cc_main
+        bra     go
+warm:   jsr     crt_stack
+go:     jsr     cc_main
         ldx     #$1f
 restore_zp:
         lda     mos16(zp_save),x
@@ -107,6 +114,7 @@ zero:   .byte   0xc0                    ; cpy #__bss_size
         iny
         bra     zero
 zeroed: sep     #$30
+crt_stack:
         lda     #__stack_lo
         sta     __rc0
         lda     #__stack_hi

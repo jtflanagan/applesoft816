@@ -21,9 +21,6 @@
 #include "machine.h"
 #include "parse.h"
 
-/* the video counter: $C02E is the vertical count over two, $7D-$FF (262
- * lines a frame, 15734 a second) */
-#define VERTCNT 0xC02E
 
 /* the VM's direct page (vm/vm.s) and image header */
 #define VM_DENTRY 0xE6
@@ -34,6 +31,7 @@
 #define VM_CSP 0x24
 #define VM_DATPTR 0xCF
 #define VM_CONTIP 0xE9
+#define VM_T0 0x30
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
@@ -149,31 +147,37 @@ typedef struct {
   uint8_t magic[4];                 /* "A816" */
   uint8_t kind, version;            /* 'C', CACHE_VERSION */
   uint16_t vm_print, src_len, src_hash, start, len, lines, code;
+  uint16_t state;                   /* the compiler's tables after the image: their length */
 } CacheHdr;
 
 #define CACHE_DIR "AS816.CACHE"
-#define CACHE_VERSION 3             /* 2: the compiler's tables after the image; 3: salist_cap */
+#define CACHE_VERSION 4             /* 2: the compiler's tables after the image; 3: salist_cap;
+                                     * 4: their length in the header */
 
-static uint8_t cache_ref, cache_err;
-static void cache_io(void *ctx, void *p, uint16_t n)
+/* n bytes between the open cache file and the stage bank (the compiler's
+ * tables), through the I/O buffer: 0 or an MLI error */
+static uint8_t stage_file(uint8_t ref, uint16_t n, int save)
 {
   ReadParms r;
-  uint8_t *q = (uint8_t *)p;
-  uint16_t k;
-  int save = ctx != 0;
-  while (n && !cache_err) {
-    k = n < RES_IOSIZE ? n : RES_IOSIZE;
-    r.n = 4, r.ref = cache_ref, r.buf = RES_IOBUF, r.req = k, r.trans = 0;
+  uint16_t at = 0, k;
+  uint8_t e;
+  r.n = 4, r.ref = ref, r.buf = RES_IOBUF;
+  while (at < n) {
+    k = (uint16_t)(n - at) < RES_IOSIZE ? (uint16_t)(n - at) : RES_IOSIZE;
+    r.req = k, r.trans = 0;
     if (save) {
-      to0(RES_IOBUF, q, k);
-      cache_err = mli(MLI_WRITE, &r, sizeof r);
+      xfer_far = (stage_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = k;
+      far_move();
+      if ((e = mli(MLI_WRITE, &r, sizeof r)) != 0) return e;
     } else {
-      cache_err = mli(MLI_READ, &r, sizeof r);
-      if (!cache_err && r.trans != k) cache_err = 0x4C;
-      if (!cache_err) from0(q, RES_IOBUF, k);
+      if ((e = mli(MLI_READ, &r, sizeof r)) != 0) return e;
+      if (r.trans != k) return MLI_EOF;
+      xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (stage_base | at) - 1, xfer_n = k;
+      far_move();
     }
-    q += k, n = (uint16_t)(n - k);
+    at = (uint16_t)(at + k);
   }
+  return 0;
 }
 
 /* the cache's pathname (or, dir_only, its directory's) into out; 0 if too long */
@@ -219,10 +223,9 @@ static int cache_load(CompileStats *st)
     far_move();
     at = (uint16_t)(at + r.trans), got = (uint16_t)(got + r.trans);
   }
-  cache_ref = ref, cache_err = 0;
-  as816_state(0, cache_io, 0);
+  e = stage_file(ref, h.state, 0);
   close_ref(ref);
-  if (cache_err) return 0;
+  if (e || cc_state_load(h.state)) return 0;
   st->lines = h.lines, st->code_size = h.code;
   return 1;
 no:
@@ -242,6 +245,7 @@ static void cache_save(const CompileStats *st)
   memcpy(h.magic, "A816", 4);
   h.kind = 'C', h.version = CACHE_VERSION, h.vm_print = vm_print, h.src_len = src_len, h.src_hash = src_hash;
   h.start = prog_start, h.len = (uint16_t)(end - prog_start), h.lines = st->lines, h.code = st->code_size;
+  h.state = cc_state_save();
   if (!cache_path(cp, 1)) return;
   put_path(cp);
   c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0x0F, c.aux = 0, c.storage = 0x0D;
@@ -263,27 +267,8 @@ static void cache_save(const CompileStats *st)
       w.req = n;
       if (mli(MLI_WRITE, &w, sizeof w)) break;
     }
-  cache_ref = ref, cache_err = 0;
-  as816_state(1, cache_io, (void *)1);
+  stage_file(ref, h.state, 1);
   close_ref(ref);
-}
-
-/* ---- the clock: half-lines of the video counter, counted by the
- * compiler's poll (at every statement: well under a frame apart) ---- */
-static uint32_t clk_half;
-static uint8_t clk_last;
-static void clk_poll(void *ctx)
-{
-  uint8_t v = peek0(VERTCNT), d = (uint8_t)(v - clk_last);
-  (void)ctx;
-  if (v < clk_last) d = (uint8_t)(d - 125);     /* past $FF: on from $7D */
-  clk_half += d;
-  clk_last = v;
-}
-static void clk_start(void)
-{
-  clk_half = 0;
-  clk_last = peek0(VERTCNT);
 }
 
 /* the program in memory, compiled (from the cache when it is a file's and
@@ -291,6 +276,7 @@ static void clk_start(void)
 static int compile_current(void)
 {
   CompileStats st;
+  uint32_t clk_half;
   uint8_t e;
   if (compiled) return 0;
   if (from_file && cache_load(&st)) {
@@ -305,9 +291,7 @@ static int compile_current(void)
     crout();
     return 0;
   }
-  clk_start();
-  e = (uint8_t)compile(&st, clk_poll);
-  clk_poll(0);
+  e = (uint8_t)compile(&st, &clk_half);
   if (e) { as_error("OUT OF MEMORY"); return 1; }
   compiled = 1;
   poke0((uint16_t)(vm_dp + VM_FRESH), 1);
@@ -417,21 +401,22 @@ static void chain_keep(uint8_t *d)
 
 static void chain_export(void)
 {
-  uint16_t i, addr, n, e;
+  uint16_t i, addr, n, e, nv, na;
   uint8_t name[3], nd, k, v[8], d[4 + 2 * 88];
   uint32_t count;
+  cc_tables(&nv, &na);
   chain_at = 0;
   chain_half ^= 1;
   chain_str = (uint16_t)(0x8000u + chain_half * 0x4000u);
-  for (i = 0; i < as816_count(0); i++) {
-    as816_var(i, name, &addr);
+  for (i = 0; i < nv; i++) {
+    cc_entry(i, name, &nd, &addr);
     k = name[2] == 1 ? 2 : name[2] == 2 ? 4 : 5;
     vm_get(v, addr, k);
     if (name[2] == 2) chain_keep(v);
     chain_put("\0", 1), chain_put(name, 3), chain_put(&k, 1), chain_put(v, k);
   }
-  for (i = 0; i < as816_count(1); i++) {
-    as816_array(i, name, &nd, &addr);
+  for (i = 0; i < na; i++) {
+    cc_entry((uint16_t)(nv + i), name, &nd, &addr);
     vm_get(d, addr, (uint16_t)(4 + 2 * nd));
     if (!(d[0] | d[1])) continue;               /* never dimensioned */
     for (count = 1, k = 0; k < nd; k++) count *= (uint32_t)(d[4 + 2 * k] | d[5 + 2 * k] << 8) + 1;
@@ -457,30 +442,31 @@ static void chain_export(void)
 static void chain_import(void)
 {
   uint8_t kind, name[3], other[3], k, nd, ond, esize, v[8], bounds[2 * 88];
-  uint16_t i, addr, n, hf, hend;
+  uint16_t i, addr, n, hf, hend, nv, na;
   vm_get(&hf, (uint16_t)(prog_start + 8), 2);    /* the array heap: its free pointer, end */
   vm_get(&hend, (uint16_t)(prog_start + 10), 2);
   chain_at = 0;
+  cc_tables(&nv, &na);
   for (;;) {
     chain_get(&kind, 1);
     if (kind == 0xFF) break;
     chain_get(name, 3);
     if (!kind) {
       chain_get(&k, 1), chain_get(v, k);
-      for (i = 0; i < as816_count(0); i++) {
-        as816_var(i, other, &addr);
+      for (i = 0; i < nv; i++) {
+        cc_entry(i, other, &ond, &addr);
         if (!memcmp(name, other, 3)) break;
       }
-      if (i == as816_count(0)) addr = compile_adopt(name, 0);   /* (kept, unnamed here) */
+      if (i == nv) addr = compile_adopt(name, 0), cc_tables(&nv, &na);   /* (kept, unnamed here) */
       if (addr) vm_put(addr, v, k);
       continue;
     }
     chain_get(&nd, 1), chain_get(&esize, 1), chain_get(bounds, (uint16_t)(2 * nd)), chain_get(&n, 2);
-    for (i = 0; i < as816_count(1); i++) {
-      as816_array(i, other, &ond, &addr);
+    for (i = 0; i < na; i++) {
+      cc_entry((uint16_t)(nv + i), other, &ond, &addr);
       if (!memcmp(name, other, 3)) break;
     }
-    if (i == as816_count(1)) addr = compile_adopt(name, nd), ond = nd;   /* (kept, unnamed here) */
+    if (i == na) addr = compile_adopt(name, nd), ond = nd, cc_tables(&nv, &na);   /* (kept, unnamed here) */
     if (addr && ond == nd && (uint32_t)hf + n <= hend) {
       vm_put(addr, &hf, 2);                       /* storage, the bounds; the bytes */
       vm_put((uint16_t)(addr + 4), bounds, (uint16_t)(2 * nd));
@@ -491,6 +477,25 @@ static void chain_import(void)
     chain_at = (uint16_t)(chain_at + n);
   }
   vm_put((uint16_t)(prog_start + 8), &hf, 2);
+}
+
+/* STORE's and RESTORE's start: the program compiled, its variables to be
+ * read or set without a CLEAR to come (a new image's stacks and DATA as a
+ * CLEAR leaves them); prog_start into *at; 1 if it does not compile, 2 if
+ * the variables are the caller's to CLEAR (a new image) */
+int prog_vars(uint16_t *at)
+{
+  uint16_t w;
+  if (compile_current()) return 1;
+  *at = prog_start;
+  if (!peek0((uint16_t)(vm_dp + VM_FRESH))) return 0;
+  poke0((uint16_t)(vm_dp + VM_FRESH), 0);
+  w = vm_read16((uint16_t)(prog_start + 4));
+  poke0((uint16_t)(vm_dp + VM_CSP), (uint8_t)w), poke0((uint16_t)(vm_dp + VM_CSP + 1), (uint8_t)(w >> 8));
+  w = vm_read16((uint16_t)(prog_start + 0x16));
+  poke0((uint16_t)(vm_dp + VM_DATPTR), (uint8_t)w), poke0((uint16_t)(vm_dp + VM_DATPTR + 1), (uint8_t)(w >> 8));
+  poke0((uint16_t)(vm_dp + VM_CONTIP), 0), poke0((uint16_t)(vm_dp + VM_CONTIP + 1), 0);
+  return 2;
 }
 
 /* CHAIN path[,@line]: the program in, its variables the old one's, run
@@ -528,12 +533,29 @@ static void chain_run(int32_t line)
   vm_call(vm_read16(VMH_DIRECT));
 }
 
+static void new_program(void);
+static int find_line(uint16_t num, uint16_t *at, uint16_t *link);
+static uint16_t del_from, del_to;        /* DEL's lines, for after_vm */
+static uint16_t vm_dp16(uint8_t a)
+{
+  return (uint16_t)(peek0((uint16_t)(vm_dp + a)) | peek0((uint16_t)(vm_dp + a + 1)) << 8);
+}
+
 static void after_vm(void)
 {
   uint8_t what, e;
   while ((what = pending) != 0) {
     pending = 0;
     if (what == 3) { bye = 1; return; }
+    if (what == 5) { new_program(); return; }
+    if (what == 6) {                             /* DEL: the lines out, FIX.LINKS */
+      xfer_far = (text_base | del_to) - 1, xfer_far2 = (text_base | del_from) - 1;
+      xfer_n = (uint16_t)(prog_end - del_to);
+      far_move_up();
+      prog_end = (uint16_t)(fix_links() + 2);
+      compiled = 0, from_file = 0;
+      return;
+    }
     if (what == 4) chain_export();
     if ((e = prog_load(pending_path)) != 0) { dos_message(dos_error(e)); return; }
     if (what == 1) run_file = 1, run_from(pending_line);
@@ -631,10 +653,26 @@ static int list_wrap(void)
   if (peek0(0xC01F) & 0x80) return peek0(0x057B) >= 0x49;
   return peek0(CH) >= 0x21;
 }
+/* where LIST's characters go: the screen, or WRITE's file (a program's
+ * LIST under WRITE: the screen's column does not move, nothing wraps) */
+static uint8_t list_file, lbuf[256], lbn;
+static void lput(uint8_t c)
+{
+  if (!list_file) { cout(c); return; }
+  lbuf[lbn++] = c;
+  if (c == 0x0D || lbn == 255) dos_put(lbuf, lbn), lbn = 0;
+}
 static void list_out(uint8_t c)
 {
-  cout(c);
-  if (list_wrap()) { crout(); poke0(CH, 5); }
+  lput(c);
+  if (!list_file && list_wrap()) { crout(); poke0(CH, 5); }
+}
+static void list_num(uint16_t v)
+{
+  char d[6];
+  int8_t j = 0;
+  do d[j++] = (char)('0' + v % 10); while ((v /= 10) != 0);
+  while (j) lput((uint8_t)d[--j]);
 }
 static void list(uint16_t from, uint16_t to)
 {
@@ -653,14 +691,14 @@ static void list(uint16_t from, uint16_t to)
       cout(7);
       break;
     }
-    num = (uint16_t)(l[2] | l[3] << 8);
+    lput(0x0D);                         /* (CRDO before the range check: a line */
+    num = (uint16_t)(l[2] | l[3] << 8); /* past it leaves a blank line) */
     if (num > to) break;
     n = (uint16_t)(link - at - 4) < 250 ? (uint16_t)(link - at - 4) : 250;
     from_text(l + 4, (uint16_t)(at + 4), n);
     l[4 + n] = 0;
-    crout();
-    cout(' ');
-    print_u(num);
+    lput(' ');
+    list_num(num);
     list_out(' ');
     for (i = 4; (c = l[i]) != 0; i++) {
       if (c < 0x80) { list_out(c); continue; }
@@ -668,15 +706,36 @@ static void list(uint16_t from, uint16_t to)
         uint16_t k = 0;
         uint8_t t = (uint8_t)(c - 0x80);
         while (t) { while (!(kw[k++] & 0x80)) {} t--; }
-        cout(' ');
-        while (!(kw[k] & 0x80)) cout(kw[k++]);
-        cout((uint8_t)(kw[k] & 0x7F));
+        lput(' ');
+        while (!(kw[k] & 0x80)) lput(kw[k++]);
+        lput((uint8_t)(kw[k] & 0x7F));
         list_out(' ');
       }
     }
     at = link;
   }
-  crout();
+  lput(0x0D);
+  if (lbn) dos_put(lbuf, lbn), lbn = 0;
+}
+
+/* a program's (or a direct line's) LIST, NEW, DEL (VM_CBREQ 4, 5, 6; the
+ * numbers at VM_T0, VM_T1): 0 on, 1 the VM leaves (after_vm does it) */
+static uint8_t text_request(uint8_t req)
+{
+  uint16_t a = vm_dp16(VM_T0), b = vm_dp16(VM_T0 + 2), link;
+  if (req == 4) {
+    list_file = (uint8_t)dos_writing();
+    list(a, b);
+    list_file = 0;
+    return 0;
+  }
+  if (req == 6) {                         /* FNDLIN a, FNDLIN b+1: backwards, on */
+    find_line(a, &del_from, &link);
+    find_line((uint16_t)(b + 1), &del_to, &link);
+    if (del_from > del_to) return 0;
+  }
+  pending = req;
+  return 1;
 }
 
 /* ---- CHR$(4) commands from a running program: vm_command, called by the
@@ -696,6 +755,7 @@ uint8_t vm_command(void)
   /* a running program's command, or a direct line's (NOT DIRECT COMMAND) */
   int deferred = peek0((uint16_t)(vm_dp + VM_CURLIN + 1)) != 0xFF;
   uint16_t b;
+  if (req >= 4) return text_request(req);
   if (req) {                              /* a text file's (dos.c) */
     if ((k = dos_io(req)) == 0) return 0;
     if (quiet) return k;
@@ -791,11 +851,11 @@ static int basic_line(void)
       p++;
       if ((b = linget(&p)) < 0) break;
     }
-    if (raw[p]) break;
+    if (raw[p]) goto compiled;          /* more after it: a direct line */
     list((uint16_t)a, b ? (uint16_t)b : 0xFFFF);
     return 1;
   case 0xBF:                            /* NEW */
-    if (raw[1]) break;
+    if (raw[1]) goto compiled;
     new_program();
     return 1;
   case 0xAC:                            /* RUN (RUN n: a direct line) */
@@ -806,6 +866,7 @@ static int basic_line(void)
   case 0:
     return 1;
   default:
+  compiled:
     direct_tokens();
     after_vm();
     return 1;

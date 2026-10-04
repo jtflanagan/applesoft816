@@ -26,12 +26,6 @@ static const char *const names[C_COUNT] = {
   "PR#", "PREFIX", "READ", "RENAME", "RESTORE", "RUN", "SAVE", "STORE", "UNLOCK", "VERIFY", "WRITE"
 };
 
-/* BASIC.SYSTEM's errors */
-enum {
-  B_RANGE = 2, B_NO_DEVICE, B_WRITE_PROTECTED, B_END_OF_DATA, B_PATH_NOT_FOUND, B_PATH_NOT_FOUND2,
-  B_IO, B_DISK_FULL, B_FILE_LOCKED, B_INVALID_PARAMETER, B_NO_BUFFERS, B_FILE_TYPE, B_TOO_LARGE,
-  B_NOT_DIRECT, B_SYNTAX, B_DIRECTORY_FULL, B_FILE_NOT_OPEN, B_DUPLICATE, B_FILE_BUSY, B_STILL_OPEN
-};
 static const char *const messages[] = {
   "RANGE ERROR", "NO DEVICE CONNECTED", "WRITE PROTECTED", "END OF DATA", "PATH NOT FOUND",
   "PATH NOT FOUND", "I/O ERROR", "DISK FULL", "FILE LOCKED", "INVALID PARAMETER", "NO BUFFERS AVAILABLE",
@@ -575,14 +569,18 @@ uint8_t dos_io(uint8_t req)
 
 int dos_writing(void) { return io_file && (peek0((uint16_t)(vm_dp + VM_IOMODE)) & IO_WRITE); }
 
-void dos_put_cr(void)
+void dos_put(const uint8_t *p, uint8_t n)
 {
   ReadParms w;
-  static const uint8_t cr = 0x0D;
-  if (!io_file) return;
-  to0(RES_IOBUF, &cr, 1);
-  w.n = 4, w.ref = files[io_file - 1].ref, w.buf = RES_IOBUF, w.req = 1;
+  if (!io_file || !n) return;
+  to0(RES_IOBUF, p, n);
+  w.n = 4, w.ref = files[io_file - 1].ref, w.buf = RES_IOBUF, w.req = n;
   mli(MLI_WRITE, &w, sizeof w);
+}
+void dos_put_cr(void)
+{
+  static const uint8_t cr = 0x0D;
+  dos_put(&cr, 1);
 }
 
 /* back at the prompt: READ/WRITE off; after a program, open files are
@@ -608,6 +606,38 @@ static uint8_t run(Cmd *c, int deferred)
   if ((e = prog_load(c->path)) != 0) return DOS_ERROR | dos_error(e);
   prog_run(line);
   return DOS_OK;
+}
+
+/* "-" on a SYS file: it into the CHAIN bank, for the loader to run at
+ * $2000 once the shell has gone (sys/sys.s); its name as typed at $0280,
+ * as BASIC.SYSTEM leaves it.  The files closed. */
+uint16_t dos_launch;
+static uint8_t sys_load(Cmd *c)
+{
+  ReadParms r;
+  uint8_t e, ref, k;
+  uint32_t eof;
+  uint16_t done = 0;
+  put_path(c->path);
+  if ((e = open_path(&ref)) != 0) return dos_error(e);
+  if ((eof = get_eof(ref)) > 0xBF00 - 0x2000) { close_ref(ref); return B_TOO_LARGE; }
+  r.n = 4, r.ref = ref, r.buf = RES_IOBUF;
+  while (done < eof) {
+    r.req = (uint16_t)(eof - done < RES_IOSIZE ? eof - done : RES_IOSIZE);
+    r.trans = 0;
+    e = mli(MLI_READ, &r, sizeof r);
+    if (e == MLI_EOF || (!e && !r.trans)) break;
+    if (e) { close_ref(ref); return dos_error(e); }
+    xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (xfer_base | done) - 1, xfer_n = r.trans;
+    far_move();
+    done = (uint16_t)(done + r.trans);
+  }
+  close_ref(ref);
+  if (!done) return B_RANGE;
+  for (k = 0; k < RES_NTBUF; k++) close_file(&files[k]);
+  to0(0x0280, c->path, (uint16_t)(c->path[0] + 1));
+  dos_launch = done;
+  return 0;
 }
 
 static uint8_t command(Cmd *c, int deferred)
@@ -743,6 +773,10 @@ static uint8_t command(Cmd *c, int deferred)
       if ((e = bload(c, &addr)) == 0) rom_call(addr);
       break;
     }
+    if (info.type == 0xFF) {              /* a system program: in place of us */
+      if ((e = sys_load(c)) == 0) return DOS_BYE;
+      break;
+    }
     if (info.type == 0x04) {              /* a text file: EXEC it */
       c->cmd = C_EXEC;
       return command(c, deferred);
@@ -759,7 +793,9 @@ static uint8_t command(Cmd *c, int deferred)
     }
     break;
   case C_FRE: case C_MON: case C_NOMON: break;
-  default: e = B_SYNTAX; break;           /* (STORE, RESTORE: next) */
+  case C_STORE: e = prog_store(c->path); break;
+  case C_RESTORE: e = prog_restore(c->path); break;
+  default: e = B_SYNTAX; break;
   }
   return e ? (uint8_t)(DOS_ERROR | e) : DOS_OK;
 }

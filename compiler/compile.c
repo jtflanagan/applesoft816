@@ -37,7 +37,9 @@ enum {
   T_ON = 0xB4, T_WAIT = 0xB5, T_CONT = 0xBB,
   T_HGR2 = 0x90, T_HGR = 0x91, T_HCOLOR = 0x92, T_HPLOT = 0x93, T_DRAW = 0x94, T_XDRAW = 0x95,
   T_ROT = 0x98, T_SCALE = 0x99, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
-  T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2,
+  T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2, T_USR = 0xD5,
+  T_LIST = 0xBC, T_NEW = 0xBF, T_DEL = 0x85,
+  T_SHLOAD = 0x9A, T_RECALL = 0xA7, T_STORE = 0xA8, T_AMPER = 0xAF, T_SAVE = 0xB6, T_LOAD = 0xB7,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
   T_TO = 0xC1, T_THEN = 0xC4, T_NOT = 0xC6, T_STEP = 0xC7, T_PLUS = 0xC8, T_MINUS = 0xC9,
   T_MUL = 0xCA, T_DIV = 0xCB, T_POW = 0xCC, T_AND = 0xCD, T_OR = 0xCE,
@@ -631,6 +633,7 @@ static int element(Pending *pend, int *np)
         return TY_NUM;
       }
       switch (c) {
+      case T_USR: if (!paren_arg(TY_NUM)) return TY_ERR; op(OP_USR); return TY_NUM;
       case T_LEN: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_LEN); return TY_NUM;
       case T_ASC: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_ASC); return TY_NUM;
       case T_VAL: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_VAL); return TY_NUM;
@@ -1065,6 +1068,46 @@ static void statement(void)
   case T_ROT: num_then(OP_ROT); return;
   case T_SCALE: num_then(OP_SCALE); return;
   case T_CONT: op(OP_CONT); return;
+  case T_LIST: {                          /* LIST [a][-,][b] ($D6A5): the shell lists */
+    uint16_t a = 0, b;
+    uint8_t d = peek();
+    if (!is_digit(d) && d && d != ':' && d != T_MINUS && d != ',') { error_here(E_SYNTAX); return; }
+    if (read_linenum(&a) < 0) { error_here(E_SYNTAX); return; }
+    b = a;
+    if ((d = peek()) == T_MINUS || d == ',') {
+      p++;
+      b = 0;
+      if (read_linenum(&b) < 0) { error_here(E_SYNTAX); return; }
+    }
+    if ((d = peek()) != 0 && d != ':') { error_here(E_SYNTAX); return; }
+    op16(OP_LIST, a);
+    emit16(b ? b : 0xFFFF);
+    return;
+  }
+  case T_NEW:                             /* NEW: the program gone, back to the prompt */
+    if (peek() && peek() != ':') { error_here(E_SYNTAX); return; }
+    op(OP_NEW);
+    return;
+  case T_DEL: {                           /* DEL a,b ($F331): lines out, back to the prompt */
+    uint16_t a, b = 0;
+    if (read_linenum(&a) <= 0) { error_here(E_SYNTAX); return; }
+    if (!want(',')) return;
+    if (read_linenum(&b) < 0) { error_here(E_SYNTAX); return; }
+    op16(OP_DEL, a);
+    emit16(b);
+    return;
+  }
+  case T_AMPER: case T_SHLOAD: case T_RECALL: case T_STORE: case T_SAVE: case T_LOAD: {
+    /* & (the GS's AppleSoft sends the cassette's statements there too): the
+     * statement's text, the token first, for the routine at $3F5 to read */
+    uint16_t at = p, k;
+    skip_statement();
+    op(OP_AMPER);
+    emit8((uint8_t)(p - at + 1));
+    emit8(c);
+    for (k = at; k < p; k++) emit8(buf[k]);
+    return;
+  }
   case T_RESUME: op(OP_RESUME); return;
   case T_LOMEM: num_then(OP_LOMEM); return;
   case T_HIMEM: num_then(OP_HIMEM); return;

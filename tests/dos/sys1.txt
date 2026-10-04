@@ -1,0 +1,2 @@
+PREFIX T
+-SYSPROG	4

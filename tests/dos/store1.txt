@@ -1,0 +1,19 @@
+PREFIX T
+NEW
+A = 1.5: B% = - 3: C$ = "HI" + "": DIM D(2): D(1) = 7: DIM E$(1): E$(0) = "XY" + "": DIM F%(1,2): F%(1,2) = 258: Z = - 2
+STORE V1	3
+CLEAR
+PRINT A;B%;C$;D(1);E$(0);F%(1,2);Z
+RESTORE V1	3
+PRINT A;B%;C$;D(1);E$(0);F%(1,2);Z
+NEW
+10 DIM Q(5),S$(3): FOR I = 0 TO 5: Q(I) = I * I: NEXT: FOR I = 0 TO 3: S$(I) = STR$ (I) + "S": NEXT: K$ = "LIT": PRINT CHR$ (4)"STORE V2"
+20 CLEAR : PRINT Q(3);S$(2);K$: PRINT CHR$ (4)"RESTORE V2": PRINT Q(3);S$(2);K$;I
+RUN	4
+PRINT Q(5);S$(3);M
+RESTORE ORIG	3
+PRINT A;B%;C$;D(1);E$(0);F%(1,2);Z;Q(5)
+RESTORE NOTES	3
+STORE NOTES	3
+RESTORE NOPE	3
+CAT,TVAR	3
