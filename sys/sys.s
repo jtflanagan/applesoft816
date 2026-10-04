@@ -2,7 +2,8 @@
 ;
 ; ProDOS 8 runs it at $2000 in emulation mode.  It checks for a IIgs, gets
 ; whole banks from the Memory Manager (the VM's, the string heap's, the
-; shell's code and data, the program text's), loads AS816.VM and AS816.CC
+; shell's code and data, the program text's, a spare for CHAIN), loads
+; AS816.VM and AS816.CC
 ; into them, sets up the resident bank-0 block (res.inc: the VM's direct
 ; page and stubs, the MLI and ROM trampolines, I/O buffers) and calls the
 ; shell (cc/, crt0's entry).  When the shell returns: the banks back, QUIT.
@@ -42,7 +43,7 @@ CCP_VM_DP = 2
 CCP_MODE = 20
 CCP_STR_BANK = 21
 CCP_USER_ID = 22
-CCP_DATA_BANK = 24
+CCP_XFER_BANK = 24
 
         .segment "LOADER"
 start:
@@ -79,7 +80,7 @@ start:
         jmp     fail_native
 @id:    pla
         sta     user_id
-        ldx     #0              ; vm_bank, str_bank, cc_bank, cc_data, text_bank
+        ldx     #0              ; vm_bank, str_bank, cc_bank, cc_data, text_bank, xfer_bank
 @alloc: phx
         jsr     alloc_bank
         plx
@@ -89,7 +90,7 @@ start:
         rep     #$20
         .a16
         inx
-        cpx     #5
+        cpx     #6
         bne     @alloc
         sec
         xce
@@ -188,6 +189,9 @@ start:
         sta     [HND],y
         iny
         lda     user_id+1
+        sta     [HND],y
+        ldy     #CCP_XFER_BANK
+        lda     xfer_bank
         sta     [HND],y
 
         ; the shell: JSL its bank's $0000 with A = its data bank
@@ -372,6 +376,7 @@ str_bank:  .byte 0
 cc_bank:   .byte 0
 cc_data:   .byte 0
 text_bank: .byte 0
+xfer_bank: .byte 0
 dest:    .word  0
 
 open_parms:

@@ -79,4 +79,14 @@ int as816_direct(const Platform *pf, const uint8_t *tok, uint16_t *entry);
  * back from it: io moves n bytes between p and the file, in order. */
 void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx);
 
+/* The last compile's variables (arrays_too: its arrays): how many; each
+ * one's name (two characters, then the type: 0 real, 1 integer, 2 string)
+ * and its slot - for an array, its dimensions and its descriptor. */
+uint16_t as816_count(int arrays_too);
+void as816_var(uint16_t i, uint8_t name[3], uint16_t *addr);
+void as816_array(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *desc);
+/* a variable (ndims 0) or array the program does not name, made for CHAIN
+ * as a direct line makes one: its slot or descriptor, 0 if no room */
+uint16_t as816_adopt(const Platform *pf, const uint8_t name[3], uint8_t ndims);
+
 #endif

@@ -725,6 +725,12 @@ static uint8_t command(Cmd *c, int deferred)
     break;
   case C_BSAVE: e = bsave(c); break;
   case C_RUN: return run(c, deferred);
+  case C_CHAIN: {
+    int32_t line = (c->have & O_AT) ? (int32_t)c->at : -1;
+    if (deferred) { prog_pending(4, c->path, line); return DOS_STOP; }
+    prog_chain(c->path, line);
+    return DOS_OK;
+  }
   case C_LOAD:
     if (deferred) { prog_pending(2, c->path, -1); return DOS_STOP; }
     if ((e = prog_load(c->path)) != 0) e = dos_error(e);
@@ -753,7 +759,7 @@ static uint8_t command(Cmd *c, int deferred)
     }
     break;
   case C_FRE: case C_MON: case C_NOMON: break;
-  default: e = B_SYNTAX; break;           /* (CHAIN, STORE, RESTORE: next) */
+  default: e = B_SYNTAX; break;           /* (STORE, RESTORE: next) */
   }
   return e ? (uint8_t)(DOS_ERROR | e) : DOS_OK;
 }

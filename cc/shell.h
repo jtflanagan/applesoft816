@@ -11,7 +11,8 @@ void shell(void);
 /* main.c */
 int compile(CompileStats *st, void (*poll)(void *));
 int compile_direct(const uint8_t *tok, uint16_t *entry);
-extern uint32_t text_base, vm_base;
+uint16_t compile_adopt(const uint8_t name[3], uint8_t ndims);
+extern uint32_t text_base, vm_base, xfer_base;
 extern uint8_t vm_bank;
 extern uint16_t vm_dp;
 

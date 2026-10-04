@@ -1359,3 +1359,43 @@ void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx
     dvar_at = 0;
   }
 }
+
+/* ---- the program's variables, by name (CHAIN carries them across) ---- */
+uint16_t as816_count(int arrays_too)
+{
+  return arrays_too ? narrays : nvars;
+}
+void as816_var(uint16_t i, uint8_t name[3], uint16_t *addr)
+{
+  name[0] = vars[i].c1, name[1] = vars[i].c2, name[2] = vars[i].type;
+  *addr = var_off[i];
+}
+void as816_array(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *desc)
+{
+  name[0] = arrays[i].c1, name[1] = arrays[i].c2, name[2] = arrays[i].type;
+  *ndims = arrays[i].ndims;
+  *desc = desc_off[i];
+}
+
+/* a variable (ndims 0) or array CHAIN brings that the program does not
+ * name: made as a direct line makes one, so it stays for the next CHAIN or
+ * a direct line; its slot (an array's descriptor), 0 if there is no room */
+uint16_t as816_adopt(const Platform *platform, const uint8_t name[3], uint8_t ndims)
+{
+  uint16_t a = 0;
+  int i;
+  pf = platform;
+  overflow = 0;
+  direct = 1;
+  pass = 2;
+  if (ndims) {
+    i = array_slot(name[0], name[1], name[2], ndims);
+    if (i >= 0 && !overflow) a = desc_off[i];
+  } else {
+    a = var_slot(name[0], name[1], name[2]);
+    if (overflow) a = 0;
+  }
+  flush();
+  direct = 0;
+  return a;
+}

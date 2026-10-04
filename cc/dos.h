@@ -38,6 +38,7 @@ void dos_prompt(int after_run);
 uint8_t prog_load(const uint8_t *path);           /* a BAS file into memory; an MLI error */
 uint8_t prog_save(const uint8_t *path);
 void prog_run(int32_t line);                     /* -1: from the start */
-void prog_pending(uint8_t what, const uint8_t *path, int32_t line);   /* after the VM: 1 RUN, 2 LOAD */
+void prog_pending(uint8_t what, const uint8_t *path, int32_t line);   /* after the VM: 1 RUN, 2 LOAD, 4 CHAIN */
+void prog_chain(const uint8_t *path, int32_t line);   /* CHAIN at the prompt */
 
 #endif

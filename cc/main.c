@@ -22,6 +22,7 @@ struct CcParams {
   uint8_t mode;         /* in: 0 compile once, 1 the shell */
   uint8_t str_bank;     /* in: the string heap's bank (the shell) */
   uint16_t user_id;     /* in: the Memory Manager's ID for us (the shell) */
+  uint8_t xfer_bank;    /* in: a spare bank (CHAIN's variables) */
 };
 /* in .noinit: crt0 clears .bss after the loader has filled this in */
 __attribute__((section(".noinit.cc_params"))) struct CcParams cc_params;
@@ -37,7 +38,7 @@ void far_in(void);
 void far_out(void);
 
 static uint16_t optab[OP_COUNT];
-uint32_t text_base, vm_base;
+uint32_t text_base, vm_base, xfer_base;
 static Platform pf;
 
 static void pf_read(void *ctx, uint16_t a, uint8_t *dst, uint16_t n)
@@ -75,6 +76,11 @@ int compile_direct(const uint8_t *tok, uint16_t *entry)
   return as816_direct(&pf, tok, entry);
 }
 
+uint16_t compile_adopt(const uint8_t name[3], uint8_t ndims)
+{
+  return as816_adopt(&pf, name, ndims);
+}
+
 int cc_main(void)
 {
   uint16_t i, nops, tab;
@@ -82,6 +88,7 @@ int cc_main(void)
   vm_dp = cc_params.vm_dp;
   vm_base = (uint32_t)vm_bank << 16;
   text_base = (uint32_t)cc_params.text_bank << 16;
+  xfer_base = (uint32_t)cc_params.xfer_bank << 16;
   nops = vm_word(0x0A);
   if (nops != OP_COUNT) { cc_params.result = -2; cc_params.st.lines = nops; cc_params.st.code_size = vm_word(4); return 0; }
   tab = vm_word(0x0C);

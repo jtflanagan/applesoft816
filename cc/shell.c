@@ -31,6 +31,9 @@
 #define VM_ONERR 0xE4
 #define VM_CBREQ 0x12
 #define VM_CURLIN 0x26
+#define VM_CSP 0x24
+#define VM_DATPTR 0xCF
+#define VM_CONTIP 0xE9
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
@@ -324,7 +327,7 @@ static int compile_current(void)
 /* ---- running ---- */
 
 /* what a program's CHR$(4) asked for, done once the VM is back: 1 RUN,
- * 2 LOAD, 3 BYE */
+ * 2 LOAD, 3 BYE, 4 CHAIN */
 static uint8_t pending, pending_path[65];
 static int32_t pending_line;
 static int bye;
@@ -340,11 +343,13 @@ void prog_pending(uint8_t what, const uint8_t *p, int32_t line)
 static void direct_tokens(void);
 
 /* RUN [n] of the program in memory */
+static uint8_t run_file;              /* RUN path: no blank line first */
 static void run_from(int32_t line)
 {
   say_time = timing;
   ran = 1;
-  if (!from_exec) crout();                /* (BASIC.SYSTEM's RUN starts a line) */
+  if (!from_exec && !run_file) crout();   /* (RUN of the program in memory starts a line) */
+  run_file = 0;
   if (line < 0) {
     if (!compile_current()) vm_call(0);
     return;
@@ -362,19 +367,192 @@ static void run_from(int32_t line)
   }
 }
 
+/* ---- CHAIN: the program's variables, by name, into the next one's slots.
+ * The spare bank holds them meanwhile: per variable a kind (0 scalar, 1
+ * array, $FF the end), its name (two characters, its type), then for a
+ * scalar its size and value (a string's descriptor: the string stays in
+ * the heap, which CHAIN keeps); for an array its dimensions, element size,
+ * bounds, the bytes' count and the bytes. ---- */
+static uint16_t chain_at;
+static void chain_put(const void *p, uint16_t n)
+{
+  if (!n) return;
+  xfer_far = (xfer_base | chain_at) - 1, xfer_near = (uint16_t)((uint16_t)p - 1), xfer_n = n;
+  far_out();
+  chain_at = (uint16_t)(chain_at + n);
+}
+static void chain_get(void *p, uint16_t n)
+{
+  if (!n) return;
+  xfer_far = (xfer_base | chain_at) - 1, xfer_near = (uint16_t)((uint16_t)p - 1), xfer_n = n;
+  far_in();
+  chain_at = (uint16_t)(chain_at + n);
+}
+static void vm_get(void *p, uint16_t a, uint16_t n)
+{
+  xfer_far = (vm_base | a) - 1, xfer_near = (uint16_t)((uint16_t)p - 1), xfer_n = n;
+  if (n) far_in();
+}
+static void vm_put(uint16_t a, const void *p, uint16_t n)
+{
+  xfer_far = (vm_base | a) - 1, xfer_near = (uint16_t)((uint16_t)p - 1), xfer_n = n;
+  if (n) far_out();
+}
+
+/* a string outside the heap (a literal in the old program, or a copy an
+ * earlier CHAIN made) goes with it: copied into this CHAIN's half of the
+ * spare bank's top 32K, its descriptor (at d) pointed there */
+static uint8_t chain_half;
+static uint16_t chain_str;
+static void chain_keep(uint8_t *d)
+{
+  uint8_t sb = peek0((uint16_t)(vm_dp + 0x48));   /* SH_BANK: the heap's */
+  if (!d[0] || d[3] == sb) return;
+  if ((uint32_t)chain_str + d[0] > (chain_half ? 0x10000ul : 0xC000ul)) return;   /* (no room: as it was) */
+  xfer_far = ((uint32_t)d[3] << 16 | (uint16_t)(d[1] | d[2] << 8)) - 1, xfer_far2 = (xfer_base | chain_str) - 1, xfer_n = d[0];
+  far_move();
+  d[1] = (uint8_t)chain_str, d[2] = (uint8_t)(chain_str >> 8), d[3] = (uint8_t)(xfer_base >> 16);
+  chain_str = (uint16_t)(chain_str + d[0]);
+}
+
+static void chain_export(void)
+{
+  uint16_t i, addr, n, e;
+  uint8_t name[3], nd, k, v[8], d[4 + 2 * 88];
+  uint32_t count;
+  chain_at = 0;
+  chain_half ^= 1;
+  chain_str = (uint16_t)(0x8000u + chain_half * 0x4000u);
+  for (i = 0; i < as816_count(0); i++) {
+    as816_var(i, name, &addr);
+    k = name[2] == 1 ? 2 : name[2] == 2 ? 4 : 5;
+    vm_get(v, addr, k);
+    if (name[2] == 2) chain_keep(v);
+    chain_put("\0", 1), chain_put(name, 3), chain_put(&k, 1), chain_put(v, k);
+  }
+  for (i = 0; i < as816_count(1); i++) {
+    as816_array(i, name, &nd, &addr);
+    vm_get(d, addr, (uint16_t)(4 + 2 * nd));
+    if (!(d[0] | d[1])) continue;               /* never dimensioned */
+    for (count = 1, k = 0; k < nd; k++) count *= (uint32_t)(d[4 + 2 * k] | d[5 + 2 * k] << 8) + 1;
+    count *= d[3];
+    if ((uint32_t)chain_at + count + 300 > 0x7FFF) continue;   /* (no room below the strings: lost) */
+    n = (uint16_t)count;
+    chain_put("\1", 1), chain_put(name, 3), chain_put(&nd, 1), chain_put(d + 3, 1);
+    chain_put(d + 4, (uint16_t)(2 * nd)), chain_put(&n, 2);
+    xfer_far = (vm_base | (uint16_t)(d[0] | d[1] << 8)) - 1, xfer_far2 = (xfer_base | chain_at) - 1, xfer_n = n;
+    if (n) far_move();
+    if (name[2] == 2)                           /* a string array's elements: keep theirs */
+      for (e = 0; e < n; e = (uint16_t)(e + 4)) {
+        xfer_far = (xfer_base | (uint16_t)(chain_at + e)) - 1, xfer_near = (uint16_t)((uint16_t)v - 1), xfer_n = 4;
+        far_in();
+        chain_keep(v);
+        far_out();
+      }
+    chain_at = (uint16_t)(chain_at + n);
+  }
+  chain_put("\377", 1);
+}
+
+static void chain_import(void)
+{
+  uint8_t kind, name[3], other[3], k, nd, ond, esize, v[8], bounds[2 * 88];
+  uint16_t i, addr, n, hf, hend;
+  vm_get(&hf, (uint16_t)(prog_start + 8), 2);    /* the array heap: its free pointer, end */
+  vm_get(&hend, (uint16_t)(prog_start + 10), 2);
+  chain_at = 0;
+  for (;;) {
+    chain_get(&kind, 1);
+    if (kind == 0xFF) break;
+    chain_get(name, 3);
+    if (!kind) {
+      chain_get(&k, 1), chain_get(v, k);
+      for (i = 0; i < as816_count(0); i++) {
+        as816_var(i, other, &addr);
+        if (!memcmp(name, other, 3)) break;
+      }
+      if (i == as816_count(0)) addr = compile_adopt(name, 0);   /* (kept, unnamed here) */
+      if (addr) vm_put(addr, v, k);
+      continue;
+    }
+    chain_get(&nd, 1), chain_get(&esize, 1), chain_get(bounds, (uint16_t)(2 * nd)), chain_get(&n, 2);
+    for (i = 0; i < as816_count(1); i++) {
+      as816_array(i, other, &ond, &addr);
+      if (!memcmp(name, other, 3)) break;
+    }
+    if (i == as816_count(1)) addr = compile_adopt(name, nd), ond = nd;   /* (kept, unnamed here) */
+    if (addr && ond == nd && (uint32_t)hf + n <= hend) {
+      vm_put(addr, &hf, 2);                       /* storage, the bounds; the bytes */
+      vm_put((uint16_t)(addr + 4), bounds, (uint16_t)(2 * nd));
+      xfer_far = (xfer_base | chain_at) - 1, xfer_far2 = (vm_base | hf) - 1, xfer_n = n;
+      if (n) far_move();
+      hf = (uint16_t)(hf + n);
+    }
+    chain_at = (uint16_t)(chain_at + n);
+  }
+  vm_put((uint16_t)(prog_start + 8), &hf, 2);
+}
+
+/* CHAIN path[,@line]: the program in, its variables the old one's, run
+ * without a CLEAR (vm_direct, VM_FRESH off): strings stay, FOR/GOSUB, DATA,
+ * ONERR and CONT start afresh */
+static void chain_run(int32_t line)
+{
+  uint16_t w;
+  uint8_t z = 0;
+  ran = 1;
+  if (compile_current()) return;
+  chain_import();
+  poke0((uint16_t)(vm_dp + VM_FRESH), 0);
+  w = vm_read16((uint16_t)(prog_start + 4));           /* the control stack: empty */
+  poke0((uint16_t)(vm_dp + VM_CSP), (uint8_t)w), poke0((uint16_t)(vm_dp + VM_CSP + 1), (uint8_t)(w >> 8));
+  w = vm_read16((uint16_t)(prog_start + 0x16));        /* DATA from its start */
+  poke0((uint16_t)(vm_dp + VM_DATPTR), (uint8_t)w), poke0((uint16_t)(vm_dp + VM_DATPTR + 1), (uint8_t)(w >> 8));
+  poke0((uint16_t)(vm_dp + VM_CONTIP), 0), poke0((uint16_t)(vm_dp + VM_CONTIP + 1), 0);
+  poke0((uint16_t)(vm_dp + VM_ONERR), 0), poke0((uint16_t)(vm_dp + VM_ONERR + 1), 0);
+  poke0(0xD8, (uint8_t)(peek0(0xD8) & 0x7F));
+  (void)z;
+  if (line >= 0) {                               /* GOTO line, as a direct line */
+    uint8_t k = 1;
+    char d[6];
+    int8_t j = 0;
+    raw[0] = 0xAB;                               /* GOTO */
+    do d[j++] = (char)('0' + line % 10); while ((line /= 10) != 0);
+    while (j) raw[k++] = (uint8_t)d[--j];
+    raw[k] = 0;
+    direct_tokens();
+    return;
+  }
+  w = vm_read16(prog_start);                     /* its entry */
+  poke0((uint16_t)(vm_dp + VM_DENTRY), (uint8_t)w), poke0((uint16_t)(vm_dp + VM_DENTRY + 1), (uint8_t)(w >> 8));
+  vm_call(vm_read16(VMH_DIRECT));
+}
+
 static void after_vm(void)
 {
   uint8_t what, e;
   while ((what = pending) != 0) {
     pending = 0;
     if (what == 3) { bye = 1; return; }
+    if (what == 4) chain_export();
     if ((e = prog_load(pending_path)) != 0) { dos_message(dos_error(e)); return; }
-    if (what == 1) run_from(pending_line);
+    if (what == 1) run_file = 1, run_from(pending_line);
+    if (what == 4) chain_run(pending_line);
   }
+}
+
+void prog_chain(const uint8_t *p, int32_t line)
+{
+  uint8_t e;
+  chain_export();
+  if ((e = prog_load(p)) != 0) { dos_message(dos_error(e)); return; }
+  chain_run(line);
+  after_vm();
 }
 
 void prog_run(int32_t line)
 {
+  run_file = 1;
   run_from(line);
   after_vm();
 }
@@ -670,7 +848,9 @@ void shell(void)
     if (compile_command()) continue;
     k = dos_command(raw, len, 0, 0);
     if (k == DOS_BYE) return;
-    if (k == DOS_NOT && basic_line()) {   /* RESTART's CRDO: to WRITE's file if on */
+    /* RESTART's CRDO after an AppleSoft line or a program (RUN path, CHAIN,
+     * -) - to WRITE's file if on */
+    if (k == DOS_NOT ? basic_line() : ran) {
       if (dos_writing()) dos_put_cr();
       else crout();
     }
