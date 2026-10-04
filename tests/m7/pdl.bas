@@ -1,0 +1,3 @@
+10 PRINT PDL (0); PDL (1); PDL (2); PDL (3)
+20 X = PDL (0) + PDL (1) * 2: PRINT X
+30 PRINT PDL (256)

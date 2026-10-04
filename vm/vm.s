@@ -193,7 +193,7 @@ optable:
         .word   op_resume, op_stmt, op_tab, op_spc, op_bytepush, op_lomem, op_himem
         .word   op_cont
         .word   op_hgr, op_hgr2, op_hcolor, op_hx, op_hplot, op_hplotto, op_hposn, op_shape
-        .word   op_draw, op_xdraw, op_rot, op_scale, op_usr, op_amper, op_list, op_new, op_del
+        .word   op_draw, op_xdraw, op_rot, op_scale, op_usr, op_amper, op_list, op_new, op_del, op_pdl
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -3282,6 +3282,21 @@ op_call:
         jsr     romcall
 @done:  ldx     VM_IP
         NEXTOP  2
+
+; PDL(n): CONINT, PREAD ($FB1E, X = n), SNGFLT of its Y
+op_pdl: stx     VM_IP
+        jsr     conint
+        rep     #$20
+        .a16
+        and     #$00FF
+        tax
+        sep     #$20
+        .a8
+        ldy     #$FB1E
+        sty     VM_T4
+        jsr     romcall
+        lda     RC_Y
+        jmp     sngflt_a
 
 ; USR(x): JSR $000A, FAC in page zero: ours ($9D-$AC: FAC, ARG, the
 ; rounding byte) there and back around the call

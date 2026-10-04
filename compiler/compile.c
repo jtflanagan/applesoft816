@@ -37,7 +37,7 @@ enum {
   T_ON = 0xB4, T_WAIT = 0xB5, T_CONT = 0xBB,
   T_HGR2 = 0x90, T_HGR = 0x91, T_HCOLOR = 0x92, T_HPLOT = 0x93, T_DRAW = 0x94, T_XDRAW = 0x95,
   T_ROT = 0x98, T_SCALE = 0x99, T_DEF = 0xB8, T_POKE = 0xB9, T_CLEAR = 0xBD, T_TABP = 0xC0, T_FN = 0xC2,
-  T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2, T_USR = 0xD5,
+  T_SPCP = 0xC3, T_AT = 0xC5, T_SCRN = 0xD7, T_POS = 0xD9, T_PEEK = 0xE2, T_USR = 0xD5, T_PDL = 0xD8,
   T_LIST = 0xBC, T_NEW = 0xBF, T_DEL = 0x85,
   T_SHLOAD = 0x9A, T_RECALL = 0xA7, T_STORE = 0xA8, T_AMPER = 0xAF, T_SAVE = 0xB6, T_LOAD = 0xB7,
   T_IF = 0xAD, T_GOSUB = 0xB0, T_RETURN = 0xB1, T_REM = 0xB2, T_PRINT = 0xBA,
@@ -634,6 +634,7 @@ static int element(Pending *pend, int *np)
       }
       switch (c) {
       case T_USR: if (!paren_arg(TY_NUM)) return TY_ERR; op(OP_USR); return TY_NUM;
+      case T_PDL: if (!paren_arg(TY_NUM)) return TY_ERR; op(OP_PDL); return TY_NUM;
       case T_LEN: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_LEN); return TY_NUM;
       case T_ASC: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_ASC); return TY_NUM;
       case T_VAL: if (!paren_arg(TY_STR)) return TY_ERR; op(OP_VAL); return TY_NUM;

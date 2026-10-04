@@ -53,6 +53,7 @@ extern "C" {
 
 namespace {
 
+constexpr uint16_t PREAD = 0xFB1E;   // the paddles: Y = 40 + 50 * X (a fixed stick)
 constexpr uint16_t COUT = 0xFDED, RDKEY = 0xFD0C, GETLN = 0xFD6A, MONWAIT = 0xFCA8, HOME = 0xFC58,
                    CLREOP = 0xFC42, CLREOL = 0xFC9C, VTAB = 0xFC22, SETWND = 0xFB4B, INPORT = 0xFE8B,
                    OUTPORT = 0xFE95, BASIC_COLD = 0xE000,
@@ -220,6 +221,10 @@ struct Machine {
     }
     switch (pc) {
     case COUT: cout(uint8_t(c.a())); c.sim_rts(); return true;
+    case PREAD:
+      c.set_regs(c.a(), c.x(), uint16_t((40 + 50 * (c.x() & 3)) & 0xFF), c.s(), c.d(), c.dbr(), c.p(), c.e());
+      c.sim_rts();
+      return true;
     case MONWAIT: c.sim_rts(); return true;
     case HOME: case CLREOP: case CLREOL:
       record(0x01), record(pc == HOME ? 'H' : pc == CLREOP ? 'P' : 'L');
