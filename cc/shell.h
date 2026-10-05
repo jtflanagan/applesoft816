@@ -7,6 +7,7 @@
 #include "compile.h"
 
 void shell(void);
+void shell_reset(void);                /* Ctrl-Reset: back to the prompt (sys.s x_reset) */
 
 /* main_sh.c */
 extern uint32_t text_base, vm_base, xfer_base, stage_base;
@@ -22,6 +23,7 @@ void cc_tables(uint16_t *vars, uint16_t *arrays);
 void cc_entry(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *slot);
 uint16_t cc_state_save(void);
 int cc_state_load(uint16_t len);
+extern uint8_t cc_busy;
 
 /* glue.s */
 extern uint32_t xfer_far, xfer_far2;   /* one below the first byte */

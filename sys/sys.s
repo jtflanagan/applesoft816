@@ -6,14 +6,16 @@
 ; AS816.VM and AS816.CC
 ; into them, sets up the resident bank-0 block (res.inc: the VM's direct
 ; page and stubs, the MLI and ROM trampolines, I/O buffers) and calls the
-; shell (cc/, crt0's entry).  When the shell returns: the banks back, QUIT -
-; or, if it left a SYS file in the CHAIN bank ("-"), that run at $2000.
+; shell (cc/, crt0's entry) through the resident EXIT block, which also
+; leaves: the banks back, QUIT - or, if the shell left a SYS file in the
+; CHAIN bank ("-"), that run at $2000.  Ctrl-Reset comes back into the shell
+; warm, at its prompt, as BASIC.SYSTEM's does (EXIT's x_reset).
 
         .p816
         .smart  off
         .include "res.inc"
         .import __RESIDENT_LOAD__, __RESIDENT_RUN__, __RESIDENT_SIZE__
-        .import __LAUNCH_LOAD__, __LAUNCH_RUN__, __LAUNCH_SIZE__
+        .import __EXIT_LOAD__, __EXIT_RUN__, __EXIT_SIZE__
 
 COUT     = $FDED
 CROUT    = $FD8E
@@ -201,43 +203,46 @@ start:
         lda     user_id+1
         sta     [HND],y
 
-        ; the shell: JSL its bank's $0000 with A = its data bank, X cold
-        lda     sh_bank
-        sta     shell_call + 3
-        ldx     #0
-        lda     sh_data
-shell_call:
-        jsl     $000000         ; bank patched above
+        ; the way out, resident (the program owns $0800-$95FF from here):
+        ; its data, the reset vector (the old one kept for the way out)
         rep     #$30
         .a16
         .i16
-        ldy     #SHP_LAUNCH
-        lda     [HND],y
-        bne     launch
-        sep     #$30
-        jmp     quit_native
-
-; ---- "-" on a SYS file: the launcher to $1F00 (the file goes over this
-; loader), told the length, the bank, the ID; native, 16-bit ----
-launch: pha
         ldx     #0
-@cp:    lda     __LAUNCH_LOAD__,x
-        sta     __LAUNCH_RUN__,x
+@xc:    lda     __EXIT_LOAD__,x
+        sta     __EXIT_RUN__,x
         inx
         inx
-        cpx     #__LAUNCH_SIZE__ + 1
-        bcc     @cp
-        pla
-        sta     t_len
+        cpx     #__EXIT_SIZE__ + 1
+        bcc     @xc
         lda     user_id
-        sta     t_id
+        sta     x_user_id
+        lda     HND
+        sta     x_hnd
+        lda     $03F2
+        sta     x_oldrst
         sep     #$20
         .a8
+        lda     HND+2
+        sta     x_hnd+2
+        lda     $03F4
+        sta     x_oldrst+2
+        lda     sh_bank
+        sta     x_sh_bank
+        lda     sh_data
+        sta     x_sh_data
         lda     xfer_bank
-        sta     t_mvn + 2       ; MVN's operands: destination, source
-        rep     #$20
-        .a16
-        jmp     tramp
+        sta     x_xfer
+        lda     #<x_reset
+        sta     $03F2
+        lda     #>x_reset
+        sta     $03F3
+        eor     #$A5
+        sta     $03F4
+        sep     #$30
+        .i8
+        ldx     #0              ; cold
+        jmp     x_enter
 
 ; ---- a whole bank from the Memory Manager: A (16-bit) = its bank ----
         .a16
@@ -403,23 +408,133 @@ quit_native:
         .word   quit_parms
         brk
 
-; ---- the launcher, at $1F00: the file to $2000, the banks back, ProDOS
-; 8's bitmap as at a system program's start, the file run in emulation ----
-        .segment "LAUNCH"
+; ---- resident at RES_EXIT: the shell's call and the way out ----
+; The loader's memory is the program's once the shell runs (HGR alone
+; clears $2000-$3FFF), so everything after the shell lives here.
+        .segment "EXIT"
+x_resetf:  .byte 0              ; RES_RESETF: Ctrl-Reset happened (the shell clears it)
+x_user_id: .word 0
+x_sh_bank: .byte 0
+x_sh_data: .byte 0
+x_xfer:    .byte 0
+x_hnd:     .res  3              ; the shell's parameter block (long)
+x_oldrst:  .res  3              ; $3F2-$3F4 as found
+
+; the shell: JSL its bank's $0000 with A = its data bank, X = 0 cold or
+; $5A warm; native, M = X = 1 on entry.  Then the way out.
+        .a8
+        .i8
+x_enter:
+        lda     x_sh_bank
+        sta     @jsl + 3
+        lda     x_hnd           ; the parameter block, for SHP_LAUNCH after
+        sta     HND
+        lda     x_hnd+1
+        sta     HND+1
+        lda     x_hnd+2
+        sta     HND+2
+        lda     x_sh_data
+@jsl:   jsl     $000000         ; bank patched above
+        rep     #$30
         .a16
         .i16
-tramp:  lda     t_len
+        lda     x_oldrst        ; the reset vector as it was
+        sta     $03F2
+        sep     #$20
+        .a8
+        lda     x_oldrst+2
+        sta     $03F4
+        rep     #$20
+        .a16
+        ldy     #SHP_LAUNCH
+        lda     [HND],y
+        bne     x_launch
+        lda     x_user_id       ; DisposeAll, DeleteID, QUIT
+        pha
+        ldx     #$1102
+        jsl     TOOLS
+        lda     x_user_id
+        pha
+        ldx     #$2103
+        jsl     TOOLS
+        sec
+        xce
+        .a8
+        .i8
+        jsr     MLI
+        .byte   $65             ; QUIT
+        .word   x_quit
+        brk
+x_quit: .byte   4, 0
+        .word   0
+        .byte   0
+        .word   0
+
+; "-" on a SYS file: the launcher to $1F00 (the file goes over $2000 up,
+; perhaps over this block too), told the length, the bank, the ID
+        .a16
+        .i16
+x_launch:
+        pha
+        ldx     #0
+@cp:    lda     x_tramp,x
+        sta     TRAMP,x
+        inx
+        inx
+        cpx     #x_tramp_end - x_tramp + 1
+        bcc     @cp
+        pla
+        sta     T_LEN
+        lda     x_user_id
+        sta     T_ID
+        sep     #$20
+        .a8
+        lda     x_xfer
+        sta     T_MVN + 2       ; MVN's operands: destination, source
+        rep     #$20
+        .a16
+        jmp     TRAMP
+
+; Ctrl-Reset (the ROM's JMP ($3F2), emulation mode): native, the stack
+; afresh, the flag, the shell warm - back at its prompt
+        .a8
+        .i8
+x_reset:
+        clc
+        xce
+        rep     #$10
+        .i16
+        ldx     #$01FB          ; as the loader set it: below AppleSoft's INPUT bytes
+        txs
+        sep     #$30
+        .i8
+        lda     #1
+        sta     x_resetf
+        ldx     #$5A            ; warm
+        jmp     x_enter
+
+; the launcher's bytes, run at TRAMP ($1F00): the file to $2000, the banks
+; back, ProDOS 8's bitmap as at a system program's start, the file run in
+; emulation.  (Its own addresses: TRAMP + offset.)
+TRAMP    = $1F00
+T_LEN    = TRAMP + x_tlen - x_tramp
+T_ID     = TRAMP + x_tid - x_tramp
+T_MVN    = TRAMP + x_tmvn - x_tramp
+        .a16
+        .i16
+x_tramp:
+        lda     T_LEN
         dec     a
         ldx     #0
         ldy     #$2000
         phb
-t_mvn:  .byte   $54, $00, $00   ; MVN source bank (patched) to bank 0
+x_tmvn: .byte   $54, $00, $00   ; MVN source bank (patched) to bank 0
         plb
-        lda     t_id            ; DisposeAll, DeleteID
+        lda     T_ID            ; DisposeAll, DeleteID
         pha
         ldx     #$1102
         jsl     TOOLS
-        lda     t_id
+        lda     T_ID
         pha
         ldx     #$2103
         jsl     TOOLS
@@ -442,8 +557,9 @@ t_mvn:  .byte   $54, $00, $00   ; MVN source bank (patched) to bank 0
         ldx     #$FF
         txs
         jmp     $2000
-t_len:  .word   0
-t_id:   .word   0
+x_tlen: .word   0
+x_tid:  .word   0
+x_tramp_end:
 
         .segment "LOADER"
 ; ---- data ----

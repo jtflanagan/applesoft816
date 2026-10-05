@@ -1,6 +1,9 @@
 #!/bin/bash
 # kegs.sh - drive KEGS (the IIgs emulator, ~/repos/kegs.1.38) headless for
-# the live tests, on Xvfb :99 (WSLg cannot deliver injected keys).
+# the live tests, on Xvfb (WSLg cannot deliver injected keys).  One KEGS per
+# display: KEGS_DISPLAY (default :99) and KEGS_RUN (its work directory,
+# default /tmp/as816-kegs) pick the instance; KEGS_KEYDELAY the ms between
+# typed keys (default 60: at 2.8 MHz KEGS's one-key latch drops faster keys).
 #
 #   kegs.sh start DISK.po [SPEED]   power on with DISK as s7d1 (SmartPort);
 #                                   SPEED: 1 = 1 MHz, 2 = 2.8 MHz (default), 0 = unlimited
@@ -10,10 +13,11 @@
 #   kegs.sh text                    the text screen, as text (kegs_text.py)
 #   kegs.sh stop
 set -eu
-DISP=:99
+DISP=${KEGS_DISPLAY:-:99}
 KEGS=$HOME/repos/kegs.1.38
 ROM=$HOME/repos/strudelworks-host/assets/apple2gs_rom3.bin
 RUN=${KEGS_RUN:-/tmp/as816-kegs}
+KEYDELAY=${KEGS_KEYDELAY:-60}
 export DISPLAY=$DISP
 
 win() { xdotool search --name KEGS 2>/dev/null | head -1; }
@@ -27,15 +31,17 @@ start)
     Xvfb $DISP -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
     sleep 1
   fi
-  pid=$(pgrep -x xkegs || true)
-  [ -n "$pid" ] && kill $pid && sleep 0.5
+  [ -f "$RUN/pid" ] && kill "$(cat "$RUN/pid")" 2>/dev/null && sleep 0.3
   cat > "$RUN/config.kegs" <<EOF
 g_cfg_rom_path = $ROM
 s7d1 = $disk
 g_limit_speed = $speed
 g_config_kegs_auto_update = 0
 EOF
-  (cd "$RUN" && nohup "$KEGS/xkegs" -display $DISP -cfg "$RUN/config.kegs" >"$RUN/kegs.log" 2>&1 &)
+  cd "$RUN"
+  nohup "$KEGS/xkegs" -display $DISP -cfg "$RUN/config.kegs" >"$RUN/kegs.log" 2>&1 &
+  echo $! > "$RUN/pid"                 # (xkegs itself: stop kills it)
+  cd - >/dev/null
   for _ in $(seq 50); do [ -n "$(win)" ] && break; sleep 0.1; done
   w=$(win)
   [ -n "$w" ] || { echo "kegs.sh: no KEGS window" >&2; exit 1; }
@@ -49,7 +55,7 @@ type)
   rest=$2
   while [ -n "$rest" ]; do
     part=${rest%%$'\n'*}
-    [ -n "$part" ] && xdotool type --delay 60 -- "$part"
+    [ -n "$part" ] && xdotool type --delay "$KEYDELAY" -- "$part"
     [ "$part" = "$rest" ] && break
     xdotool key Return
     rest=${rest#*$'\n'}
@@ -80,8 +86,8 @@ text)
   rm -f "$t"
   ;;
 stop)
-  pid=$(pgrep -x xkegs || true)
-  [ -n "$pid" ] && kill $pid
+  [ -f "$RUN/pid" ] && kill "$(cat "$RUN/pid")" 2>/dev/null
+  rm -f "$RUN/pid"
   ;;
 *)
   sed -n '2,13p' "$0"

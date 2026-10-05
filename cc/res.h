@@ -15,6 +15,8 @@
 #define RES_PARMS 0x9880u
 #define RES_PATH 0x9900u
 #define RES_SCRATCH 0x9980u
+#define RES_EXIT 0x9A00u               /* 512: the way out and Ctrl-Reset (sys/sys.s, EXIT) */
+#define RES_RESETF 0x9A00u             /* 1: set by Ctrl-Reset: the shell enters warm, at its prompt */
 #define RES_FBUF 0x9C00u
 #define RES_IOBUF 0xA000u
 #define RES_IOSIZE 0x0800u

@@ -4,6 +4,8 @@
 # alike (/BSYS) with the same test files in /BSYS/T; the two transcripts
 # are diffed, the volume's block totals masked.
 #   COLS=80 (default) or 40; the cursor cell after a prompt is not compared (it blinks)
+#   All the runs go at once (two per session, KEGS at unlimited speed, each
+#   on its own Xvfb display from :100); KEYDELAY ms between typed keys (15).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../.."
@@ -40,20 +42,41 @@ ours_disk() {
   files "$1"
 }
 
-session() {   # session DISK FILE OUT
-  "$tools/kegs.sh" start "$1" 2 >/dev/null
-  sleep 6
-  if [ "${COLS:-80}" = 80 ]; then "$tools/kegs.sh" type $'PR#3\n'; sleep 2; fi
-  "$tools/kegs_session.sh" "$2" > "$3"
+session() {   # session DISK FILE OUT DISPLAY: on its own KEGS (unlimited speed), its own display
+  local disk=$1 file=$2 out=$3
+  export KEGS_DISPLAY=$4 KEGS_RUN="$work/kegs${4#:}" KEGS_KEYDELAY=${KEYDELAY:-15}
+  "$tools/kegs.sh" start "$disk" 0 >/dev/null
+  python3 "$tools/kegs_wait.py" prompt 60 >/dev/null
+  if [ "${COLS:-80}" = 80 ]; then
+    "$tools/kegs.sh" type $'PR#3\n'
+    python3 "$tools/kegs_wait.py" prompt 5 >/dev/null
+  fi
+  "$tools/kegs_session.sh" "$file" > "$out"
+  "$tools/kegs.sh" stop
 }
+
+# every KEGS this run started goes when it ends, however it ends
+stop_all() { for d in "$work"/kegs1[0-9][0-9]; do [ -f "$d/pid" ] && kill "$(cat "$d/pid")" 2>/dev/null; done; }
+trap stop_all EXIT
+
+# one disk of each kind, copied per run; then every run at once, each
+# KEGS on a display of its own (:100 up)
+oracle_disk "$work/oracle.po" >/dev/null
+ours_disk "$work/ours.po" >/dev/null
+n=100
+for s in "$@"; do
+  name=$(basename "$s" .txt)
+  for side in oracle ours; do
+    cp "$work/$side.po" "$work/$name.$side.po"
+    session "$work/$name.$side.po" "$s" "$work/$name.$side" ":$n" &
+    n=$((n + 1))
+  done
+done
+wait
 
 rc=0
 for s in "$@"; do
   name=$(basename "$s" .txt)
-  oracle_disk "$work/oracle.po" >/dev/null
-  ours_disk "$work/ours.po" >/dev/null
-  session "$work/oracle.po" "$s" "$work/$name.oracle"
-  session "$work/ours.po" "$s" "$work/$name.ours"
   # the volume's totals differ by the system files (BASIC.SYSTEM against ours)
   for f in oracle ours; do
     sed -E 's/^\](.)?$/]/; s/^(BLOCKS FREE:) *[0-9]+( +BLOCKS USED:) *[0-9]+/\1 n\2 n/; s/(TOTAL BLOCKS:) *[0-9]+/\1 n/' \
@@ -66,5 +89,4 @@ for s in "$@"; do
     rc=1
   fi
 done
-"$tools/kegs.sh" stop
 exit $rc

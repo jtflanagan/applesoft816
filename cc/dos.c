@@ -428,6 +428,15 @@ static uint8_t io_flush(void)
   return 0;
 }
 
+/* Ctrl-Reset, as BASIC.SYSTEM: READ, WRITE and EXEC end (WRITE's unsent
+ * output with them); the files stay open */
+void dos_reset(void)
+{
+  io_file = 0, exec_file = 0;
+  poke0((uint16_t)(vm_dp + VM_OUTLEN), 0);
+  io_mode(0);
+}
+
 static void close_file(File *f)
 {
   if (!f->ref) return;

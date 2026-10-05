@@ -32,6 +32,8 @@ void dos_put(const uint8_t *p, uint8_t n);       /* bytes to WRITE's file */
 /* EXEC's next line for the prompt (0: none, the keyboard) */
 int dos_exec_line(uint8_t *line, uint8_t *len);
 int dos_execing(void);
+/* Ctrl-Reset: READ/WRITE/EXEC off, files left open */
+void dos_reset(void);
 /* back at the prompt: READ/WRITE off; after a program, FILE(S) STILL OPEN */
 void dos_prompt(int after_run);
 

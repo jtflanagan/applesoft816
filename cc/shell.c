@@ -32,6 +32,8 @@
 #define VM_DATPTR 0xCF
 #define VM_CONTIP 0xE9
 #define VM_T0 0x30
+#define VM_CMDLEN 0x18
+#define VM_IOQUIET 0x11
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
@@ -875,19 +877,10 @@ static int basic_line(void)
   return 1;
 }
 
-void shell(void)
+/* the prompt, line after line, until BYE */
+static void prompt_loop(void)
 {
   uint8_t i, k;
-  rom_call(HOME);
-  prog_start = vm_read16(0x0E);
-  hash_acc = 0;
-  xfer_far = vm_base - 1, xfer_n = prog_start;
-  far_hash();
-  vm_print = hash_acc;
-  new_program();
-  vm_hook();
-  print("APPLESOFT816 0.1");
-  crout();
   while (!bye) {
     from_exec = 0;
     if (dos_execing()) {                  /* EXEC: the prompt and the Return show, */
@@ -918,6 +911,41 @@ void shell(void)
     dos_prompt(ran);
     ran = 0;
   }
+}
+
+/* Ctrl-Reset (sys.s x_reset: the stack afresh, the shell called warm), as
+ * BASIC.SYSTEM's: the program stays; its variables go (as CLEAR: the VM
+ * clears on its next run or direct line) and CONT with them; a command half
+ * gathered, READ/WRITE/EXEC end, the files stay open; the prompt, from
+ * column 0 of the cursor's line (no CR: tests/dos/reset1.txt).  A reset
+ * inside the compiler leaves its tables half made: compiled again. */
+void shell_reset(void)
+{
+  pending = 0, bye = 0, ran = 0, from_exec = 0, run_file = 0;
+  if (cc_busy) cc_busy = 0, compiled = 0;
+  poke0((uint16_t)(vm_dp + VM_FRESH), 1);
+  poke0((uint16_t)(vm_dp + VM_CONTIP), 0), poke0((uint16_t)(vm_dp + VM_CONTIP + 1), 0);
+  poke0((uint16_t)(vm_dp + VM_CMDLEN), 0xFF);
+  poke0((uint16_t)(vm_dp + VM_IOQUIET), 0);
+  dos_reset();
+  vm_hook();
+  poke0(CH, 0);                         /* the prompt at the line's start, no CR */
+  prompt_loop();
+}
+
+void shell(void)
+{
+  rom_call(HOME);
+  prog_start = vm_read16(0x0E);
+  hash_acc = 0;
+  xfer_far = vm_base - 1, xfer_n = prog_start;
+  far_hash();
+  vm_print = hash_acc;
+  new_program();
+  vm_hook();
+  print("APPLESOFT816 0.1");
+  crout();
+  prompt_loop();
 }
 
 #pragma clang attribute pop

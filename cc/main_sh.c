@@ -6,6 +6,7 @@
 #pragma clang attribute push (__attribute__((minsize)), apply_to = function)
 
 #include "dos.h"
+#include "machine.h"
 #include "shell.h"
 
 struct ShParams {
@@ -44,7 +45,11 @@ int cc_main(void)
   cc_bank = cc_params.cc_bank;
   cc_data = cc_params.cc_data;
   cc_init();
-  shell();
+  if (peek0(RES_RESETF)) {               /* Ctrl-Reset brought us here (sys.s x_reset) */
+    poke0(RES_RESETF, 0);
+    shell_reset();
+  } else
+    shell();
   cc_params.launch = dos_launch;
   return 0;
 }

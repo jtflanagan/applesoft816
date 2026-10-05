@@ -51,11 +51,15 @@ void cc_init(void)
   put(CCP_STAGE, b, 1);
 }
 
+uint8_t cc_busy;                /* inside the compiler: a Ctrl-Reset here leaves its tables half made */
+
 static int16_t req(uint8_t r)
 {
   int16_t res;
   put(CCP_REQ, &r, 1);
+  cc_busy = 1;
   cc_call(warm);
+  cc_busy = 0;
   warm = 1;
   get(&res, CCP_RESULT, 2);
   return res;

@@ -20,7 +20,13 @@ FONT = os.path.expanduser("~/repos/kegs.1.38/src/kegsfont.h")
 X0 = 32
 
 
+_TABLE = None
+
+
 def glyphs():
+    global _TABLE
+    if _TABLE is not None:
+        return _TABLE
     rows = [list(map(lambda v: int(v, 16), re.findall(r"0x([0-9a-f]{2})", l)))
             for l in open(FONT) if l.strip().startswith("{")]
     table = {}
@@ -32,11 +38,13 @@ def glyphs():
             ch = chr((code & 0x3F) | (0x40 if code & 0x3F < 0x20 else 0))
             bits = tuple(tuple(1 - b for b in row) for row in bits)
         table.setdefault(bits, ch)
+    _TABLE = table
     return table
 
 
 def read(path):
-    im = Image.open(path).convert("RGB")
+    """the 24 lines of a screenshot (a path, or a PIL image)"""
+    im = (path if isinstance(path, Image.Image) else Image.open(path)).convert("RGB")
     w, h = im.size
     data = im.tobytes()
     lit = lambda x, y: 1 if min(data[3 * (y * w + x):3 * (y * w + x) + 3]) > 128 else 0
