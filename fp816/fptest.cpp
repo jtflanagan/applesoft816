@@ -44,6 +44,9 @@ constexpr int FP_BUF = 0xFD, RNDSEED = 0xC9, CPRMASK = 0x16;
 constexpr uint32_t F_SQR = LIB + 0x5C, F_PWR = LIB + 0x60, F_LOG = LIB + 0x64, F_EXP = LIB + 0x68,
                    F_RND = LIB + 0x6C, F_SIN = LIB + 0x70, F_COS = LIB + 0x74, F_TAN = LIB + 0x78,
                    F_ATN = LIB + 0x7C;
+constexpr uint32_t F_NEXT = LIB + 0x98;
+constexpr int FP_SER = 0xAD;
+constexpr uint32_t LIMIT = 0x000308; // NEXT's limit, 5 packed bytes
 constexpr uint32_t OUTBUF = 0x000500; // fp816's FOUT text (the ROM's is $0100)
 constexpr int LINNUM = 0x50, FP_INT = 0xF8, FP_TXT = 0xFA, TXTPTR = 0xB8;
 constexpr uint32_t TEXT = 0x000400; // number text for FIN
@@ -333,6 +336,46 @@ std::string random_number_text()
   return t;
 }
 
+// a whole number as AppleSoft packs it (zero: exponent 0, any mantissa)
+void int_packed(long v, uint8_t p[5])
+{
+  if (v == 0) {
+    p[0] = 0;
+    for (int i = 1; i < 5; i++) p[i] = rndn(2) ? 0 : uint8_t(rnd());
+    return;
+  }
+  unsigned long u = unsigned(v < 0 ? -v : v);
+  int bits = 0;
+  while ((u >> bits) > 1) bits++;
+  bits++;
+  uint32_t m = uint32_t(u << (32 - bits));
+  p[0] = uint8_t(0x80 + bits);
+  p[1] = uint8_t(((m >> 24) & 0x7F) | (v < 0 ? 0x80 : 0));
+  p[2] = uint8_t(m >> 16), p[3] = uint8_t(m >> 8), p[4] = uint8_t(m);
+}
+
+// NEXT's operands: mostly whole numbers, some not (the ROM's path)
+long pick_whole()
+{
+  switch (rndn(8)) {
+  case 0: return long(rndn(41)) - 20;
+  case 1: case 2: return long(rndn(2001)) - 1000;
+  case 3: case 4: return long(rndn(65535)) - 32767;
+  case 5: { static const long e[] = {32767, -32767, 32766, -32766, 16384, -16384, 255, 256, -256, 1, -1, 0};
+            return e[rndn(12)]; }
+  default: return long(rndn(201)) - 100;
+  }
+}
+void pick_next_operand(uint8_t p[5])
+{
+  switch (rndn(10)) {
+  case 0: random_packed(p, 0x88); break;                 // anything
+  case 1: int_packed(long(rndn(200000)) - 100000, p); break; // beyond 32767 too
+  case 2: int_packed(pick_whole(), p); p[4] ^= uint8_t(1u << rndn(8)); break; // a fraction
+  default: int_packed(pick_whole(), p);
+  }
+}
+
 void show(const char* tag, const Fac& f)
 {
   printf("  %s exp=%02X m=%02X%02X%02X%02X sign=%02X ext=%02X\n", tag, f.exp, f.m[0], f.m[1], f.m[2], f.m[3],
@@ -471,6 +514,104 @@ int main(int argc, char** argv)
       }
     }
     printf("%-20s %8ld cases  %6ld ROM errors  %ld differ\n", "FIN text->FAC", cases, errs, bad);
+    failed_tests += bad != 0;
+  }
+
+  // NEXT: FADD the variable, STORE it rounded, FCOMP the limit (fp_next),
+  // against the ROM's three in a row.  FAC is undefined afterwards: not
+  // compared.  Random cases, then every small case.
+  if (!getenv("FPTEST_ONLY") || strstr("NEXT", getenv("FPTEST_ONLY"))) {
+    long bad = 0, errs = 0, n = 0;
+    uint64_t rom_cyc = 0, our_cyc = 0, ok = 0;
+    auto one = [&](const Fac& f, const uint8_t var[5], const uint8_t lim[5]) {
+      Outcome want{}, got{};
+      Cpu816& c = m.cpu;
+      for (int ours = 0; ours < 2; ours++) {
+        Outcome& o = ours ? got : want;
+        c.reset_regs();
+        memcpy(&c.mem[OPERAND], var, 5);
+        memcpy(&c.mem[LIMIT], lim, 5);
+        if (!ours) {
+          memset(&c.mem[0], 0, 0x100);
+          m.put_fac(0, f);
+          uint8_t stub[] = {0xA9, uint8_t(OPERAND), 0xA0, uint8_t(OPERAND >> 8), 0x20, uint8_t(R_FADD), uint8_t(R_FADD >> 8),
+                            0xA2, uint8_t(OPERAND), 0xA0, uint8_t(OPERAND >> 8), 0x20, uint8_t(R_STORE_FAC), uint8_t(R_STORE_FAC >> 8),
+                            0xA9, uint8_t(LIMIT), 0xA0, uint8_t(LIMIT >> 8), 0x20, uint8_t(R_FCOMP), uint8_t(R_FCOMP >> 8),
+                            0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          c.set_regs(0, 0, 0, 0x01FF, 0, 0, 0x34, true);
+          if (!m.run(STUB, true, o.err)) o.err = -1;
+          o.res = c.a() & 0xFF;
+        } else {
+          memset(&c.mem[DP_OURS], 0, 0x100);
+          m.put_fac(DP_OURS, f);
+          for (int k = 0; k < 3; k++) {
+            c.mem[DP_OURS + FP_PTR + k] = uint8_t(OPERAND >> (8 * k));
+            c.mem[DP_OURS + FP_SER + k] = uint8_t(LIMIT >> (8 * k));
+          }
+          uint32_t e = F_NEXT + lib_base;
+          uint8_t stub[] = {0x22, uint8_t(e), uint8_t(e >> 8), uint8_t(e >> 16), 0xDB};
+          memcpy(&c.mem[STUB], stub, sizeof stub);
+          uint8_t p = uint8_t(rndn(4) << 4);
+          c.set_regs(0, 0, 0, 0x01FF, DP_OURS, 0, p, false);
+          if (!m.run(STUB, false, o.err)) o.err = -1;
+          else o.err = c.mem[DP_OURS + FP_ERR];
+          if (c.p() != p && o.err >= 0) o.err = -2;
+          o.res = c.mem[DP_OURS + FP_RES];
+        }
+        memcpy(o.stored, &c.mem[OPERAND], 5);
+        if (o.err) o.res = 0;
+        if (!ours) rom_cyc += m.last_cycles; else our_cyc += m.last_cycles;
+      }
+      n++, ok++;
+      errs += want.err != 0;
+      if (!(want == got) && ++bad <= 4) {
+        printf("NEXT: case %ld differs\n", n);
+        show("step", f);
+        printf("     var %02X %02X %02X %02X %02X  limit %02X %02X %02X %02X %02X\n", var[0], var[1], var[2], var[3],
+               var[4], lim[0], lim[1], lim[2], lim[3], lim[4]);
+        show("ROM", want);
+        show("fp ", got);
+      }
+    };
+    auto step_fac = [&](const uint8_t p[5], int sign) {
+      Fac f;
+      f.exp = p[0];
+      memcpy(f.m, p + 1, 4);
+      f.m[0] |= 0x80;
+      f.sign = uint8_t(f.exp ? sign : 0);
+      f.ext = 0;
+      return f;
+    };
+    for (long i = 0; i < cases; i++) {
+      uint8_t sp[5], var[5], lim[5];
+      long sv = rndn(3) ? long(rndn(9)) - 4 : pick_whole();
+      if (rndn(10)) int_packed(sv, sp); else pick_next_operand(sp);
+      Fac f = step_fac(sp, (sp[1] & 0x80) ? 0xFF : 0x01);
+      if (rndn(20) == 0) f.ext = uint8_t(rnd());
+      if (rndn(20) == 0) f.sign = uint8_t(rnd());
+      pick_next_operand(var);
+      if (rndn(3) == 0) {
+        long v = 0;                                      // a limit at the sum, or a hair off
+        if (var[0] >= 0x81 && var[0] <= 0x8F) {
+          v = long(((var[1] | 0x80) << 8 | var[2]) >> (0x90 - var[0]));
+          if (var[1] & 0x80) v = -v;
+        }
+        int_packed(v + sv + long(rndn(3)) - 1, lim);
+      } else pick_next_operand(lim);
+      one(f, var, lim);
+    }
+    for (long v = -300; v <= 300; v++)
+      for (long st = -12; st <= 12; st++)
+        for (long d = -1; d <= 1; d++) {
+          uint8_t sp[5], var[5], lim[5];
+          int_packed(st, sp);
+          int_packed(v, var);
+          int_packed(v + st + d, lim);
+          one(step_fac(sp, st < 0 ? 0xFF : st > 0 ? 0x01 : 0), var, lim);
+        }
+    printf("%-20s %8ld cases  %6ld ROM errors  %ld differ   cycles/call ROM %6.0f fp816 %6.0f\n", "NEXT", n, errs, bad,
+           ok ? double(rom_cyc) / ok : 0, ok ? double(our_cyc) / ok : 0);
     failed_tests += bad != 0;
   }
 

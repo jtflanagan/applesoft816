@@ -203,12 +203,14 @@ fp_table:
         nop
         jmp     fp_uint16          ; +$94  FAC = the unsigned word FP_INT (LINPRT's FLOAT.2)
         nop
+        jmp     fp_next            ; +$98  NEXT: [FP_PTR] += FAC, rounded; FP_RES = FCOMP([FP_SER])
+        nop
 
         .export fp_load_fac, fp_load_arg, fp_store_fac, fp_add, fp_sub, fp_addt, fp_subt
         .export fp_mul, fp_div, fp_cmp, fp_mul10, fp_div10, fp_sgn, fp_abs, fp_int, fp_qint
         .export fp_ayint, fp_givayf, fp_conint, fp_getadr, fp_fin, fp_negop, fp_fout
         .export fp_sqr, fp_pwr, fp_log, fp_exp, fp_rnd, fp_sin, fp_cos, fp_tan, fp_atn
-        .export fp_round, fp_multt, fp_divt, fp_pwrt, fp_float, fp_uint16
+        .export fp_round, fp_multt, fp_divt, fp_pwrt, fp_float, fp_uint16, fp_next
 
 ; ---- public entries ----
         .a8
@@ -419,6 +421,29 @@ fp_uint16:
         jsr     float_2
         LEAVE
 
+; NEXT ($DCF9) after the step is in FAC: FAC (the step, FACSIGN its sign
+; byte) += the variable at [FP_PTR] (FADD), stored back there rounded
+; (STORE.FAC.AT.YX.ROUNDED), then FP_RES = FCOMP of the result with the limit
+; at [FP_SER].  FAC is undefined afterwards.  When the variable, the step and
+; the limit are whole numbers below 32768 and the sum is not zero, next_int
+; does it with integers: the same stored bytes, the same comparison.
+fp_next:
+        ENTER
+        jsr     next_int
+        bcc     @done
+        jsr     load_arg_from_ptr
+        jsr     faddt
+        jsr     store_fac_at_ptr_rounded
+        lda     FP_SER
+        sta     FP_PTR
+        lda     FP_SER+1
+        sta     FP_PTR+1
+        lda     FP_SER+2
+        sta     FP_PTR+2
+        jsr     fcomp
+        sta     FP_RES
+@done:  LEAVE
+
 ; Error: unwind to the entry's frame and return with FP_ERR set.
 fp_error:                       ; A = error code
         rep     #$30
@@ -433,6 +458,192 @@ fp_error:                       ; A = error code
         .i8
         stx     FP_ERR
         LEAVE
+
+; =========================================================================
+; NEXT's integer path (fp_next): not a port - checked against the ROM's FADD,
+; STORE.FAC.AT.YX.ROUNDED and FCOMP by fptest's NEXT family.
+; =========================================================================
+
+NX_V = RESULT                   ; 2: the variable, then the sum (signed)
+NX_S = RESULT+2                 ; 2: the step (signed)
+NX_L = TEMP3                    ; 2: the limit (signed)
+
+; A = the packed number at [ptr] as a signed integer, C clear; C set when
+; it is not a whole number below 32768.  16-bit A, X, Y.
+.macro  PACKED_WHOLE ptr
+        ldy     #$0003
+        lda     [ptr],y         ; the low mantissa bytes: none in a whole
+        bne     :+              ; number below 32768
+        lda     [ptr]
+        and     #$00FF
+        tax                     ; the exponent
+        ldy     #$0001
+        lda     [ptr],y
+        xba                     ; sign + mantissa 1 : mantissa 2
+        tay                     ; (the sign: bit 15)
+        ora     #$8000
+        jsr     whole
+        bcs     :++
+        cpy     #$8000
+        bcc     :++             ; (C clear)
+        eor     #$FFFF
+        inc     a
+        clc
+        bra     :++
+:       sec
+:
+.endmacro
+
+; the VM's integer NEXT (vm.s) uses these three as fp_next does; all three
+; run with 16-bit A, X, Y, DBR anything, D = the FP direct page
+        .export fp_packed_int, fp_int_packed, fp_whole
+        .a16
+        .i16
+fp_packed_int:                  ; A = [FP_PTR] as above
+        PACKED_WHOLE FP_PTR
+        rts
+fp_whole = whole
+
+; [FP_PTR] = A (signed, not zero), packed as STORE.FAC.AT.YX.ROUNDED
+; packs it: the sum of two whole numbers is exact.
+fp_int_packed:
+        sta     NX_V
+        bpl     @pos
+        eor     #$FFFF
+        inc     a
+@pos:   ldy     #$0090          ; normalize: exponent in Y, mantissa top in A
+        cmp     #$0100
+        bcs     @norm
+        xba
+        ldy     #$0088
+@norm:  cmp     #$8000
+        bcs     @put
+        asl     a
+        dey
+        bra     @norm
+@put:   xba                     ; mantissa 1 : mantissa 2, as stored
+        and     #$FF7F
+        bit     NX_V
+        bpl     @plus
+        ora     #$0080          ; the sign, in mantissa 1's top bit
+@plus:  phy
+        ldy     #$0001
+        sta     [FP_PTR],y
+        lda     #$0000
+        ldy     #$0003
+        sta     [FP_PTR],y
+        pla
+        sep     #$20
+        .a8
+        sta     [FP_PTR]        ; the exponent
+        rep     #$20
+        .a16
+        rts
+
+; C clear: done (stored, FP_RES set); C set: not for this path, nothing
+; written.  Entered with M = X = 1, left that way.
+        .a8
+        .i8
+next_int:
+        lda     FAC_EXT         ; the step: FAC with no rounding byte and no
+        ora     FAC+3           ; low mantissa bytes
+        ora     FAC+4
+        beq     @step
+        sec
+        rts
+@step:  rep     #$30
+        .a16
+        .i16
+        lda     FAC
+        and     #$00FF
+        tax
+        lda     FAC+1
+        xba                     ; mantissa 1 : mantissa 2
+        jsr     whole
+        bcs     @no1
+        bit     FACSIGN-1       ; N = FACSIGN's bit 7
+        bpl     @s
+        eor     #$FFFF
+        inc     a
+@s:     sta     NX_S
+        PACKED_WHOLE FP_SER
+        bcs     @no1
+        sta     NX_L
+        PACKED_WHOLE FP_PTR
+        bcc     @sum
+@no1:   jmp     @no
+@sum:
+        clc
+        adc     NX_S
+        bvs     @no             ; beyond 16 bits
+        beq     @no             ; zero: the ROM's own way
+        pha
+        sec                     ; FCOMP: 0 equal, 1 above, $FF below
+        sbc     NX_L
+        beq     @eq
+        bvc     @nv
+        eor     #$8000
+@nv:    bmi     @lt
+        ldx     #$0001
+        bra     @cmp
+@lt:    ldx     #$00FF
+        bra     @cmp
+@eq:    ldx     #$0000
+@cmp:   stx     FP_RES          ; (and FP_RES+1, a scratch byte)
+        pla
+        jsr     fp_int_packed
+        sep     #$30
+        .a8
+        .i8
+        clc
+        rts
+        .a16
+        .i16
+@no:    sep     #$30
+        .a8
+        .i8
+        sec
+        rts
+
+; whole: A = the magnitude of the number with exponent X and mantissa top
+; A (bit 15 set, the low 16 bits zero), C clear; C set when it is not a
+; whole number below 32768.  Y kept.  16-bit A and X.
+        .a16
+        .i16
+whole:  cpx     #$0081
+        bcc     @small
+        cpx     #$0090
+        bcs     @no
+        cpx     #$0089
+        bcs     @bits
+        bit     #$00FF          ; 8 or more fraction bits: a byte at once
+        bne     @no
+        xba
+        and     #$00FF
+        cpx     #$0088
+        beq     @ok
+@l1:    lsr     a
+        bcs     @no
+        inx
+        cpx     #$0088
+        bne     @l1
+        bra     @ok
+@bits:  lsr     a
+        bcs     @no
+        inx
+        cpx     #$0090
+        bne     @bits
+@ok:    clc
+        rts
+@small: cpx     #$0000
+        bne     @no
+        lda     #$0000          ; zero, whatever its mantissa
+        clc
+        rts
+@no:    sec
+        rts
+        .a8
+        .i8
 
 ; =========================================================================
 ; The port.  ROM labels in comments; same instructions, same order, so the

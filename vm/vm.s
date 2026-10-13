@@ -24,11 +24,12 @@
         .import fp_sgn, fp_ayint, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
         .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_add, fp_table
         .import fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin, fp_tan, fp_atn
-        .import fp_conint, fp_fin, fp_getadr
+        .import fp_conint, fp_fin, fp_getadr, fp_next, fp_packed_int, fp_int_packed, fp_whole
 
 ; ---- direct page ----
 ; fp816's (see fp.s)
 FP_PTR   = $5E
+FP_SER   = $AD          ; 3: fp_next's limit pointer
 FAC      = $9D
 FACSIGN  = $A2
 ARG      = $A5
@@ -119,7 +120,12 @@ ERR_STRING_TOO_LONG = $B0
 
 FRAME_FOR   = $81       ; the ROM's FOR token, as its frames are marked
 FRAME_GOSUB = $B0       ; the ROM's GOSUB token
-FOR_SIZE    = 19        ; var 2, sign 1, step 5, limit 5, body 2, line 2, mark 1... (+1 spare)
+FOR_SIZE    = 30        ; the FOR frame (find_for), its mark last
+F_FLAGS     = $11       ; in it: bit 0 the limit is whole (F_LIMIT), bit 1 the step
+F_STEP      = $12       ;   (F_STEP), bit 2 F_CACHE/F_CVAL hold the variable as NEXT
+F_LIMIT     = $14       ;   stored it last
+F_CACHE     = $16
+F_CVAL      = $1B
 GOSUB_SIZE  = 5         ; return IP 2, line 2, mark 1
 
 .macro  NEXTOP  n
@@ -1156,7 +1162,9 @@ drop_frame:
         rts
 
 ; FOR frame, from its base:  +0 var  +2 step sign  +3 step (5, FAC bytes)
-;  +8 limit (5, packed)  +13 body IP  +15 CURLIN  +17 spare  +18 mark $81
+;  +8 limit (5, packed)  +13 body IP  +15 CURLIN  +17 flags  +18 step and
+;  +20 limit as integers  +22 the variable's bytes as NEXT stored them
+;  last, +27 their value  +29 mark $81
 
 ; find the FOR frame for variable VM_T1 (0 = any), dropping the FOR frames
 ; above it (GTFORPNT); Y = its base, Z clear if found
@@ -1212,6 +1220,8 @@ op_forbegin:
         sta     a:$0000,y       ; the variable
         sep     #$20
         .a8
+        lda     #$00
+        sta     a:F_FLAGS,y
         lda     #FRAME_FOR
         sta     a:FOR_SIZE-1,y
         ldx     VM_IP
@@ -1245,6 +1255,34 @@ op_forlim:
         .a8
         lda     FAC+4
         sta     a:$000C,y
+        stx     VM_IP           ; a whole limit: as an integer too
+        rep     #$21
+        .a16
+        tya
+        adc     #$0008
+        sta     FP_PTR
+        sep     #$20
+        .a8
+        phk
+        pla
+        sta     FP_PTR+2
+        rep     #$20
+        .a16
+        phy
+        jsr     fp_packed_int
+        ply
+        bcs     @no
+        sta     a:F_LIMIT,y
+        sep     #$20
+        .a8
+        lda     a:F_FLAGS,y
+        ora     #$01
+        sta     a:F_FLAGS,y
+        bra     @done
+        .a16
+@no:    sep     #$20
+        .a8
+@done:  ldx     VM_IP
         NEXTOP  2
 
 ; FORSTEP: the step (FAC): its SIGN, then rounded, its five FAC bytes (STEP
@@ -1282,7 +1320,45 @@ op_forstep:
         sta     a:$0007,y
         pla
         sta     a:$0002,y       ; step sign
-        NEXTOP  2
+        lda     FAC+3           ; a whole step: as an integer too (as NEXT
+        ora     FAC+4           ; loads it: FAC+1 with bit 7, the sign apart)
+        bne     @done
+        stx     VM_IP
+        rep     #$20
+        .a16
+        lda     FAC
+        and     #$00FF
+        tax
+        lda     FAC+1
+        xba
+        ora     #$8000
+        phy
+        jsr     fp_whole
+        ply
+        bcs     @no
+        sta     VM_T1
+        sep     #$20
+        .a8
+        lda     a:$0002,y
+        asl     a               ; C = the sign
+        rep     #$20
+        .a16
+        lda     VM_T1
+        bcc     @pos
+        eor     #$FFFF
+        inc     a
+@pos:   sta     a:F_STEP,y
+        sep     #$20
+        .a8
+        lda     a:F_FLAGS,y
+        ora     #$02
+        sta     a:F_FLAGS,y
+        bra     @ip
+        .a16
+@no:    sep     #$20
+        .a8
+@ip:    ldx     VM_IP
+@done:  NEXTOP  2
 
 ; NEXT v / NEXT: NEXT ($DCF9).  FAC = the step (FACSIGN = the sign byte),
 ; FADD the variable, store it rounded (SETFOR), FCOMP the limit; the loop
@@ -1305,14 +1381,109 @@ next_common:
         lda     #ERR_NEXT_WITHOUT_FOR
         jmp     vm_error
 @found: sty     VM_T0           ; the frame's base
+        lda     a:F_FLAGS,y
+        and     #$03
+        cmp     #$03
+        beq     @int
+        jmp     @float
+; the step and the limit are whole numbers: fp816's integer NEXT (fp_next's
+; next_int, checked against the ROM), the variable's last value cached
+@int:   rep     #$20
+        .a16
+        lda     a:$0000,y       ; FP_PTR = the variable (this bank)
+        sta     FP_PTR
+        tax
+        sep     #$20
+        .a8
+        phk
+        pla
+        sta     FP_PTR+2
+        lda     a:F_FLAGS,y
+        and     #$04
+        rep     #$20
+        .a16
+        beq     @decode
+        lda     a:$0000,x       ; still the bytes NEXT stored?
+        cmp     a:F_CACHE,y
+        bne     @decode
+        lda     a:$0002,x
+        cmp     a:F_CACHE+2,y
+        bne     @decode
+        lda     a:$0003,x
+        cmp     a:F_CACHE+3,y
+        bne     @decode
+        lda     a:F_CVAL,y
+        bra     @add
+@decode:
+        jsr     fp_packed_int   ; (X, Y lost)
+        bcs     @float16
+        ldy     VM_T0
+@add:   clc
+        adc     a:F_STEP,y
+        bvs     @float16        ; beyond 16 bits
+        beq     @float16        ; zero: the ROM's own way
+        sta     a:F_CVAL,y
+        sec                     ; FCOMP with the limit: 0 =, 1 above, $FF below
+        sbc     a:F_LIMIT,y
+        beq     @eq
+        bvc     @nv
+        eor     #$8000
+@nv:    sep     #$20
+        .a8
+        bmi     @lt
+        lda     #$01
+        bra     @res
+@lt:    lda     #$FF
+        bra     @res
+        .a16
+@eq:    sep     #$20
+        .a8
+        lda     #$00
+@res:   sta     VM_T1
+        rep     #$20
+        .a16
+        lda     a:F_CVAL,y
+        jsr     fp_int_packed   ; the variable = the sum (Y lost)
+        ldy     VM_T0
+        ldx     FP_PTR          ; the cache = its bytes
+        lda     a:$0000,x
+        sta     a:F_CACHE,y
+        lda     a:$0002,x
+        sta     a:F_CACHE+2,y
+        lda     a:$0003,x
+        sta     a:F_CACHE+3,y
+        sep     #$20
+        .a8
+        lda     a:F_FLAGS,y
+        ora     #$04
+        sta     a:F_FLAGS,y
+        lda     VM_T1
+        bra     @decide
+        .a16
+@float16:
+        sep     #$20
+        .a8
+; otherwise fp_next: FAC = the step, FADD the variable, store it, FCOMP
+@float: ldx     VM_IP
+        ldy     VM_T0
         rep     #$20            ; FAC = the step (LOAD.FAC.FROM.YA of its
         .a16                    ; five bytes: FAC+1 with bit 7, FAC_EXT 0)
         lda     a:$0003,y
         sta     FAC
         lda     a:$0005,y
         sta     FAC+2
+        lda     a:$0000,y       ; FP_PTR = the variable
+        sta     FP_PTR
+        tya                     ; FP_SER = the limit
+        clc
+        adc     #$0008
+        sta     FP_SER
         sep     #$20
         .a8
+        phk
+        pla
+        sta     FP_PTR+2
+        sta     FP_SER+2
         lda     a:$0007,y
         sta     FAC+4
         lda     FAC+1
@@ -1321,34 +1492,11 @@ next_common:
         stz     FAC_EXT
         lda     a:$0002,y       ; FACSIGN = the step's sign
         sta     FACSIGN
-        rep     #$20
-        .a16
-        lda     a:$0000,y       ; the variable
-        tay
-        sep     #$20
-        .a8
-        PTRY
-        FPCHK   fp_add          ; FAC = var + step
-        ldy     VM_T0
-        rep     #$20
-        .a16
-        lda     a:$0000,y
-        tay
-        sep     #$20
-        .a8
-        jsr     store_fac_y     ; SETFOR
-        rep     #$21
-        .a16
-        lda     VM_T0
-        adc     #$0008          ; the limit
-        tay
-        sep     #$20
-        .a8
-        PTRY
-        FP      fp_cmp
+        FPCHK   fp_next
         ldy     VM_T0
         lda     FP_RES
-        sec
+@decide:
+        sec                     ; the loop ends when FCOMP gave the step's sign
         sbc     a:$0002,y
         beq     @done
         rep     #$20            ; again: the body, the FOR's line

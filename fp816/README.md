@@ -34,6 +34,7 @@ compare each fail it.
 | FIN (with CHRGET/CHRGOT over a long text pointer), NEGOP | ported, matches (incl. ?OVERFLOW) |
 | FOUT (number to text, into a caller's buffer) | ported, matches |
 | functions: SQR ^ LOG EXP SIN COS TAN ATN RND (incl. RND's seed, SIN/TAN's quadrant flag) | ported, matches |
+| NEXT (`fp_next`: FADD, STORE rounded, FCOMP in one; an integer path for whole numbers below 32768) | new, matches the ROM's three in a row (random + every small case) |
 
 **Stage 1 is complete: every AppleSoft float routine, bit-exact** (29 test
 families; `make test CASES=50000` runs in ~90 s).  Cost, cycles per call on

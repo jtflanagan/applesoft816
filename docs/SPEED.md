@@ -54,7 +54,9 @@ Compiling Lemonade: 14,761,369 cycles.
 4. **The expression stack and subscripts**: fused operations from the
    compiler, `mul16` out of one-dimension subscripts.
 5. **Compile speed**: one pass instead of two, a FIN fast path for small
-   integers.
+   integers.  *Considering (user, 2026-10-13):* compile lazily, a line (or
+   a run of lines) the first time it is reached, so RUN starts at once and
+   lines that never run are never compiled.  One pass is the prerequisite.
 
 ## Results
 
@@ -62,3 +64,4 @@ Compiling Lemonade: 14,761,369 cycles.
 |---|---|---|---|---|---|---|
 | baseline | 1,207,813 | 7,270,951 | 21,660,330 | 9,622,831 | 65,084,540 | 14,761,369 |
 | 1: round and store inline, NEXT's step inline | 974,567 | 6,634,845 | 19,103,224 | 9,575,091 | 59,242,343 | |
+| 2: integer NEXT (fp_next, frame cache) | 560,784 | 6,634,845 | 18,082,224 | 9,575,091 | 48,866,171 | |
