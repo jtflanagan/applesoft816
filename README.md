@@ -1,7 +1,7 @@
 # applesoft816
 
 A faster AppleSoft for the Apple IIgs: unmodified AppleSoft programs,
-compiled to a cached bytecode, run by a 65816 interpreter that lives (with
+compiled to bytecode on RUN, run by a 65816 interpreter that lives (with
 all its data) outside banks 0/1.  Later, a 16-bit ProDOS 8 underneath.
 
 - `docs/DESIGN.md` - scope, decisions, proposals, open questions

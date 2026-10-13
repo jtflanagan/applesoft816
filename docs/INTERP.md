@@ -81,7 +81,8 @@ C, line by line: copy a line from the text bank into a near buffer, compile
 its statements into bytecode written to the VM bank, record the line's
 bytecode address; patch forward jumps at the end.  Variables are assigned
 slots on first sight (AppleSoft's two-significant-character names, `%` and
-`$` kept apart).  The result is cached beside the source (DESIGN.md).
+`$` kept apart).  Compiled on demand, kept in memory, never written to
+disk (DESIGN.md).
 
 ## Testing (as built)
 
@@ -114,4 +115,4 @@ seed bytes (`$CD` is whatever memory held).
 | M2 | numeric core: PRINT, LET, expressions, IF, GOTO, GOSUB/RETURN, FOR/NEXT, DIM and arrays, END, REM, the numeric functions, AppleSoft's errors | BM1-BM8 and `tests/m2` (arithmetic, loops, GOSUB, arrays, functions, PRINT layout, eight errors): output identical to the GS ROM's AppleSoft - **done**; 1.03-4.3x before any optimisation |
 | M3 | strings, arrays, DIM, INPUT/GET, DATA/READ/RESTORE, DEF FN, all functions, ONERR | Lemonade's computing lines; a string/array corpus - **done** |
 | M4 | screen and machine: HOME, VTAB/HTAB, TEXT/GR/COLOR/PLOT/HLIN/VLIN, HGR/HPLOT, PEEK/POKE/CALL (bank-0 stubs, emulation mode) | Lemonade, whole game, identical screens - **done (2026-10-03): byte-identical output and final screen, 84.0M vs 65.0M cycles**; HGR/HPLOT/DRAW, USR, &, 80-column double lo-res still to do |
-| M5 | the system file, immediate mode, line editor, LOAD/SAVE/RUN/CATALOG/CHR$(4) commands on ProDOS, the bytecode cache | KEGS, then the machine - **in KEGS (2026-10-03, `M5.md`): AS816.SYSTEM under ProDOS 8; RUN/LOAD/SAVE/CATALOG; the line editor, LIST, direct lines, CONT; CHR$(4) CATALOG/RUN/LOAD/PR#; the cache; Lemonade compiles in 4.46 s at 2.8 MHz and plays.  Left: text file I/O, BLOAD/BRUN, the real machine** |
+| M5 | the system file, immediate mode, line editor, LOAD/SAVE/RUN/CATALOG/CHR$(4) commands on ProDOS | KEGS, then the machine - **in KEGS (2026-10-03, `M5.md`): AS816.SYSTEM under ProDOS 8; RUN/LOAD/SAVE/CATALOG; the line editor, LIST, direct lines, CONT; CHR$(4) CATALOG/RUN/LOAD/PR#; Lemonade compiles in 4.46 s at 2.8 MHz and plays.  Left: text file I/O, BLOAD/BRUN, the real machine** |

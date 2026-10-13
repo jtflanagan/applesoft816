@@ -75,10 +75,6 @@ int as816_compile(const Platform *pf, CompileStats *st);
  * not fit (then nothing of it is kept). */
 int as816_direct(const Platform *pf, const uint8_t *tok, uint16_t *entry);
 
-/* The compiler's tables for direct lines, to the bytecode cache (save) or
- * back from it: io moves n bytes between p and the file, in order. */
-void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx);
-
 /* The last compile's variables (arrays_too: its arrays): how many; each
  * one's name (two characters, then the type: 0 real, 1 integer, 2 string)
  * and its slot - for an array, its dimensions and its descriptor. */

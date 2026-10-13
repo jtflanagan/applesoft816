@@ -574,7 +574,7 @@ cc_bank:   .byte 0              ; the compiler image (AS816.CC): code, data
 cc_data:   .byte 0
 text_bank: .byte 0
 xfer_bank: .byte 0              ; CHAIN's variables
-stage_bank: .byte 0             ; the compiler's tables to and from the cache
+stage_bank: .byte 0             ; the variables' table (STORE, CHAIN)
 NBANKS = * - banks
 ; which of banks: the shell gets, and where in its block
 shp_from: .byte vm_bank - banks, text_bank - banks, str_bank - banks, xfer_bank - banks

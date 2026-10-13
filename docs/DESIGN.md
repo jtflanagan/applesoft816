@@ -1,7 +1,7 @@
 # applesoft816: design
 
 A faster AppleSoft for the Apple IIgs: the same language (line numbers and
-all), compiled to a cached bytecode and run by a 65816 interpreter that keeps
+all), compiled to bytecode on `RUN` and run by a 65816 interpreter that keeps
 the program and all its data outside banks 0/1.  Later, a 16-bit ProDOS 8
 underneath it.
 
@@ -15,9 +15,11 @@ Decisions marked *(user)* are settled; the rest are proposals.
 - **Pure AppleSoft** *(user)*: run existing AppleSoft programs, unmodified,
   faster.  No new dialect.  (An earlier plan for a label-based "modern BASIC"
   with an AppleSoft translator was dropped as too large.)
-- **Bytecode cached beside the source** *(user)*, like Python's `.pyc`:
-  compile on `RUN`, keep it in memory, write it next to the program; no
-  re-parsing, variables bound to slots, jumps resolved.
+- **Compiled on demand** *(user, 2026-10-13)*: `RUN` compiles the program
+  and keeps the bytecode in memory until the program changes; nothing
+  compiled goes to disk.  No re-parsing while it runs, variables bound to
+  slots, jumps resolved.  (A `.pyc`-style cache file beside the source was
+  built in M5 and removed: the source is the only file.)
 - **Compatibility with AppleSoft's internals is given up** *(user)* in
   exchange for capacity: program text, bytecode, variables, arrays and strings
   all live outside bank 0, so `LOMEM:`/`HIMEM:` stop mattering and bank 0 is
@@ -69,15 +71,15 @@ The ROM's line editor stores at `$801` and DOS/BASIC.SYSTEM's `LOAD`/`SAVE`/
 `RUN file` work AppleSoft's own pointers, so the interpreter supplies:
 immediate mode (direct lines compiled and run), the line editor, `LIST`,
 `DEL`, `NEW`, `LOAD`/`SAVE`/`RUN file`/`CHAIN`.  Files stay standard AppleSoft
-(`$FC` / DOS `A`) plus the cache file.  `PRINT`/`INPUT` go through the
+(`$FC` / DOS `A`), nothing else.  `PRINT`/`INPUT` go through the
 ROM's `COUT`/input hooks so DOS and BASIC.SYSTEM still see `CHR$(4)` commands.
 
-## The cache file
+## Compiling
 
-- Compiled on `RUN`, kept in memory, written beside the source.
-- Validated by a hash of the tokenized program (DOS 3.3 has no timestamps).
-- Editing a line invalidates it; per-line recompilation is a later option.
-- Always disposable: the source is the program.
+- Compiled on `RUN` (or the first direct line that needs it), kept in
+  memory.
+- Editing a line, `LOAD`, `NEW` or `CHAIN` throws it away; per-line
+  recompilation is a later option.
 
 ## The OS, later *(user: incremental)*
 

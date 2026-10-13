@@ -21,8 +21,6 @@ int compile_direct(const uint8_t *tok, uint16_t *entry);
 uint16_t compile_adopt(const uint8_t name[3], uint8_t ndims);
 void cc_tables(uint16_t *vars, uint16_t *arrays);
 void cc_entry(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *slot);
-uint16_t cc_state_save(void);
-int cc_state_load(uint16_t len);
 extern uint8_t cc_busy;
 
 /* glue.s */
@@ -41,7 +39,5 @@ uint8_t vm_call(uint16_t entry);
 void cc_call(uint8_t warm);            /* the compiler image (cccall.c) */
 void vm_hook(void);                    /* the VM's CHR$(4) commands come to vm_command */
 uint8_t vm_command(void);       /* vm_run ($0000) or vm_direct; VM_ERR */
-extern uint16_t hash_acc;
-void far_hash(void);                   /* hash_acc over xfer_n bytes at xfer_far */
 
 #endif

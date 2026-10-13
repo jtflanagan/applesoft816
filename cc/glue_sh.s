@@ -101,31 +101,6 @@ vm_back:
         lda     [__rc2],y
         rts
 
-; far_hash: hash_acc over xfer_n bytes at xfer_far (one below), last byte
-; first: h = (h rotated left 1) ^ byte
-        .global far_hash
-far_hash:
-        jsr     xfer_setup
-        rep     #0x20
-        lda     mos16(hash_acc)
-        sta     __rc7
-hash_loop:
-        lda     [__rc2],y
-        .byte   0x29                    ; and #$00FF (sixteen bits)
-        .short  0x00ff
-        sta     __rc9
-        lda     __rc7
-        asl     a
-        .byte   0x69                    ; adc #0
-        .short  0
-        eor     __rc9
-        sta     __rc7
-        dey
-        bne     hash_loop
-        sta     mos16(hash_acc)
-        sep     #0x30
-        rts
-
 ; uint16_t fix_links(void): AppleSoft's FIX.LINKS over the program at $0801
 ; of the text bank - each line's link from where its 0 is - up to the line
 ; whose link's high byte is 0; returns that end's address

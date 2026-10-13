@@ -3,9 +3,9 @@
  * A line typed is BASIC.SYSTEM's command (dos.c) if it is one, else
  * AppleSoft's: a numbered line goes into the program (the text bank),
  * LIST/NEW/RUN are done here, anything else is a direct line, compiled
- * against the program and run by the VM.  RUN compiles the program (or
- * takes it from the bytecode cache) and runs it.  COMPILE name is ours: a
- * timed compile, not run.
+ * against the program and run by the VM.  RUN compiles the program (every
+ * time: nothing compiled is kept on disk) and runs it.  COMPILE name is
+ * ours: a timed compile, not run.
  *
  * Everything reaches the machine through machine.c and glue.s: the ROM's
  * COUT/GETLN in emulation mode, the MLI with its parameters in bank 0
@@ -43,12 +43,7 @@ static uint8_t len;
 /* the program in the text bank: $0801 to prog_end (after its 00 00) */
 static uint16_t prog_end = 0x0803;
 static uint8_t compiled;             /* the VM bank holds it, compiled */
-static uint8_t from_file;            /* it is path's file, unedited: the cache applies */
 
-/* the program: its pathname (length first), and what the cache checks */
-static uint8_t path[65];
-static uint16_t src_len, src_hash;
-static uint16_t vm_print;           /* the VM image's hash: bytecode names its handlers */
 static uint16_t prog_start;         /* where the VM image ends and the program begins */
 
 static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
@@ -57,15 +52,6 @@ static int is_digit(uint8_t c) { return c >= '0' && c <= '9'; }
 static uint8_t timing, say_time;
 
 /* ---- the program from a file, to a file ---- */
-
-static void hash_source(void)
-{
-  src_len = (uint16_t)(prog_end - 0x0801);
-  hash_acc = 0;
-  xfer_far = (text_base | 0x0801) - 1, xfer_n = src_len;
-  if (src_len) far_hash();
-  src_hash = hash_acc;
-}
 
 /* LOAD: the BAS file at p into the text bank at $0801; an MLI error (or
  * $4A for the file's type, $4D for its size) */
@@ -96,16 +82,14 @@ uint8_t prog_load(const uint8_t *p)
   if (e) {
     static const uint8_t none[2] = {0, 0};
     to_text(0x0801, none, 2);              /* (half a program is none) */
-    prog_end = 0x0803, compiled = 0, from_file = 0;
+    prog_end = 0x0803, compiled = 0;
     return e;
   }
   /* the end: two zero bytes after it, whatever the file had; the links
    * made for here, wherever it was saved from (FIX.LINKS) */
   to_text(at, z, 2);
   prog_end = (uint16_t)(fix_links() + 2);
-  memcpy(path, p, (size_t)p[0] + 1);
-  compiled = 0, from_file = 1;
-  hash_source();
+  compiled = 0;
   return 0;
 }
 
@@ -133,171 +117,20 @@ uint8_t prog_save(const uint8_t *p)
     e = mli(MLI_WRITE, &w, sizeof w);
   }
   close_ref(ref);
-  if (!e) {                               /* it is that file now */
-    memcpy(path, p, (size_t)p[0] + 1);
-    hash_source();
-    from_file = 1;
-  }
   return e;
 }
 
-/* ---- the bytecode cache: DIR/AS816.CACHE/NAME beside DIR/NAME (ProDOS
- * names leave no room for a suffix), the VM bank's image of the compiled
- * program from prog_start to the stacks, after a header that says which
- * source and which VM it was made from, then the compiler's tables ---- */
-typedef struct {
-  uint8_t magic[4];                 /* "A816" */
-  uint8_t kind, version;            /* 'C', CACHE_VERSION */
-  uint16_t vm_print, src_len, src_hash, start, len, lines, code;
-  uint16_t state;                   /* the compiler's tables after the image: their length */
-} CacheHdr;
-
-#define CACHE_DIR "AS816.CACHE"
-#define CACHE_VERSION 4             /* 2: the compiler's tables after the image; 3: salist_cap;
-                                     * 4: their length in the header */
-
-/* n bytes between the open cache file and the stage bank (the compiler's
- * tables), through the I/O buffer: 0 or an MLI error */
-static uint8_t stage_file(uint8_t ref, uint16_t n, int save)
-{
-  ReadParms r;
-  uint16_t at = 0, k;
-  uint8_t e;
-  r.n = 4, r.ref = ref, r.buf = RES_IOBUF;
-  while (at < n) {
-    k = (uint16_t)(n - at) < RES_IOSIZE ? (uint16_t)(n - at) : RES_IOSIZE;
-    r.req = k, r.trans = 0;
-    if (save) {
-      xfer_far = (stage_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = k;
-      far_move();
-      if ((e = mli(MLI_WRITE, &r, sizeof r)) != 0) return e;
-    } else {
-      if ((e = mli(MLI_READ, &r, sizeof r)) != 0) return e;
-      if (r.trans != k) return MLI_EOF;
-      xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (stage_base | at) - 1, xfer_n = k;
-      far_move();
-    }
-    at = (uint16_t)(at + k);
-  }
-  return 0;
-}
-
-/* the cache's pathname (or, dir_only, its directory's) into out; 0 if too long */
-static int cache_path(uint8_t *out, int dir_only)
-{
-  static const char cd[] = CACHE_DIR;
-  uint8_t n = path[0], i, cut = 0, k = 0;
-  for (i = 1; i <= n; i++)
-    if (path[i] == '/') cut = i;
-  if (cut + sizeof cd + (n - cut) > 64) return 0;
-  for (i = 1; i <= cut; i++) out[++k] = path[i];
-  for (i = 0; cd[i]; i++) out[++k] = (uint8_t)cd[i];
-  if (!dir_only) {
-    out[++k] = '/';
-    for (i = (uint8_t)(cut + 1); i <= n; i++) out[++k] = path[i];
-  }
-  out[0] = k;
-  return 1;
-}
-
-static int cache_load(CompileStats *st)
-{
-  uint8_t cp[65], ref, e;
-  CacheHdr h;
-  ReadParms r;
-  uint16_t at, got = 0;
-  if (!cache_path(cp, 0)) return 0;
-  put_path(cp);
-  if (open_path(&ref)) return 0;
-  r.n = 4, r.ref = ref, r.buf = RES_IOBUF, r.req = sizeof h, r.trans = 0;
-  if (mli(MLI_READ, &r, sizeof r) || r.trans != sizeof h) goto no;
-  from0(&h, RES_IOBUF, sizeof h);
-  if (memcmp(h.magic, "A816", 4) || h.kind != 'C' || h.version != CACHE_VERSION || h.vm_print != vm_print ||
-      h.src_len != src_len || h.src_hash != src_hash || h.start != prog_start)
-    goto no;
-  at = h.start;
-  while (got < h.len) {
-    r.req = (uint16_t)(h.len - got) < RES_IOSIZE ? (uint16_t)(h.len - got) : RES_IOSIZE;
-    r.trans = 0;
-    e = mli(MLI_READ, &r, sizeof r);
-    if (e || r.trans != r.req) goto no;
-    xfer_far = (uint32_t)RES_IOBUF - 1, xfer_far2 = (vm_base | at) - 1, xfer_n = r.trans;
-    far_move();
-    at = (uint16_t)(at + r.trans), got = (uint16_t)(got + r.trans);
-  }
-  e = stage_file(ref, h.state, 0);
-  close_ref(ref);
-  if (e || cc_state_load(h.state)) return 0;
-  st->lines = h.lines, st->code_size = h.code;
-  return 1;
-no:
-  close_ref(ref);
-  return 0;
-}
-
-/* the compiled program into the cache; quietly nothing if the disk says no */
-static void cache_save(const CompileStats *st)
-{
-  uint8_t cp[65], ref;
-  CacheHdr h;
-  CreateParms c;
-  PathParms d;
-  ReadParms w;
-  uint16_t end = vm_read16((uint16_t)(prog_start + 2)), at, n;   /* the header's fstack */
-  memcpy(h.magic, "A816", 4);
-  h.kind = 'C', h.version = CACHE_VERSION, h.vm_print = vm_print, h.src_len = src_len, h.src_hash = src_hash;
-  h.start = prog_start, h.len = (uint16_t)(end - prog_start), h.lines = st->lines, h.code = st->code_size;
-  h.state = cc_state_save();
-  if (!cache_path(cp, 1)) return;
-  put_path(cp);
-  c.n = 7, c.path = RES_PATH, c.access = 0xC3, c.type = 0x0F, c.aux = 0, c.storage = 0x0D;
-  p8_now(&c.cdate, &c.ctime);
-  mli(MLI_CREATE, &c, sizeof c);              /* (there already, mostly) */
-  cache_path(cp, 0);
-  put_path(cp);
-  d.n = 1, d.path = RES_PATH;
-  mli(MLI_DESTROY, &d, sizeof d);
-  c.type = 0x06, c.aux = prog_start, c.storage = 0x01;
-  if (mli(MLI_CREATE, &c, sizeof c) || open_path(&ref)) return;
-  to0(RES_IOBUF, &h, sizeof h);
-  w.n = 4, w.ref = ref, w.buf = RES_IOBUF, w.req = sizeof h;
-  if (!mli(MLI_WRITE, &w, sizeof w))
-    for (at = prog_start; at < end; at = (uint16_t)(at + n)) {
-      n = (uint16_t)(end - at) < RES_IOSIZE ? (uint16_t)(end - at) : RES_IOSIZE;
-      xfer_far = (vm_base | at) - 1, xfer_far2 = (uint32_t)RES_IOBUF - 1, xfer_n = n;
-      far_move();
-      w.req = n;
-      if (mli(MLI_WRITE, &w, sizeof w)) break;
-    }
-  stage_file(ref, h.state, 1);
-  close_ref(ref);
-}
-
-/* the program in memory, compiled (from the cache when it is a file's and
- * the cache has it); 0, having said how long the compile took */
+/* the program in memory, compiled; 0, having said how long the compile took */
 static int compile_current(void)
 {
   CompileStats st;
   uint32_t clk_half;
   uint8_t e;
   if (compiled) return 0;
-  if (from_file && cache_load(&st)) {
-    compiled = 1;
-    poke0((uint16_t)(vm_dp + VM_FRESH), 1);
-    if (!say_time) return 0;
-    crout();
-    print_u(st.lines);
-    print(" LINES, ");
-    print_u(st.code_size);
-    print(" BYTES: CACHED");
-    crout();
-    return 0;
-  }
   e = (uint8_t)compile(&st, &clk_half);
   if (e) { as_error("OUT OF MEMORY"); return 1; }
   compiled = 1;
   poke0((uint16_t)(vm_dp + VM_FRESH), 1);
-  if (from_file) cache_save(&st);
   if (!st.lines || !say_time) return 0;       /* (no program: nothing to say) */
   crout();
   print_u(st.lines);
@@ -555,7 +388,7 @@ static void after_vm(void)
       xfer_n = (uint16_t)(prog_end - del_to);
       far_move_up();
       prog_end = (uint16_t)(fix_links() + 2);
-      compiled = 0, from_file = 0;
+      compiled = 0;
       return;
     }
     if (what == 4) chain_export();
@@ -600,7 +433,7 @@ static void new_program(void)
   static const uint8_t z[2] = {0, 0};
   to_text(0x0801, z, 2);
   prog_end = 0x0803;
-  compiled = 0, from_file = 0;
+  compiled = 0;
 }
 
 /* FNDLIN: the first line numbered num or more (or the end); 1 if it is num */
@@ -643,7 +476,7 @@ static int edit_line(uint16_t num, const uint8_t *tok, uint8_t n)
     }
   }
   prog_end = (uint16_t)(fix_links() + 2);
-  compiled = 0, from_file = 0;
+  compiled = 0;
   return said;
 }
 
@@ -937,10 +770,6 @@ void shell(void)
 {
   rom_call(HOME);
   prog_start = vm_read16(0x0E);
-  hash_acc = 0;
-  xfer_far = vm_base - 1, xfer_n = prog_start;
-  far_hash();
-  vm_print = hash_acc;
   new_program();
   vm_hook();
   print("APPLESOFT816 0.1");

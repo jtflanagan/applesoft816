@@ -15,7 +15,7 @@ struct ShParams {
   uint16_t vm_dp;       /* +2  the VM's direct page (bank 0) */
   uint8_t str_bank;     /* +4  the string heap's */
   uint8_t xfer_bank;    /* +5  CHAIN's */
-  uint8_t stage_bank;   /* +6  the compiler's tables on their way to and from the cache */
+  uint8_t stage_bank;   /* +6  the variables' table (STORE, CHAIN) */
   uint8_t cc_bank;      /* +7  the compiler image's code bank */
   uint8_t cc_data;      /* +8  ... and data bank */
   uint16_t user_id;     /* +9  the Memory Manager's ID for us */
@@ -29,7 +29,6 @@ uint8_t vm_bank, cc_bank, cc_data;
 uint16_t vm_dp;
 uint32_t xfer_far, xfer_far2;   /* far_in/far_out/far_move: one below the first byte */
 uint16_t xfer_near, xfer_n;
-uint16_t hash_acc;              /* far_hash */
 uint16_t vm_entry;              /* vm_call's */
 
 uint32_t text_base, vm_base, xfer_base, stage_base;

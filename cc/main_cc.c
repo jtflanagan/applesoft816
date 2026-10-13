@@ -6,8 +6,7 @@
  * Requests (cc_params.req): 0 compile once (gsrun: cold, the parameters
  * filled in by it), 1 compile, timed by the video counter, 2 a direct
  * line, 3 adopt a variable (CHAIN), 4 the variables' table into the stage
- * bank, 5/6 the compiler's tables to/from the stage bank (the bytecode
- * cache).  After the first, the shell calls warm: the tables stay. */
+ * bank.  After the first, the shell calls warm: the tables stay. */
 #include <stdint.h>
 
 #include "compile.h"
@@ -22,10 +21,9 @@ struct CcParams {
   int16_t result;       /* +4  out */
   CompileStats st;      /* +6  out (14 bytes) */
   uint8_t req;          /* +20 in: the request */
-  uint8_t stage_bank;   /* +21 in: a bank for the tables (requests 4-6) */
+  uint8_t stage_bank;   /* +21 in: a bank for the variables' table (request 4) */
   uint32_t clk;         /* +22 out: request 1's time, in half-lines of the video counter */
-  uint16_t n1, n2;      /* +26 +28: out: direct line's entry, adopt's slot, lengths, counts;
-                         *          in: request 6's length */
+  uint16_t n1, n2;      /* +26 +28: out: direct line's entry, adopt's slot, counts */
   uint8_t name[3];      /* +30 in: adopt's variable */
   uint8_t ndims;        /* +33 in */
   uint8_t tok[256];     /* +34 in: the direct line's tokens */
@@ -81,14 +79,12 @@ static void clk_poll(void *ctx)
   clk_last = v;
 }
 
-/* ---- the stage bank, for the tables (requests 4-6) ---- */
+/* ---- the stage bank, for the variables' table (request 4) ---- */
 static uint16_t stage_at;
-static void stage_io(void *ctx, void *p, uint16_t n)
+static void stage_out(void *p, uint16_t n)
 {
-  if (!n) return;
   xfer_far = (stage_base | stage_at) - 1, xfer_near = (uint16_t)((uint16_t)p - 1), xfer_n = n;
-  if (ctx) far_out();
-  else far_in();
+  far_out();
   stage_at = (uint16_t)(stage_at + n);
 }
 
@@ -132,23 +128,13 @@ int cc_main(void)
     for (i = 0; i < cc_params.n1; i++) {
       as816_var(i, e, &a);
       e[3] = 0, e[4] = (uint8_t)a, e[5] = (uint8_t)(a >> 8);
-      stage_io((void *)1, e, 6);
+      stage_out(e, 6);
     }
     for (i = 0; i < cc_params.n2; i++) {
       as816_array(i, e, &e[3], &a);
       e[4] = (uint8_t)a, e[5] = (uint8_t)(a >> 8);
-      stage_io((void *)1, e, 6);
+      stage_out(e, 6);
     }
-    break;
-  case 5:
-    stage_at = 0;
-    as816_state(1, stage_io, (void *)1);
-    cc_params.n1 = stage_at;
-    break;
-  case 6:
-    stage_at = 0;
-    as816_state(0, stage_io, 0);
-    cc_params.result = stage_at == cc_params.n1 ? 0 : -1;
     break;
   }
   return 0;

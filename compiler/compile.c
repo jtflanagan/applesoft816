@@ -1362,48 +1362,6 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
   return 0;
 }
 
-/* the compiler's tables (direct lines need them), out to the cache or back
- * in from it: io moves n bytes between p and the file, in order */
-/* (the layout and counts, as a table: compact on the 65816) */
-static uint16_t *const state_words[] = {
-  &nlines, &nvars, &narrays, &nconsts, &nfns, &nsvars, &nsarrays, &svlist_cap, &salist_cap,
-  &code_base, &const_base, &str_base, &data_base, &var_base, &fn_base, &desc_base, &desc_copy_base,
-  &desc_bytes, &svlist_base, &salist_base, &fstack_base, &sstack_base, &cstack_base, &heap_base
-};
-#define NSTATE (sizeof state_words / sizeof state_words[0])
-
-void as816_state(int save, void (*io)(void *ctx, void *p, uint16_t n), void *ctx)
-{
-  uint16_t t[NSTATE + 1], i;
-  if (save) {
-    for (i = 0; i < NSTATE; i++) t[i] = *state_words[i];
-    t[NSTATE] = (uint16_t)use_onerr;
-  }
-  io(ctx, t, sizeof t);
-  if (!save) {
-    for (i = 0; i < NSTATE; i++) *state_words[i] = t[i];
-    use_onerr = t[NSTATE];
-    if (nlines > MAX_LINES || nvars > MAX_VARS || narrays > MAX_ARRAYS || nconsts > MAX_CONSTS || nfns > MAX_FNS)
-      nlines = nvars = narrays = nconsts = nfns = 0;
-  }
-  io(ctx, lines, (uint16_t)(sizeof lines[0] * (nlines + 1)));
-  io(ctx, vars, (uint16_t)(sizeof vars[0] * nvars));
-  io(ctx, var_off, (uint16_t)(sizeof var_off[0] * nvars));
-  io(ctx, arrays, (uint16_t)(sizeof arrays[0] * narrays));
-  io(ctx, desc_off, (uint16_t)(sizeof desc_off[0] * narrays));
-  io(ctx, fns, (uint16_t)(sizeof fns[0] * nfns));
-  io(ctx, consts, (uint16_t)(sizeof consts[0] * nconsts));
-  if (!save) {                             /* the constants' hash, and no direct lines yet */
-    memset(const_head, 0, sizeof const_head);
-    for (i = 0; i < nconsts; i++) {
-      uint8_t h = const_hash(consts[i]);
-      const_next[i] = const_head[h];
-      const_head[h] = (uint16_t)(i + 1);
-    }
-    dvar_at = 0;
-  }
-}
-
 /* ---- the program's variables, by name (CHAIN carries them across) ---- */
 uint16_t as816_count(int arrays_too)
 {

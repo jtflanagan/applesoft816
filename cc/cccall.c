@@ -116,16 +116,4 @@ void cc_entry(uint16_t i, uint8_t name[3], uint8_t *ndims, uint16_t *slot)
   *slot = (uint16_t)(e[4] | e[5] << 8);
 }
 
-/* the compiler's tables to the stage bank (its length) and back (0 or -1) */
-uint16_t cc_state_save(void)
-{
-  req(5);
-  return n1();
-}
-int cc_state_load(uint16_t len)
-{
-  put(CCP_N1, &len, 2);
-  return req(6);
-}
-
 #pragma clang attribute pop
