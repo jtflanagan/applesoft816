@@ -61,3 +61,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | Step | BM1 | BM3 | BM7 | BM8 | Lemonade | Compile |
 |---|---|---|---|---|---|---|
 | baseline | 1,207,813 | 7,270,951 | 21,660,330 | 9,622,831 | 65,084,540 | 14,761,369 |
+| 1: round and store inline, NEXT's step inline | 974,567 | 6,634,845 | 19,103,224 | 9,575,091 | 59,242,343 | |

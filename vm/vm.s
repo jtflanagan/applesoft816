@@ -811,13 +811,12 @@ op_ldv:
 ; STV v: the variable at v = FAC, rounded (STORE.FAC.AT.YX.ROUNDED)
 op_stv:
         ldy     a:$0002,x
-        PTRY
-        FPCHK   fp_store_fac
+        jsr     store_fac_y
         NEXTOP  4
 
 ; PUSH: FRMEVL's FRM.STACK: round FAC, push it (sign kept apart)
 op_push:
-        FPCHK   fp_round
+        jsr     round_fac
         ldy     VM_FSP
         rep     #$20
         .a16
@@ -834,6 +833,41 @@ op_push:
         sep     #$20
         .a8
         NEXTOP  2
+
+; round_fac: ROUND.FAC ($EB72) - here, unless the rounding byte carries
+; into the mantissa: then fp816's (the increment, ?OVERFLOW).  X, Y kept.
+round_fac:
+        lda     FAC
+        beq     @r
+        lda     FAC_EXT
+        bmi     @carry
+        asl     FAC_EXT
+@r:     rts
+@carry: phy
+        FPCHK   fp_round
+        ply
+        rts
+
+; store_fac_y: the variable at Y (this bank) = FAC, rounded
+; (STORE.FAC.AT.YX.ROUNDED: the sign packed into the mantissa, FAC_EXT = 0)
+store_fac_y:
+        jsr     round_fac
+        lda     FACSIGN
+        ora     #$7F
+        and     FAC+1
+        xba                     ; B = the packed first mantissa byte
+        lda     FAC
+        rep     #$20
+        .a16
+        sta     a:$0000,y       ; exponent, sign + mantissa 1
+        lda     FAC+2
+        sta     a:$0002,y
+        sep     #$20
+        .a8
+        lda     FAC+4
+        sta     a:$0004,y
+        stz     FAC_EXT
+        rts
 
 ; pop the pushed operand into ARG, SGNCPR (FRM.PERFORM.2)
 poparg: ldy     VM_FSP
@@ -1195,7 +1229,7 @@ op_forlim:
         ora     #$7F
         and     FAC+1
         sta     FAC+1
-        FPCHK   fp_round
+        jsr     round_fac
         ldy     VM_CSP
         rep     #$20
         .a16
@@ -1224,7 +1258,7 @@ op_forstep:
         bcs     @sg
         lda     #$01
 @sg:    pha
-        FPCHK   fp_round
+        jsr     round_fac
         ldy     VM_CSP
         rep     #$20
         .a16
@@ -1271,18 +1305,21 @@ next_common:
         lda     #ERR_NEXT_WITHOUT_FOR
         jmp     vm_error
 @found: sty     VM_T0           ; the frame's base
-        tya                     ; FP_PTR = the step bytes
-        rep     #$21
-        .a16
-        tya
-        adc     #$0003
-        tay
+        rep     #$20            ; FAC = the step (LOAD.FAC.FROM.YA of its
+        .a16                    ; five bytes: FAC+1 with bit 7, FAC_EXT 0)
+        lda     a:$0003,y
+        sta     FAC
+        lda     a:$0005,y
+        sta     FAC+2
         sep     #$20
         .a8
-        PTRY
-        FP      fp_load_fac
-        ldy     VM_T0
-        lda     a:$0002,y
+        lda     a:$0007,y
+        sta     FAC+4
+        lda     FAC+1
+        ora     #$80
+        sta     FAC+1
+        stz     FAC_EXT
+        lda     a:$0002,y       ; FACSIGN = the step's sign
         sta     FACSIGN
         rep     #$20
         .a16
@@ -1299,8 +1336,7 @@ next_common:
         tay
         sep     #$20
         .a8
-        PTRY
-        FPCHK   fp_store_fac    ; SETFOR
+        jsr     store_fac_y     ; SETFOR
         rep     #$21
         .a16
         lda     VM_T0
@@ -1553,8 +1589,7 @@ op_sta: stx     VM_IP
         ldy     a:$0002,x
         jsr     elem_addr
         ldx     VM_IP
-        PTRY
-        FPCHK   fp_store_fac
+        jsr     store_fac_y
         NEXTOP  4
 
 ; DIM d: bounds from the n subscripts pushed (IDX), ?REDIM'D ARRAY if done
@@ -2472,7 +2507,7 @@ op_ldvi:
 
 ; STVI v: LET2: ROUND.FAC, AYINT (?ILLEGAL QUANTITY), the two bytes
 op_stvi:
-        FPCHK   fp_round
+        jsr     round_fac
         FPCHK   fp_ayint
         ldy     a:$0002,x
         lda     FAC+3
@@ -2499,7 +2534,7 @@ op_stai:
         jsr     elem_addr
         sty     VM_T4
         ldx     VM_IP
-        FPCHK   fp_round
+        jsr     round_fac
         FPCHK   fp_ayint
         ldy     VM_T4
         lda     FAC+3
@@ -2870,10 +2905,9 @@ in_number:
 @ok:    lda     VM_ITYPE
         bne     @int
         ldy     VM_ITGT         ; SETFOR: stored rounded
-        PTRY
-        FPCHK   fp_store_fac
+        jsr     store_fac_y
         bra     in_more
-@int:   FPCHK   fp_round
+@int:   jsr     round_fac
         FPCHK   fp_ayint
         ldy     VM_ITGT
         lda     FAC+3
@@ -3122,8 +3156,7 @@ op_fncall:
         sep     #$20
         .a8
         ldy     VM_T1
-        PTRY
-        FPCHK   fp_store_fac
+        jsr     store_fac_y
         ldx     VM_T2
         jmp     ($0000,x)
 
