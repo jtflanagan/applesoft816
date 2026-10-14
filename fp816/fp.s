@@ -210,12 +210,14 @@ fp_table:
         nop
         jmp     fp_next            ; +$98  NEXT: [FP_PTR] += FAC, rounded; FP_RES = FCOMP([FP_SER])
         nop
+        jmp     fp_ayint16         ; +$9C  FAC+3,4 = AYINT (the rest of FAC undefined)
+        nop
 
         .export fp_load_fac, fp_load_arg, fp_store_fac, fp_add, fp_sub, fp_addt, fp_subt
         .export fp_mul, fp_div, fp_cmp, fp_mul10, fp_div10, fp_sgn, fp_abs, fp_int, fp_qint
         .export fp_ayint, fp_givayf, fp_conint, fp_getadr, fp_fin, fp_negop, fp_fout
         .export fp_sqr, fp_pwr, fp_log, fp_exp, fp_rnd, fp_sin, fp_cos, fp_tan, fp_atn
-        .export fp_round, fp_multt, fp_divt, fp_pwrt, fp_float, fp_uint16, fp_next
+        .export fp_round, fp_multt, fp_divt, fp_pwrt, fp_float, fp_uint16, fp_next, fp_ayint16
 
 ; ---- public entries ----
         .a8
@@ -310,6 +312,52 @@ fp_qint:
 fp_ayint:
         ENTER
         jsr     ayint
+        LEAVE
+
+; AYINT's result alone (subscripts, integer variables): FAC+3 (high), FAC+4
+; = the integer, ?ILLEGAL QUANTITY as AYINT; the rest of FAC undefined.  A
+; positive number below 32768 is its top 16 mantissa bits shifted (what
+; QINT comes to); anything else is AYINT's own way.
+fp_ayint16:
+        ENTER
+        lda     FACSIGN
+        bmi     @slow
+        lda     FAC
+        cmp     #$90
+        bcs     @slow
+        cmp     #$81
+        bcc     @zero
+        rep     #$30
+        .a16
+        .i16
+        and     #$00FF
+        tax                     ; the exponent
+        lda     FAC+1
+        xba                     ; the top 16 mantissa bits
+        cpx     #$0089
+        bcs     @bits
+        xba                     ; 8 or more to go: a byte at once
+        and     #$00FF
+@l1:    cpx     #$0088
+        beq     @put
+        lsr     a
+        inx
+        bra     @l1
+@bits:  cpx     #$0090
+        beq     @put
+        lsr     a
+        inx
+        bra     @bits
+@put:   xba
+        sta     FAC+3           ; high, low
+        sep     #$30
+        .a8
+        .i8
+        LEAVE
+@zero:  stz     FAC+3
+        stz     FAC+4
+        LEAVE
+@slow:  jsr     ayint
         LEAVE
 
 fp_givayf:

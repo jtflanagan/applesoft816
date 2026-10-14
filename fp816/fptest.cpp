@@ -44,7 +44,7 @@ constexpr int FP_BUF = 0xFD, RNDSEED = 0xC9, CPRMASK = 0x16;
 constexpr uint32_t F_SQR = LIB + 0x5C, F_PWR = LIB + 0x60, F_LOG = LIB + 0x64, F_EXP = LIB + 0x68,
                    F_RND = LIB + 0x6C, F_SIN = LIB + 0x70, F_COS = LIB + 0x74, F_TAN = LIB + 0x78,
                    F_ATN = LIB + 0x7C;
-constexpr uint32_t F_NEXT = LIB + 0x98;
+constexpr uint32_t F_NEXT = LIB + 0x98, F_AYINT16 = LIB + 0x9C;
 constexpr int FP_SER = 0xAD;
 constexpr uint32_t LIMIT = 0x000308; // NEXT's limit, 5 packed bytes
 constexpr uint32_t OUTBUF = 0x000500; // fp816's FOUT text (the ROM's is $0100)
@@ -442,6 +442,14 @@ int main(int argc, char** argv)
       {"INT", both(F_INT, R_INT, NONE), 0x70, 0xA8},
       {"QINT", both(F_QINT, R_QINT, NONE), 0x70, 0xA0},
       {"AYINT", both(F_AYINT, R_AYINT, NONE), 0x70, 0x92},
+      // fp_ayint16: AYINT's two bytes and its error only (FAC+3, FAC+4)
+      {"AYINT16", [&m](bool o, const Fac& f, const uint8_t* p) {
+         Outcome r = o ? m.lib_call(F_AYINT16, f, p, NONE) : m.rom_call(R_AYINT, f, p, NONE);
+         Fac k{};
+         k.m[2] = r.fac.m[2], k.m[3] = r.fac.m[3];
+         r.fac = r.err ? Fac{} : k;
+         return r;
+       }, 0x70, 0x92},
       {"GIVAYF", both(F_GIVAYF, R_GIVAYF, INT16)},
       {"CONINT", both(F_CONINT, R_CONINT, NONE, R_X), 0x70, 0x8A},
       {"GETADR", both(F_GETADR, R_GETADR, NONE, R_LINNUM), 0x70, 0x92},

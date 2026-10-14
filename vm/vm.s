@@ -24,7 +24,7 @@
         .import fp_sgn, fp_ayint, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
         .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_add, fp_table
         .import fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin, fp_tan, fp_atn
-        .import fp_conint, fp_fin, fp_getadr, fp_next, fp_packed_int, fp_int_packed, fp_whole
+        .import fp_conint, fp_fin, fp_getadr, fp_ayint16, fp_next, fp_packed_int, fp_int_packed, fp_whole
 
 ; ---- direct page ----
 ; fp816's (see fp.s)
@@ -1675,7 +1675,7 @@ op_idx:
         bpl     @pos
         lda     #ERR_ILLQTY
         jmp     vm_error
-@pos:   FPCHK   fp_ayint
+@pos:   FPCHK   fp_ayint16
         ldy     VM_FSP
         lda     FAC+4
         sta     a:$0000,y
@@ -1699,7 +1699,44 @@ elem_addr:
 @have:  ldy     VM_T1
         lda     a:$0002,y       ; n (byte)
         and     #$00FF
+        cmp     #$0001
+        bne     @many
+        ldy     VM_FSP          ; one subscript: popped, checked, times the
+        dey                     ; element size (5, 2, 4) by shifts
+        dey
+        sty     VM_FSP
+        lda     a:$0000,y
+        ldy     VM_T1
+        cmp     a:$0004,y
+        beq     @in1
+        bcc     @in1
+        jmp     @bad
+@in1:   sta     VM_T0
+        lda     a:$0003,y
+        and     #$00FF
+        cmp     #$0004
+        beq     @x4
+        bcs     @x5
+        lda     VM_T0           ; 2
         asl     a
+        bra     @add
+@x4:    lda     VM_T0
+        asl     a
+        asl     a
+        bra     @add
+@x5:    lda     VM_T0
+        asl     a
+        asl     a
+        clc
+        adc     VM_T0
+@add:   clc
+        adc     a:$0000,y
+        tay
+        sep     #$20
+        .a8
+        rts
+        .a16
+@many:  asl     a
         sta     VM_T2           ; 2n
         ; subscripts on the expression stack, first pushed first: walk from
         ; the last (innermost index) to the first
@@ -2823,7 +2860,7 @@ op_ldvi:
 ; STVI v: LET2: ROUND.FAC, AYINT (?ILLEGAL QUANTITY), the two bytes
 op_stvi:
         jsr     round_fac
-        FPCHK   fp_ayint
+        FPCHK   fp_ayint16
         ldy     a:$0002,x
         lda     FAC+3
         sta     a:$0000,y
@@ -2850,7 +2887,7 @@ op_stai:
         sty     VM_T4
         ldx     VM_IP
         jsr     round_fac
-        FPCHK   fp_ayint
+        FPCHK   fp_ayint16
         ldy     VM_T4
         lda     FAC+3
         sta     a:$0000,y
@@ -3277,7 +3314,7 @@ in_number:
         jsr     store_fac_y
         bra     in_more
 @int:   jsr     round_fac
-        FPCHK   fp_ayint
+        FPCHK   fp_ayint16
         ldy     VM_ITGT
         lda     FAC+3
         sta     a:$0000,y
