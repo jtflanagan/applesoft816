@@ -57,6 +57,11 @@ TEMP2    = $98
 RNDSEED  = $C9          ; 5 bytes: RND's seed (AppleSoft: 80 4F C7 52 58 at cold start)
 LINNUM   = $50          ; GETADR's result, 2 bytes
 FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
+; stage 2's scratch ($67-$81: free in AppleSoft's offsets and the VM's)
+DW_A = $67                      ; 4: ARG's mantissa, little-endian (FDIVT)
+DW_F = $6B                      ; 4: FAC's
+DW_Q = $6F                      ; 2: quotient bits coming in, behind a sentinel 1
+DW_R = $71                      ; 6: the quotient words: bits 1-16, 17-32, then 33-34
 
 ERR_OVERFLOW = $45
 ERR_DIVZERO  = $85
@@ -1273,8 +1278,9 @@ div:    stx     SGNCPR
 
 ; FDIVT ($EA69): FAC = ARG / FAC; A = FAC exponent with flags on entry
 fdivt:
-        beq     @leae1
-        jsr     round_fac
+        bne     @nz
+        jmp     @leae1
+@nz:    jsr     round_fac
         lda     #$00
         sec
         sbc     FAC
@@ -1282,75 +1288,103 @@ fdivt:
         jsr     add_exponents
         inc     FAC
         beq     jov
-        ldx     #$FC
-        lda     #$01
-@lea80: ldy     ARG+1
-        cpy     FAC+1
-        bne     @lea96
-        ldy     ARG+2
-        cpy     FAC+2
-        bne     @lea96
-        ldy     ARG+3
-        cpy     FAC+3
-        bne     @lea96
-        ldy     ARG+4
-        cpy     FAC+4
-@lea96: php
-        rol     a
-        bcc     @leaa3
-        inx
-        ; ROM: sta $65,x with X = $FD..$01 - on the 6502 that wraps in zero
-        ; page ($62..$66); native-mode dp,X does not wrap, so store through
-        ; a long pointer to this direct page at the wrapped offset.
-        php
-        pha
-        txa
-        clc
-        adc     #$65
-        tay
-        pla
-        sta     [FP_DPP],y
-        plp
-        beq     @lead1
-        bpl     @lead5
-        lda     #$01
-@leaa3: plp
-        bcs     @leab4
-@leaa6: asl     ARG+4
-        rol     ARG+3
-        rol     ARG+2
-        rol     ARG+1
-        bcs     @lea96
-        bmi     @lea80
-        bpl     @lea96
-@leab4: tay
-        lda     ARG+4
-        sbc     FAC+4
-        sta     ARG+4
+        ; Stage 2: the ROM's restoring division (34 quotient bits: RESULT's
+        ; 32, then 2 into FAC.EXTENSION's top; after a bit, if it is 1, ARG
+        ; -= FAC; ARG <<= 1; the next bit is the bit shifted out, else
+        ; ARG >= FAC compared only when ARG's top bit is set; nothing after
+        ; the last bit) in 16-bit halves of little-endian copies
+        rep     #$30
+        .a16
+        .i16
         lda     ARG+3
-        sbc     FAC+3
-        sta     ARG+3
-        lda     ARG+2
-        sbc     FAC+2
-        sta     ARG+2
+        xba
+        sta     DW_A
         lda     ARG+1
-        sbc     FAC+1
+        xba
+        sta     DW_A+2
+        lda     FAC+3
+        xba
+        sta     DW_F
+        lda     FAC+1
+        xba
+        sta     DW_F+2
+        ldx     #$0000          ; the next quotient word (DW_R+x)
+        lda     #$0001          ; behind a sentinel bit
+        sta     DW_Q
+@cmp:   lda     DW_A+2          ; C = ARG >= FAC
+        cmp     DW_F+2
+        bne     @c
+        lda     DW_A
+        cmp     DW_F
+@c:     bcc     @zero
+@one:   rol     DW_Q            ; a 1
+        bcc     @sub
+        jsr     div_word
+        beq     @done
+@sub:   lda     DW_A            ; ARG -= FAC
+        sec
+        sbc     DW_F
+        sta     DW_A
+        lda     DW_A+2
+        sbc     DW_F+2
+        sta     DW_A+2
+@shift: asl     DW_A            ; ARG <<= 1
+        rol     DW_A+2
+        bcs     @one            ; a bit out: 1
+        bit     DW_A+2
+        bmi     @cmp            ; the top bit set: compare
+@zero:  rol     DW_Q            ; else 0
+        bcc     @shift
+        jsr     div_word
+        bne     @shift
+@done:  lda     DW_A+2          ; ARG as the ROM leaves it
+        xba
         sta     ARG+1
-        tya
-        jmp     @leaa6
-@lead1: lda     #$40
-        bne     @leaa3
-@lead5: asl     a
+        lda     DW_A
+        xba
+        sta     ARG+3
+        lda     DW_R            ; RESULT: bits 1-32
+        xba
+        sta     RESULT
+        lda     DW_R+2
+        xba
+        sta     RESULT+2
+        sep     #$30
+        .a8
+        .i8
+        lda     DW_R+4          ; bits 33, 34 (the ROM stores them at $66 too,
+        sta     $66             ; RESULT's wrapped fifth byte)
+        asl     a
         asl     a
         asl     a
         asl     a
         asl     a
         asl     a
         sta     FAC_EXT
-        plp
         jmp     copy_result_into_fac
 @leae1: lda     #ERR_DIVZERO
         jmp     fp_error
+
+
+; a quotient word is full (DW_Q's sentinel out): kept, the next begun - the
+; third takes only two bits (sentinel $4000); Z set when all 34 are in
+        .a16
+        .i16
+div_word:
+        lda     DW_Q
+        sta     DW_R,x
+        inx
+        inx
+        cpx     #$0006
+        beq     @r
+        lda     #$0001
+        cpx     #$0004
+        bne     @s
+        lda     #$4000
+@s:     sta     DW_Q            ; (Z clear)
+@r:     rts
+        .a8
+        .i8
 
 ; COPY.RESULT.INTO.FAC ($EAE6)
 copy_result_into_fac:

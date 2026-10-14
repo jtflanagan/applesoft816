@@ -41,7 +41,9 @@ acc = (acc >> 8) + b * ARG per multiplier byte (plus its known bug: a zero
 byte after a zero byte shifts RESULT a bit further), done with quarter
 squares in 16-bit halves: 1316 -> 871 cycles a call, every function that
 multiplies faster too; mutation-checked (the bug path dropped fails FMULT,
-LOG and EXP).
+LOG and EXP).  FDIV - the same restoring division (34 quotient bits) on
+little-endian 16-bit copies of the mantissas: 2381 -> 1962.  Stage 2's
+scratch is $67-$81, free in AppleSoft's offsets and the VM's.
 
 **Stage 1 is complete: every AppleSoft float routine, bit-exact** (29 test
 families; `make test CASES=50000` runs in ~90 s).  Cost, cycles per call on
