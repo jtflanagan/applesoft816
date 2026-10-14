@@ -149,12 +149,14 @@ static uint8_t cbuf[256];
 static uint8_t clen;
 static void flush_code(uint16_t n)
 {
+  if (pc > code_limit) overflow = 1;      /* (checked here, not per byte: the limit is at
+                                           * most $F400, so pc cannot wrap in between) */
   if (n && !overflow) pf->write(pf->ctx, (uint16_t)(pc - n), cbuf, n);
   clen = 0;
 }
 static void emit8(uint8_t v)
 {
-  if (++pc > code_limit || pc == 0) overflow = 1;
+  pc++;
   cbuf[clen++] = v;
   if (!clen) flush_code(256);
 }
@@ -1159,12 +1161,13 @@ static uint16_t read_line(uint16_t at, uint16_t *num)
  * literals, REM, DATA and &'s text (more is only room unused) ---- */
 static uint16_t var_max, desc_max, nfn_max, nsv_max, nsa_max, nstmt_max;
 
-/* the subscripts' count of the "(" at buf[j]: its commas at depth 1, + 1 */
-static uint8_t scan_dims(uint8_t j)
+/* the subscripts' count of the "(" at t[j] (n bytes): its commas at depth
+ * 1, + 1 */
+static uint8_t scan_dims(const uint8_t *t, uint8_t j, uint8_t n)
 {
   uint8_t nd = 1, depth = 0, q = 0;
-  for (; j < blen; j++) {
-    uint8_t d = buf[j];
+  for (; j < n; j++) {
+    uint8_t d = t[j];
     if (d == '"') { q ^= 1; continue; }
     if (q) continue;
     if (d == '(') depth++;
@@ -1174,33 +1177,74 @@ static uint8_t scan_dims(uint8_t j)
   return nd;
 }
 
+/* the index of the first byte from t[j] (below n) the scan acts on - a
+ * letter, ":", a token it looks at - passing over quoted text; n if none
+ * (65816: cc/glue_cc.s, a table and a tight loop) */
+#ifdef __mos__
+uint8_t scan_skip(const uint8_t *t, uint8_t j, uint8_t n);
+#else
+static uint8_t scan_skip(const uint8_t *t, uint8_t j, uint8_t n)
+{
+  for (; j < n; j++) {
+    uint8_t c = t[j];
+    if ((c >= 'A' && c <= 'Z') || c == ':' || c == T_REM || c == T_DATA || c == T_AMPER || c == T_SHLOAD ||
+        c == T_RECALL || c == T_STORE || c == T_SAVE || c == T_LOAD || c == T_ONERR || c == T_RESUME ||
+        c == T_TRACE || c == T_DEF)
+      return j;
+    if (c == '"')
+      for (j++; j < n && t[j] != '"'; j++) {}
+  }
+  return n;
+}
+#endif
+
 /* the keys dims_of holds (to clear them after), as many as fit */
 #define SCAN_KEYS 128
 static uint16_t scan_key[SCAN_KEYS];
 static uint8_t nscan_keys;
 
+/* the scan reads the text a window at a time: tbuf holds tlen bytes from
+ * tbase; a line is wholly in it (header, at most 255 characters, its 0) */
+#define TWIN 1024
+static uint8_t tbuf[TWIN];
+static uint16_t tbase, tlen;
+static const uint8_t *text_at(uint16_t at)
+{
+  if (at < tbase || (uint32_t)at + 260 > (uint32_t)tbase + tlen) {
+    tbase = at;
+    tlen = (uint16_t)(0xFFFFu - at + 1 < TWIN ? 0xFFFFu - at + 1 : TWIN);
+    pf->read(pf->ctx, at, tbuf, tlen);
+  }
+  return tbuf + (at - tbase);
+}
+
 static int prescan(void)
 {
-  uint16_t at = 0x0801, link, num;
+  uint16_t at = 0x0801, link;
   memset(seen, 0, sizeof seen);
   nscan_keys = 0;
   nlines = 0;
   var_max = desc_max = nfn_max = nsv_max = nsa_max = nstmt_max = 0;
   use_onerr = 0;
-  while ((link = read_line(at, &num)) != 0) {
-    uint8_t j = 0, n = blen;
+  tbase = 0xFFFF, tlen = 0;
+  for (;;) {
+    const uint8_t *h = text_at(at), *buf;
+    uint8_t j = 0, n = 0;
+    link = (uint16_t)(h[0] | h[1] << 8);
+    if (!link) break;
+    buf = h + 4;
+    while (n < 255 && buf[n]) n++;
     if (pf->poll) pf->poll(pf->ctx);
     if (nlines == MAX_LINES) return -1;
-    lines[nlines].num = num, lines[nlines].at = at;
+    lines[nlines].num = (uint16_t)(h[2] | h[3] << 8), lines[nlines].at = at;
     nlines++;
     nstmt_max++;
-    while (j < n) {
-      uint8_t c = buf[j++];
-      if (c < 'A') {                      /* digits, punctuation: " and : matter */
-        if (c == '"') { while (j < n && buf[j++] != '"') {} }
-        else if (c == ':') nstmt_max++;
-        continue;
-      }
+    for (;;) {
+      uint8_t c;
+      j = scan_skip(buf, j, n);
+      if (j >= n) break;
+      c = buf[j++];
+      if (c == ':') { nstmt_max++; continue; }
       if (c <= 'Z') {                     /* a name, as read_name reads it */
         uint8_t c2 = 0, type = 0, d;
         while (j < n && buf[j] == ' ') j++;
@@ -1213,7 +1257,7 @@ static int prescan(void)
         while (j < n && buf[j] == ' ') j++;
         if (j < n && buf[j] == '(') {
           uint16_t key = name_key(c, c2, type);
-          uint8_t nd = scan_dims(j), had = dims_of[key];
+          uint8_t nd = scan_dims(buf, j, n), had = dims_of[key];
           if (!had) {
             desc_max = (uint16_t)(desc_max + 4 + 2 * nd);
             nsa_max += type == 2;
@@ -1300,9 +1344,9 @@ static void program_array(uint16_t i)
 }
 
 /* line i's code: its entry in the line table, LINE, its statements */
-__attribute__((noinline)) static void compile_line(uint16_t i)
+static void compile_line(uint16_t i)
 {
-  uint16_t num;
+  uint16_t num = lines[i].num;
   line_i = i;
   read_line(lines[i].at, &num);
   out(entry(i), (uint8_t)pc), out((uint16_t)(entry(i) + 1), (uint8_t)(pc >> 8));

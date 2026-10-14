@@ -53,10 +53,11 @@ Compiling Lemonade: 14,761,369 cycles.
    shift, add, normalize, multiply, divide), held to fptest.
 4. **The expression stack and subscripts**: fused operations from the
    compiler, `mul16` out of one-dimension subscripts.
-5. **Compile speed**: one pass instead of two, a FIN fast path for small
-   integers.  *Considering (user, 2026-10-13):* compile lazily, a line (or
-   a run of lines) the first time it is reached, so RUN starts at once and
-   lines that never run are never compiled.  One pass is the prerequisite.
+5. **Compile speed** *(user, 2026-10-13: single pass, then lazy)*: DONE -
+   one pass after a counting scan, then a lazy compile (RUN lays the
+   program out; a run of 16 lines compiles when control first reaches its
+   first line).  Left: a FIN fast path for small integers (FIN is 17% of a
+   compile), MVN for the far reads, the per-line C in the scan.
 
 ## Results
 
@@ -67,3 +68,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | 2: integer NEXT (fp_next, frame cache) | 560,784 | 6,634,845 | 18,082,224 | 9,575,091 | 48,866,171 | |
 | 3: READ from the text; one-pass compile | 560,802 | 6,624,870 | 18,055,242 | 9,573,416 | 49,703,940 | 10,625,980 |
 | 4: lazy compile (RUN: scan + layout; lines compile when reached) | 560,914 | 6,631,982 | 18,068,884 | 9,574,228 | 49,710,745 | 2,213,024 at RUN (cold call) |
+| 5: the scan's text in windows, its byte skipping in assembly | 560,914 | 6,631,982 | 18,068,884 | 9,574,228 | 49,710,745 | 1,818,284 at RUN (cold call; ~1.43M warm), 9,908,565 for COMPILE |

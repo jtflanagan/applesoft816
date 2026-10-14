@@ -94,3 +94,58 @@ fin_fail:
         lda     #$ff
         tax
         rts
+
+; uint8_t scan_skip(const uint8_t *t, uint8_t j, uint8_t n): the index of
+; the first byte from t[j] (below n) the compiler's scan acts on - a letter,
+; ":", REM DATA & SHLOAD RECALL STORE SAVE LOAD ONERR RESUME TRACE DEF -
+; passing over quoted text; n if none.  (compile.c's scan_skip, in C for the
+; PC build: the same.)  t in __rc2/3, j in A, n in X.
+        .global scan_skip
+scan_skip:
+        tay
+        stx     __rc4
+        cpy     __rc4
+        bcs     ss_done
+ss_loop:
+        lda     (__rc2),y
+        tax
+        lda     mos16(scan_class),x
+        bne     ss_special
+ss_next:
+        iny
+        cpy     __rc4
+        bne     ss_loop
+ss_done:
+        tya
+        rts
+ss_special:
+        cmp     #2
+        bne     ss_done
+ss_quote:                               ; to the closing quote, past it
+        iny
+        cpy     __rc4
+        beq     ss_done
+        lda     (__rc2),y
+        cmp     #0x22
+        bne     ss_quote
+        bra     ss_next
+
+        .section .rodata.scan_class,"a"
+scan_class:
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0
+        .byte   0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        .byte   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1
+        .byte   0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .text
