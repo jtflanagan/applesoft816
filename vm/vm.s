@@ -129,6 +129,7 @@ F_STEP      = $12       ;   (F_STEP), bit 2 F_CACHE/F_CVAL hold the variable as 
 F_LIMIT     = $14       ;   stored it last
 F_CACHE     = $16
 F_CVAL      = $1B
+NX_OUT      = $C2       ; fp_int_packed's packed number (5)
 GOSUB_SIZE  = 5         ; return IP 2, line 2, mark 1
 
 .macro  NEXTOP  n
@@ -1524,11 +1525,41 @@ op_next:
         lda     #$04
 next_common:
         sta     VM_T2+1         ; this operation's length
-        jsr     find_for
+        ldy     VM_CSP          ; the usual case first: the loop's own FOR
+        cpy     VM_CBASE_PTR    ; frame on top, its numbers cached
+        beq     @find
+        dey
+        lda     a:$0000,y
+        cmp     #FRAME_FOR
+        bne     @find
+        rep     #$20
+        .a16
+        tya
+        sec
+        sbc     #FOR_SIZE-1
+        tay
+        lda     VM_T1           ; (NEXT v: v's frame; NEXT: any)
+        beq     @top
+        cmp     a:$0000,y
+        bne     @find16
+@top:   sep     #$20
+        .a8
+        sty     VM_T0
+        lda     a:F_FLAGS,y
+        cmp     #$07
+        bne     @found2
+        jmp     next_cached
+        .a16
+@find16:
+        sep     #$20
+        .a8
+@find:  jsr     find_for
         bne     @found
         lda     #ERR_NEXT_WITHOUT_FOR
         jmp     vm_error
 @found: sty     VM_T0           ; the frame's base
+@found2:
+next_common_found2:
         lda     a:F_FLAGS,y
         and     #$03
         cmp     #$03
@@ -1591,14 +1622,17 @@ next_common:
         rep     #$20
         .a16
         lda     a:F_CVAL,y
-        jsr     fp_int_packed   ; the variable = the sum (Y lost)
+        jsr     fp_int_packed   ; the variable and the cache = the sum (Y lost)
         ldy     VM_T0
-        ldx     FP_PTR          ; the cache = its bytes
-        lda     a:$0000,x
+        ldx     FP_PTR
+        lda     NX_OUT
+        sta     a:$0000,x
         sta     a:F_CACHE,y
-        lda     a:$0002,x
+        lda     NX_OUT+2
+        sta     a:$0002,x
         sta     a:F_CACHE+2,y
-        lda     a:$0003,x
+        lda     NX_OUT+3
+        sta     a:$0003,x
         sta     a:F_CACHE+3,y
         sep     #$20
         .a8
@@ -1657,6 +1691,78 @@ next_common:
         .a8
         jmp     ($0000,x)
 @done:  sty     VM_CSP          ; drop the frame, carry on after NEXT
+        ldx     VM_IP
+        lda     VM_T2+1
+        cmp     #$04
+        beq     @n4
+        NEXTOP  2
+@n4:    NEXTOP  4
+
+; NEXT's usual case (next_common): Y = VM_T0 = the frame, its step and
+; limit whole, the variable as NEXT stored it last - unless the body changed
+; it (then the general paths, with the frame found)
+next_cached:
+        rep     #$20
+        .a16
+        ldx     a:$0000,y       ; the variable
+        lda     a:$0000,x
+        cmp     a:F_CACHE,y
+        bne     @miss
+        lda     a:$0002,x
+        cmp     a:F_CACHE+2,y
+        bne     @miss
+        lda     a:$0003,x
+        cmp     a:F_CACHE+3,y
+        bne     @miss
+        lda     a:F_CVAL,y
+        clc
+        adc     a:F_STEP,y
+        bvs     @miss           ; beyond 16 bits, or zero: the general paths
+        bne     @hit
+@miss:  sep     #$20
+        .a8
+        ldy     VM_T0
+        jmp     next_common_found2
+        .a16
+@hit:   sta     a:F_CVAL,y
+        jsr     fp_int_packed   ; NX_OUT = the sum packed (X kept, Y lost)
+        ldy     VM_T0
+        lda     NX_OUT          ; the variable and the cache
+        sta     a:$0000,x
+        sta     a:F_CACHE,y
+        lda     NX_OUT+2
+        sta     a:$0002,x
+        sta     a:F_CACHE+2,y
+        lda     NX_OUT+3
+        sta     a:$0003,x
+        sta     a:F_CACHE+3,y
+        lda     a:F_CVAL,y      ; FCOMP with the limit against the step's sign:
+        sec                     ; done when above with a positive step, below
+        sbc     a:F_LIMIT,y     ; with a negative one, equal with STEP 0
+        beq     @eq
+        bvc     @nv
+        eor     #$8000
+@nv:    bmi     @below
+        lda     a:F_STEP,y      ; above
+        beq     @again
+        bpl     @done
+        bra     @again
+@below: lda     a:F_STEP,y
+        bmi     @done
+        bra     @again
+@eq:    lda     a:F_STEP,y
+        beq     @done
+@again: lda     a:$000F,y       ; the body again, the FOR's line
+        sta     CURLIN
+        lda     a:$000D,y
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+        .a16
+@done:  sep     #$20            ; drop the frame, on after NEXT
+        .a8
+        sty     VM_CSP
         ldx     VM_IP
         lda     VM_T2+1
         cmp     #$04

@@ -60,6 +60,7 @@ FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 ; stage 2's scratch ($67-$81: free in AppleSoft's offsets and the VM's)
 DW_A = $67                      ; 4: ARG's mantissa, little-endian (FDIVT)
 FOUT_V = $67                    ; 4: FOUT's digit loop: the mantissa, little-endian
+NX_OUT = $C2                    ; 5: fp_int_packed's packed number (free in the VM's too)
 DW_F = $6B                      ; 4: FAC's
 DW_Q = $6F                      ; 2: quotient bits coming in, behind a sentinel 1
 DW_R = $71                      ; 6: the quotient words: bits 1-16, 17-32, then 33-34
@@ -558,8 +559,9 @@ fp_packed_int:                  ; A = [FP_PTR] as above
         rts
 fp_whole = whole
 
-; [FP_PTR] = A (signed, not zero), packed as STORE.FAC.AT.YX.ROUNDED
-; packs it: the sum of two whole numbers is exact.
+; NX_OUT (5 bytes) = A (signed, not zero), packed as
+; STORE.FAC.AT.YX.ROUNDED packs it: the sum of two whole numbers is exact.
+; Y lost, X kept.
 fp_int_packed:
         sta     NX_V
         bpl     @pos
@@ -580,18 +582,9 @@ fp_int_packed:
         bit     NX_V
         bpl     @plus
         ora     #$0080          ; the sign, in mantissa 1's top bit
-@plus:  phy
-        ldy     #$0001
-        sta     [FP_PTR],y
-        lda     #$0000
-        ldy     #$0003
-        sta     [FP_PTR],y
-        pla
-        sep     #$20
-        .a8
-        sta     [FP_PTR]        ; the exponent
-        rep     #$20
-        .a16
+@plus:  sty     NX_OUT          ; the exponent (and a byte the next store covers)
+        sta     NX_OUT+1
+        stz     NX_OUT+3
         rts
 
 ; C clear: done (stored, FP_RES set); C set: not for this path, nothing
@@ -646,6 +639,14 @@ next_int:
 @cmp:   stx     FP_RES          ; (and FP_RES+1, a scratch byte)
         pla
         jsr     fp_int_packed
+        lda     NX_OUT          ; [FP_PTR] = it
+        sta     [FP_PTR]
+        ldy     #$0002
+        lda     NX_OUT+2
+        sta     [FP_PTR],y
+        iny
+        lda     NX_OUT+3
+        sta     [FP_PTR],y
         sep     #$30
         .a8
         .i8

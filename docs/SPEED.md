@@ -74,3 +74,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | 8: PUSH + load + operation fused (ARGV/ARGK/ARGKI, the A forms) | 560,914 | 5,421,854 | 16,930,526 | 6,778,528 | 49,311,563 | |
 | 9: subscripts: fp_ayint16 (fast AYINT), one-dimension element address by shifts | 560,914 | 5,421,854 | 13,448,210 | 6,778,528 | 49,122,115 | |
 | 10: FOUT's digit loop and MAF in 16-bit | 560,914 | 5,421,854 | 13,448,210 | 6,756,528 | 48,996,873 | |
+| 11: NEXT's usual case (own frame on top, cached) without find_for; packing via the direct page | 428,002 | 5,421,854 | 12,871,210 | 6,756,528 | 45,810,081 | |
