@@ -1709,16 +1709,15 @@ alloc_array:
         and     #$00FF
         jsr     mul16
         ldy     VM_PROG
-        lda     a:$0008,y       ; the array heap's free pointer
-        tax
-        clc
-        adc     VM_T0
-        bcs     @oom
-        cmp     a:$000A,y       ; its end
-        bcs     @oom
+        lda     a:$0008,y       ; the array heap's free pointer: it grows down,
+        sec                     ; from the stacks to its floor (the code's
+        sbc     VM_T0           ; end, which a lazy compile raises)
+        bcc     @oom
+        cmp     a:$000A,y
+        bcc     @oom
         sta     a:$0008,y
+        tax
         ldy     VM_T1
-        txa
         sta     a:$0000,y       ; storage
         ldy     VM_T0
 @z:     cpy     #$0000          ; zero it

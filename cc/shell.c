@@ -278,8 +278,8 @@ static void chain_import(void)
 {
   uint8_t kind, name[3], other[3], k, nd, ond, esize, v[8], bounds[2 * 88];
   uint16_t i, addr, n, hf, hend, nv, na;
-  vm_get(&hf, (uint16_t)(prog_start + 8), 2);    /* the array heap: its free pointer, end */
-  vm_get(&hend, (uint16_t)(prog_start + 10), 2);
+  vm_get(&hf, (uint16_t)(prog_start + 8), 2);    /* the array heap: its free pointer (it grows */
+  vm_get(&hend, (uint16_t)(prog_start + 10), 2);  /* down), its floor */
   chain_at = 0;
   cc_tables(&nv, &na);
   for (;;) {
@@ -302,12 +302,12 @@ static void chain_import(void)
       if (!memcmp(name, other, 3)) break;
     }
     if (i == na) addr = compile_adopt(name, nd), ond = nd, cc_tables(&nv, &na);   /* (kept, unnamed here) */
-    if (addr && ond == nd && (uint32_t)hf + n <= hend) {
+    if (addr && ond == nd && (uint32_t)hend + n <= hf) {
+      hf = (uint16_t)(hf - n);
       vm_put(addr, &hf, 2);                       /* storage, the bounds; the bytes */
       vm_put((uint16_t)(addr + 4), bounds, (uint16_t)(2 * nd));
       xfer_far = (xfer_base | chain_at) - 1, xfer_far2 = (vm_base | hf) - 1, xfer_n = n;
       if (n) far_move();
-      hf = (uint16_t)(hf + n);
     }
     chain_at = (uint16_t)(chain_at + n);
   }

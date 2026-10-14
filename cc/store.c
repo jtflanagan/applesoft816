@@ -326,7 +326,8 @@ uint8_t prog_restore(const uint8_t *path)
       n *= sz;
     }
     slot = slot_of(name, nd);
-    if (slot && (uint32_t)hf + n * esize_ours(name[2]) <= hend) {
+    if (slot && (uint32_t)hend + n * esize_ours(name[2]) <= hf) {   /* (the heap grows down) */
+      hf = (uint16_t)(hf - n * esize_ours(name[2]));
       vm_put(slot, &hf, 2);
       vm_put((uint16_t)(slot + 4), bounds, (uint16_t)(2 * nd));
       if (name[2] != 2) {
@@ -339,7 +340,6 @@ uint8_t prog_restore(const uint8_t *path)
           if (str_in(v[0], (uint16_t)(v[1] | v[2] << 8), sd)) return B_TOO_LARGE;
           vm_put((uint16_t)(hf + 4 * e), sd, 4);
         }
-      hf = (uint16_t)(hf + n * esize_ours(name[2]));
     }
     at = next;
   }

@@ -1351,10 +1351,11 @@ int as816_compile(const Platform *platform, CompileStats *st)
   {
     uint16_t h = pf->prog_start, vals[24];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
-    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = pc, vals[5] = STACKS_BASE;   /* the array heap */
+    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE);
+    vals[4] = STACKS_BASE, vals[5] = pc;   /* the array heap: free pointer (down), floor */
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
     vals[11] = 0x0800;                     /* DATA: READ from the text's start, as RESTORE */
-    vals[12] = pc, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
+    vals[12] = STACKS_BASE, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
     vals[17] = 0;                          /* direct lines' variables: none yet */
     vals[18] = stmt_base, vals[19] = nstmts, vals[20] = pc;   /* statements; the code's end */
