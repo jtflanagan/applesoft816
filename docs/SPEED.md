@@ -65,3 +65,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | baseline | 1,207,813 | 7,270,951 | 21,660,330 | 9,622,831 | 65,084,540 | 14,761,369 |
 | 1: round and store inline, NEXT's step inline | 974,567 | 6,634,845 | 19,103,224 | 9,575,091 | 59,242,343 | |
 | 2: integer NEXT (fp_next, frame cache) | 560,784 | 6,634,845 | 18,082,224 | 9,575,091 | 48,866,171 | |
+| 3: READ from the text; one-pass compile | 560,802 | 6,624,870 | 18,055,242 | 9,573,416 | 49,703,940 | 10,625,980 |

@@ -100,7 +100,7 @@ VM_STMTIP = $DC         ; 2: the current statement's IP (STMT, when ONERR is use
 VM_STMTCSP = $DE        ; 2: ... and the control stack then
 VM_ERRIP = $E0          ; 2: RESUME's statement
 VM_ERRCSP = $E2         ; 2: ... and its control stack
-VM_ONERR = $E4          ; 2: the ONERR handler's IP (0: none)
+VM_ONERR = $E4          ; 2: the ONERR handler's line-table entry (0: none)
 VM_DENTRY = $E6         ; 2: vm_direct's code (the shell's direct line)
 VM_FRESH = $E8          ; 1: vm_direct CLEARs first (the image is new, or was edited)
 VM_CONTIP = $E9         ; 2: where CONT goes on (OLDTEXT; 0: ?CAN'T CONTINUE)
@@ -201,6 +201,7 @@ optable:
         .word   op_cont
         .word   op_hgr, op_hgr2, op_hcolor, op_hx, op_hplot, op_hplotto, op_hposn, op_shape
         .word   op_draw, op_xdraw, op_rot, op_scale, op_usr, op_amper, op_list, op_new, op_del, op_pdl
+        .word   op_ldci, op_sliti
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -801,6 +802,26 @@ op_ldc:
         sta     FAC_EXT
         NEXTOP  4
 
+; LDCI k: FAC = k, the constant's seven bytes here (its first use; later
+; uses LDC them where they are)
+op_ldci:
+        lda     a:$0008,x
+        sta     FAC_EXT
+        rep     #$21
+        .a16
+        lda     a:$0002,x
+        sta     FAC
+        lda     a:$0004,x
+        sta     FAC+2
+        lda     a:$0006,x
+        sta     FAC+4           ; mantissa low byte and the sign
+        txa
+        adc     #$0009
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
+
 ; LDV v: FAC = the packed variable at v (LOAD.FAC.FROM.YA)
 op_ldv:
         ldy     a:$0002,x
@@ -1058,16 +1079,17 @@ op_prcomma:
         NEXTOP  2
 
 op_goto:
-        ldy     a:$0002,x
-        tyx
+        ldy     a:$0002,x       ; the line's entry in the line table
+        ldx     a:$0000,y
         jmp     ($0000,x)
 
-; IFNOT a: IF's test - FAC's exponent 0 means false: go to a (the next line)
+; IFNOT e: IF's test - FAC's exponent 0 means false: go to entry e's code
+; (the next line's)
 op_ifnot:
         lda     FAC
         bne     @true
         ldy     a:$0002,x
-        tyx
+        ldx     a:$0000,y
         jmp     ($0000,x)
 @true:  NEXTOP  4
 
@@ -1092,8 +1114,8 @@ op_gosub:
         .a8
         lda     #FRAME_GOSUB
         sta     a:$0004,y
-        ldy     a:$0002,x
-        tyx
+        ldy     a:$0002,x       ; the line's entry
+        ldx     a:$0000,y
         jmp     ($0000,x)
         .a16
 @full:  sep     #$20
@@ -2132,6 +2154,26 @@ op_slit:
         sta     SACC+3
         NEXTOP  4
 
+; SLITI n text: SACC = the literal here (its length n, then its text)
+op_sliti:
+        lda     a:$0002,x
+        sta     SACC
+        rep     #$21
+        .a16
+        txa
+        adc     #$0003
+        sta     SACC+1          ; the text's address
+        lda     SACC
+        and     #$00FF
+        adc     SACC+1          ; past it
+        tax
+        sep     #$20
+        .a8
+        phk
+        pla
+        sta     SACC+3
+        jmp     ($0000,x)
+
 ; SLDV v / SSTV v: SACC = the variable's descriptor, and back
 op_sldv:
         ldy     a:$0002,x
@@ -2791,10 +2833,13 @@ op_inpstart:
         stx     VM_INSTMT
         stx     VM_IP
         jsr     io_quiet
-        ldy     a:$0002,x
+        lda     a:$0002,x       ; 0: no prompt; else its length + 1, its text
         beq     @ques
-        lda     a:$0000,y       ; STRPRT the literal
+        dec     a
         sta     VM_T0
+        txy                     ; STRPRT the text
+        iny
+        iny
 @p:     lda     VM_T0
         beq     @line
         iny
@@ -2809,8 +2854,19 @@ op_inpstart:
         jsr     inlin
         stz     VM_INMODE
         jsr     save_inptr
-        ldx     VM_IP
-        NEXTOP  4
+        ldx     VM_IP           ; past the prompt: 3 + its length
+        lda     a:$0002,x
+        beq     @n
+        dec     a
+@n:     rep     #$21
+        .a16
+        and     #$00FF
+        adc     #$0003
+        adc     VM_IP
+        tax
+        sep     #$20
+        .a8
+        jmp     ($0000,x)
 
 ; READSTART: from DATPTR in the program's text
 op_readstart:
@@ -3215,8 +3271,10 @@ op_on:  stx     VM_IP
         clc
         adc     VM_IP
         tay                     ; Y + 2 = a(n): the table starts at +4
-        lda     a:$0002,y
+        lda     a:$0002,y       ; (a line-table entry)
         beq     @undef
+        tay
+        lda     a:$0000,y
         sta     VM_T2           ; the target
         lda     VM_T1           ; this operation's length: 4 + 2k
         asl     a
@@ -4177,9 +4235,10 @@ clear_all:
         stz     SH_HALF
         rts
 
-; RUN a: CLEAR, then the program from a
+; RUN e: CLEAR, then the program from entry e's code
 op_run: ldy     a:$0002,x
-        sty     VM_T5
+        ldx     a:$0000,y
+        stx     VM_T5
         jsr     clear_all
         ldx     VM_T5
         jmp     ($0000,x)
@@ -4248,7 +4307,8 @@ handlerr:
         .a8
         rep     #$10
         .i16
-        ldx     VM_ONERR
+        ldy     VM_ONERR        ; the handler's line
+        ldx     a:$0000,y
         jmp     ($0000,x)
 
 ; RESUME: the statement that failed, again

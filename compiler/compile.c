@@ -1,9 +1,12 @@
 /* compile.c - tokenized AppleSoft to applesoft816 bytecode (docs/INTERP.md).
  *
- * Two passes over the program: the first lays the image out (code, then the
- * constants, string literals, variables and array descriptors it found),
- * the second writes it with every jump resolved.  Both make the same
- * decisions, so the sizes agree.
+ * One pass over the program, after a scan that only counts: the scan finds
+ * the lines (the line table: each line's code address, which every jump
+ * goes through) and sizes the fixed regions - variables, FN entries, array
+ * descriptors, the collector's roots, the statement table - so the code,
+ * which grows up after them, is written as it is compiled.  A constant or
+ * string literal lives in the code where it is first used (LDCI, SLITI);
+ * later uses of a constant point there.
  *
  * Bit-exactness lives in expr(): it is FRMEVL's own precedence algorithm
  * (the ROM's MATHTBL precedences, left to right, pending operators of equal
@@ -58,7 +61,7 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 44
+#define HEADER_SIZE 48
 #define SV_SPARE 16                  /* string roots kept free for direct lines' variables */
 #define SA_SPARE 8                   /* ... and for their string arrays */
 #define DESC_SPARE 96                /* descriptor bytes kept free for direct lines' arrays */
@@ -69,48 +72,47 @@ enum {
 #define DIRECT_DATA 0xFA00u
 #define DIRECT_VARS 0xFC00u          /* the lowest a direct line's variable goes */
 #define MAX_FNS 64
-#define MAX_LITS 3000                /* numeric literals FIN converts in pass 1 */
 #define CONST_HASH 128
+#define STACKS_BASE (DIRECT_BASE - FSTACK_SIZE - SSTACK_SIZE - CSTACK_SIZE)
 
-typedef struct { uint16_t num, addr; } Line;
+typedef struct { uint16_t num, at; } Line;                 /* at: the line in the text */
 typedef struct { uint8_t c1, c2, type; } Var;              /* type: 0 real, 1 integer, 2 string */
 typedef struct { uint8_t c1, c2, type, ndims; } Array;
 
 static const Platform *pf;
-static int pass;
 static uint16_t pc;                 /* the emit position (an address in the VM bank) */
 static int overflow;                /* the image does not fit */
 
-NOINIT static Line lines[MAX_LINES + 1];      /* + the END after the last line */
+NOINIT static Line lines[MAX_LINES];
 static uint16_t nlines, line_i;     /* line_i: the line being compiled */
+static uint16_t linetab;            /* the line table in the VM bank: nlines + 2 code
+                                     * addresses (the last two: the END after the last
+                                     * line, a direct line's END) */
 NOINIT static Var vars[MAX_VARS];
 static uint16_t nvars;
 NOINIT static Array arrays[MAX_ARRAYS];
 static uint16_t narrays;
-/* the constant pool: made in pass 1, kept (same order) for pass 2 */
+/* the constants met so far: their values and where they are (in the code,
+ * after the LDCI that first loaded them) */
 NOINIT static uint8_t consts[MAX_CONSTS][7];
+NOINIT static uint16_t const_addr[MAX_CONSTS];
 static uint16_t nconsts;
 NOINIT static uint16_t const_head[CONST_HASH], const_next[MAX_CONSTS];   /* index + 1, 0 = none */
-/* pass 1's literals - where in the text, what FIN made of them - so pass 2
- * neither runs FIN nor looks the constant up again */
-typedef struct { uint16_t at, slot; uint8_t used; } Lit;
-NOINIT static Lit lits[MAX_LITS];
-static uint16_t nlits, lit_i;
 static uint16_t line_at;            /* the text address of buf[0] */
-static uint16_t str_bytes;          /* string literal pool size, this pass */
+static uint16_t str_bytes;          /* string literal bytes */
 
-/* the layout, fixed after pass 1 */
+/* the layout, fixed by the scan */
 static Var fns[MAX_FNS];                          /* DEF FN names */
 static uint16_t fn_addr[MAX_FNS];                 /* a direct line's FN entries */
 static uint16_t nfns, fn_base, desc_copy_base, desc_bytes;
 static int use_onerr;                             /* STMT marks needed */
-static uint16_t code_base, const_base, str_base, var_base, desc_base, svlist_base, salist_base, fstack_base,
-    sstack_base, cstack_base, heap_base;
+static uint16_t code_base, var_base, desc_base, svlist_base, salist_base, fstack_base, sstack_base,
+    cstack_base;
 static uint16_t nsvars, nsarrays, svlist_cap, salist_cap;
 static uint16_t stmt_base, nstmts;  /* where each statement starts (CONT after an error) */
 NOINIT static uint16_t var_off[MAX_VARS];
 static uint16_t desc_off[MAX_ARRAYS];
-static uint16_t str_at;             /* pass 2: the next literal's address */
+static uint16_t str_at;             /* a direct line's next literal */
 /* direct lines */
 static int direct;                  /* compiling one */
 static uint16_t dvar_at;            /* the lowest of their variables (0: none yet) */
@@ -138,8 +140,8 @@ static void out(uint16_t a, uint8_t v)
   wnext = (uint16_t)(a + 1);
 }
 
-/* ---- emitting: pass 2 gathers the code in cbuf, written 256 bytes at a
- * time; cbuf[0] is the byte at pc - clen ---- */
+/* ---- emitting: the code gathers in cbuf, written 256 bytes at a time;
+ * cbuf[0] is the byte at pc - clen ---- */
 static uint8_t cbuf[256];
 static uint8_t clen;
 static void flush_code(uint16_t n)
@@ -150,10 +152,8 @@ static void flush_code(uint16_t n)
 static void emit8(uint8_t v)
 {
   if (++pc == 0) overflow = 1;
-  if (pass == 2) {
-    cbuf[clen++] = v;
-    if (!clen) flush_code(256);
-  }
+  cbuf[clen++] = v;
+  if (!clen) flush_code(256);
 }
 /* a byte of code already emitted */
 static void patch8(uint16_t a, uint8_t v)
@@ -196,6 +196,9 @@ static void error_here(uint8_t e)
 }
 
 /* ---- symbols ---- */
+static uint16_t var_at, desc_at;    /* the next variable's slot, the next descriptor */
+static void program_var(uint16_t i);
+static void program_array(uint16_t i);
 
 /* a direct line's new array: its descriptor (and the pristine copy CLEAR
  * restores) in the room kept after the program's, the header's count of
@@ -253,8 +256,9 @@ static uint16_t var_slot(uint8_t c1, uint8_t c2, uint8_t type)
     vars[nvars].c1 = c1, vars[nvars].c2 = c2, vars[nvars].type = type;
     nvars++;
     if (direct) var_off[i] = direct_var(type == 1 ? 2 : type == 2 ? 4 : 5, type == 2);
+    else program_var(i);
   }
-  return pass == 2 ? var_off[i] : 0;
+  return var_off[i];
 }
 
 /* the array's index (its descriptor), or -1 if used with another number of
@@ -270,6 +274,7 @@ static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
     arrays[narrays].ndims = ndims;
     narrays++;
     if (direct) direct_array(i);
+    else program_array(i);
   }
   return arrays[i].ndims == ndims ? (int)i : -1;
 }
@@ -290,58 +295,36 @@ static uint16_t const_find(const uint8_t fac[7])
   }
   return 0;
 }
-/* the constant's index in the pool, added if new */
-static uint16_t const_index(const uint8_t fac[7])
+/* FAC = the constant: LDC where it already is, else LDCI with it inline
+ * (a direct line's new constants go to its data area, gone after it) */
+static void ldc(const uint8_t fac[7])
 {
-  uint8_t h = const_hash(fac);
-  uint16_t i = const_find(fac);
-  if (i) return (uint16_t)(i - 1);
-  if (nconsts == MAX_CONSTS) { overflow = 1; return 0; }
-  memcpy(consts[nconsts], fac, 7);
-  const_next[nconsts] = const_head[h];
-  const_head[h] = ++nconsts;
-  return (uint16_t)(nconsts - 1);
-}
-static uint16_t const_slot(const uint8_t fac[7])
-{
-  uint16_t i, k;
-  if (!direct) return (uint16_t)(const_base + 7 * const_index(fac));
-  if ((i = const_find(fac)) != 0) return (uint16_t)(const_base + 7 * (i - 1));
-  if ((uint16_t)(str_at + 7) > DIRECT_VARS) { overflow = 1; return DIRECT_DATA; }
-  for (k = 0; k < 7; k++) out((uint16_t)(str_at + k), fac[k]);
-  str_at = (uint16_t)(str_at + 7);
-  return (uint16_t)(str_at - 7);
+  uint16_t i = const_find(fac), k;
+  if (i) { op16(OP_LDC, const_addr[i - 1]); return; }
+  if (direct) {
+    if ((uint16_t)(str_at + 7) > DIRECT_VARS) { overflow = 1; return; }
+    for (k = 0; k < 7; k++) out((uint16_t)(str_at + k), fac[k]);
+    op16(OP_LDC, str_at);
+    str_at = (uint16_t)(str_at + 7);
+    return;
+  }
+  op(OP_LDCI);
+  if (nconsts < MAX_CONSTS) {               /* (a full table: inline every time) */
+    uint8_t h = const_hash(fac);
+    memcpy(consts[nconsts], fac, 7);
+    const_addr[nconsts] = pc;
+    const_next[nconsts] = const_head[h];
+    const_head[h] = ++nconsts;
+  }
+  for (k = 0; k < 7; k++) emit8(fac[k]);
 }
 
-/* a numeric literal at buf[p]: its constant's slot, and p past it; 0 for
- * FIN's ?OVERFLOW (p not moved) */
-static int literal(uint16_t *slot)
+/* a numeric literal at buf[p]: FIN's value, p past it; 0 for FIN's
+ * ?OVERFLOW (p not moved) */
+static int literal(uint8_t fac[7])
 {
-  uint16_t at = (uint16_t)(line_at + p);
-  uint8_t fac[7];
-  uint16_t i;
-  int used;
-  if (pass == 2 && !direct) {       /* pass 1 saw it (parsing is the same in both passes) */
-    while (lit_i < nlits && lits[lit_i].at < at) lit_i++;
-    if (lit_i < nlits && lits[lit_i].at == at) {
-      *slot = (uint16_t)(const_base + 7 * lits[lit_i].slot);
-      p += lits[lit_i].used;
-      return 1;
-    }
-  }
-  used = pf->fin(pf->ctx, buf + p, blen - p, fac);
+  int used = pf->fin(pf->ctx, buf + p, blen - p, fac);
   if (used <= 0) return 0;
-  if (direct) {
-    *slot = const_slot(fac);
-    p += used;
-    return 1;
-  }
-  i = const_index(fac);
-  *slot = (uint16_t)(const_base + 7 * i);
-  if (pass == 1 && nlits < MAX_LITS) {
-    lits[nlits].at = at, lits[nlits].slot = i, lits[nlits].used = (uint8_t)used;
-    nlits++;
-  }
   p += used;
   return 1;
 }
@@ -358,25 +341,34 @@ static uint16_t fn_slot(uint8_t c1, uint8_t c2)
     nfns++;
     if (direct) { fns[i].type = 1; fn_addr[i] = direct_var(4, 0); }   /* (type 1: fn_addr has it) */
   }
-  if (pass != 2) return 0;
   return fns[i].type ? fn_addr[i] : (uint16_t)(fn_base + 4 * i);
 }
 
-/* a string literal: length byte, then the text */
-static uint16_t str_literal(const uint8_t *s, uint8_t n)
+/* SACC = a string literal: SLITI with it inline (length, text); a direct
+ * line's, from its data area (OP_SLIT) */
+static void slit(const uint8_t *s, uint8_t n)
 {
-  uint16_t at = str_at, i;
-  if (pass == 2) {
-    out(str_at, n);
-    for (i = 0; i < n; i++) out((uint16_t)(str_at + 1 + i), s[i]);
-    str_at = (uint16_t)(str_at + 1 + n);
-  }
+  uint16_t i;
   str_bytes = (uint16_t)(str_bytes + 1 + n);
-  return at;
+  if (!direct) {
+    op(OP_SLITI);
+    emit8(n);
+    for (i = 0; i < n; i++) emit8(s[i]);
+    return;
+  }
+  if ((uint16_t)(str_at + 1 + n) > DIRECT_VARS) { overflow = 1; return; }
+  out(str_at, n);
+  for (i = 0; i < n; i++) out((uint16_t)(str_at + 1 + i), s[i]);
+  op16(OP_SLIT, str_at);
+  str_at = (uint16_t)(str_at + 1 + n);
 }
 
-/* the address of line n's code; 0 if there is no such line */
-static uint16_t line_addr(uint16_t n)
+/* the line table's entry for entry i (nlines: the END after the last line,
+ * nlines + 1: a direct line's END) */
+static uint16_t entry(uint16_t i) { return (uint16_t)(linetab + 2 * i); }
+
+/* line n's entry in the line table; 0 if there is no such line */
+static uint16_t line_entry(uint16_t n)
 {
   uint16_t lo = 0, hi = nlines;
   while (lo < hi) {
@@ -384,14 +376,14 @@ static uint16_t line_addr(uint16_t n)
     if (lines[mid].num < n) lo = (uint16_t)(mid + 1);
     else hi = mid;
   }
-  return lo < nlines && lines[lo].num == n ? lines[lo].addr : 0;
+  return lo < nlines && lines[lo].num == n ? entry(lo) : 0;
 }
 
 /* where control goes after this line: the next line, or the final END */
-static uint16_t next_line_addr(void)
+static uint16_t next_line_entry(void)
 {
-  if (direct) return DIRECT_BASE;
-  return line_i + 1 < nlines ? lines[line_i + 1].addr : lines[nlines].addr;
+  if (direct) return entry((uint16_t)(nlines + 1));
+  return entry((uint16_t)(line_i + 1));       /* (line_i + 1 == nlines: the END) */
 }
 
 /* ---- names: PTRGET's reading (first two characters count) ---- */
@@ -486,7 +478,7 @@ static int load_name(const Name *nm)
     if (!n) { error_here(E_SYNTAX); return TY_ERR; }
     a = array_slot(nm->c1, nm->c2, nm->type, (uint8_t)n);
     if (a < 0) { error_here(E_BAD_SUBSCRIPT); return TY_ERR; }
-    op16(nm->type == 2 ? OP_SLDA : nm->type == 1 ? OP_LDAI : OP_LDA, pass == 2 ? desc_off[a] : 0);
+    op16(nm->type == 2 ? OP_SLDA : nm->type == 1 ? OP_LDAI : OP_LDA, desc_off[a]);
   } else
     op16(nm->type == 2 ? OP_SLDV : nm->type == 1 ? OP_LDVI : OP_LDV, var_slot(nm->c1, nm->c2, nm->type));
   return nm->type == 2 ? TY_STR : TY_NUM;
@@ -548,9 +540,9 @@ static int element(Pending *pend, int *np)
   for (;;) {
     uint8_t c = peek();
     if (is_digit(c) || c == '.') {
-      uint16_t slot;
-      if (!literal(&slot)) { error_here(0x45); return TY_ERR; }  /* FIN's ?OVERFLOW, at run time */
-      op16(OP_LDC, slot);
+      uint8_t fac[7];
+      if (!literal(fac)) { error_here(0x45); return TY_ERR; }  /* FIN's ?OVERFLOW, at run time */
+      ldc(fac);
       return TY_NUM;
     }
     if (is_letter(c)) {
@@ -581,10 +573,10 @@ static int element(Pending *pend, int *np)
       int s0 = ++p, q = s0;
       while (q < blen && buf[q] && buf[q] != '"') q++;
       if (direct) {                        /* a direct line's text is gone after it: the */
-        op16(OP_SLIT, str_literal(buf, 0));        /* string goes to string space ("" + it), */
+        slit(buf, 0);                              /* string goes to string space ("" + it), */
         op(OP_SPUSH);                              /* as AppleSoft copies one from the input */
       }                                            /* buffer */
-      op16(OP_SLIT, str_literal(buf + s0, (uint8_t)(q - s0)));
+      slit(buf + s0, (uint8_t)(q - s0));
       if (direct) op(OP_SCAT);
       p = q < blen && buf[q] == '"' ? q + 1 : q;
       return TY_STR;
@@ -756,15 +748,15 @@ static void st_let(void)
   if (t == TY_ERR) return;
   if (t != (nm.type == 2 ? TY_STR : TY_NUM)) { error_here(E_TYPE_MISMATCH); return; }
   if (nm.is_array)
-    op16(nm.type == 2 ? OP_SSTA : nm.type == 1 ? OP_STAI : OP_STA, pass == 2 ? desc_off[a] : 0);
+    op16(nm.type == 2 ? OP_SSTA : nm.type == 1 ? OP_STAI : OP_STA, desc_off[a]);
   else
     op16(nm.type == 2 ? OP_SSTV : nm.type == 1 ? OP_STVI : OP_STV, var_slot(nm.c1, nm.c2, nm.type));
 }
 
 static void jump_to(int opcode, uint16_t n)
 {
-  uint16_t a = line_addr(n);
-  if (pass == 2 && !a) op16(OP_ERR, E_UNDEF_STATEMENT);   /* same size as the jump */
+  uint16_t a = line_entry(n);
+  if (!a) op16(OP_ERR, E_UNDEF_STATEMENT);
   else op16(opcode, a);
 }
 
@@ -789,7 +781,7 @@ static void st_if(void)
   c = peek();
   if (c != T_GOTO && c != T_THEN) { error_here(E_SYNTAX); return; }
   p++;
-  op16(OP_IFNOT, next_line_addr());
+  op16(OP_IFNOT, next_line_entry());
   if (c == T_GOTO || is_digit(peek())) { st_goto(OP_GOTO); return; }
   /* THEN statements: the rest of the line runs only when true */
   statement();
@@ -814,7 +806,7 @@ static void st_for(void)
     if ((t = expr()) != TY_NUM) { if (t != TY_ERR) error_here(E_TYPE_MISMATCH); return; }
   } else {
     static const uint8_t one[7] = {0x81, 0x80, 0, 0, 0, 0, 0};   /* CON.ONE as LOAD.FAC leaves it */
-    op16(OP_LDC, const_slot(one));
+    ldc(one);
   }
   op(OP_FORSTEP);
 }
@@ -841,7 +833,7 @@ static void st_dim(void)
     if (!n) { error_here(E_SYNTAX); return; }
     a = array_slot(nm.c1, nm.c2, nm.type, (uint8_t)n);
     if (a < 0) { error_here(E_BAD_SUBSCRIPT); return; }
-    op16(OP_DIM, pass == 2 ? desc_off[a] : 0);
+    op16(OP_DIM, desc_off[a]);
     if (peek() != ',') return;
     p++;
   }
@@ -859,7 +851,7 @@ static void input_items(void)
       if (!n) { error_here(E_SYNTAX); return; }
       a = array_slot(nm.c1, nm.c2, nm.type, (uint8_t)n);
       if (a < 0) { error_here(E_BAD_SUBSCRIPT); return; }
-      op(OP_ITEM), emit8((uint8_t)(nm.type | 0x80)), emit16(pass == 2 ? desc_off[a] : 0);
+      op(OP_ITEM), emit8((uint8_t)(nm.type | 0x80)), emit16(desc_off[a]);
     } else
       op(OP_ITEM), emit8(nm.type), emit16(var_slot(nm.c1, nm.c2, nm.type));
     if (peek() != ',') break;
@@ -868,17 +860,21 @@ static void input_items(void)
   op(OP_INPEND);
 }
 
+/* INPSTART n [text]: n = 0, no prompt ("?"); else the prompt's length + 1,
+ * then its text (printed instead of "?") */
 static void st_input(void)
 {
-  uint16_t prompt = 0;
-  if (peek() == '"') {                     /* a prompt: printed instead of "?" */
-    int s0 = ++p, q = s0;
+  int s0 = 0, q = 0, k;
+  if (peek() == '"') {                     /* a prompt */
+    s0 = ++p, q = s0;
     while (q < blen && buf[q] && buf[q] != '"') q++;
-    prompt = str_literal(buf + s0, (uint8_t)(q - s0));
     p = q < blen && buf[q] == '"' ? q + 1 : q;
     if (next() != ';') { error_here(E_SYNTAX); return; }
-  }
-  op16(OP_INPSTART, prompt);
+    if (q - s0 > 254) q = s0 + 254;
+    op(OP_INPSTART), emit8((uint8_t)(q - s0 + 1));
+    for (k = s0; k < q; k++) emit8(buf[k]);
+  } else
+    op(OP_INPSTART), emit8(0);
   input_items();
 }
 
@@ -913,7 +909,7 @@ static void st_on(void)
     p++;
   }
   op(OP_ON), emit8(k), emit8(tok == T_GOSUB);
-  for (at = 0; at < k; at++) emit16(line_addr(nums[at]));
+  for (at = 0; at < k; at++) emit16(line_entry(nums[at]));
 }
 
 static void st_def(void)
@@ -935,7 +931,7 @@ static void st_def(void)
   if (t == TY_ERR) return;
   if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return; }
   op(OP_FNRET);
-  if (pass == 2) patch8(skip_at, (uint8_t)pc), patch8((uint16_t)(skip_at + 1), (uint8_t)(pc >> 8));
+  patch8(skip_at, (uint8_t)pc), patch8((uint16_t)(skip_at + 1), (uint8_t)(pc >> 8));
 }
 
 /* PLOT/HLIN/VLIN's coordinates: e (checked < 80 when r), pushed */
@@ -1019,7 +1015,7 @@ static void statement(void)
     if (peek() == ',') { p++; if (!coord(0)) return; }
     else {
       static const uint8_t zero[7] = {0};
-      op16(OP_LDC, const_slot(zero));
+      ldc(zero);
       op(OP_BYTEPUSH), emit8(0);
     }
     op(OP_WAIT);
@@ -1100,7 +1096,7 @@ static void statement(void)
     uint16_t n;
     int r = read_linenum(&n);
     if (r < 0) { error_here(E_SYNTAX); return; }
-    if (r == 0) op16(OP_RUN, code_base);
+    if (r == 0) op16(OP_RUN, entry(0));     /* (no lines: entry 0 is the END's) */
     else jump_to(OP_RUN, n);
     return;
   }
@@ -1138,54 +1134,173 @@ static uint16_t read_line(uint16_t at, uint16_t *num)
   return link;
 }
 
-static void run_pass(void)
+/* ---- the scan: the lines, and the room the fixed regions need - every
+ * name the compiler can meet is a run of letters and digits outside string
+ * literals, REM, DATA and &'s text (more is only room unused) ---- */
+static uint16_t var_max, desc_max, nfn_max, nsv_max, nsa_max, nstmt_max;
+
+static void skip_spaces(uint16_t *j)
 {
-  uint16_t at = 0x0801, link, num;
-  pc = code_base;
-  clen = 0;
-  nstmts = 0;
-  nvars = narrays = nfns = 0;
-  if (pass == 1) {
-    nconsts = nlits = 0;
-    memset(const_head, 0, sizeof const_head);
-  }
-  lit_i = 0;
-  str_bytes = 0;
-  str_at = str_base;
-  line_i = 0;
-  for (;;) {
-    if (!(link = read_line(at, &num))) break;
-    if (line_i == MAX_LINES) { overflow = 1; break; }
-    lines[line_i].num = num, lines[line_i].addr = pc;
-    op16(OP_LINE, num);
-    for (;;) {
-      if (pf->poll) pf->poll(pf->ctx);
-      if (pass == 2) out((uint16_t)(stmt_base + 2 * nstmts), (uint8_t)pc), out((uint16_t)(stmt_base + 2 * nstmts + 1), (uint8_t)(pc >> 8));
-      nstmts++;
-      statement();
-      if (p >= blen || peek() == 0) break;
-      if (peek() == ':') { p++; continue; }
-      error_here(E_SYNTAX);                 /* something left that is not a statement */
-    }
-    line_i++;
-    at = link;
-  }
-  nlines = line_i;
-  lines[nlines].num = 0xFFFF, lines[nlines].addr = pc;   /* running off the end: END */
-  op(OP_END);
-  if (pass == 2) flush_code(clen);
+  while (*j < blen && buf[*j] == ' ') (*j)++;
 }
 
-/* does the program use ONERR, RESUME or TRACE (statement marks needed)?
- * (tokens appear only as tokens: string, REM and DATA text is ASCII) */
-static int scan_onerr(void)
+/* the subscripts' count of the "(" at buf[j]: its commas at depth 1, + 1 */
+static uint8_t scan_dims(uint16_t j)
 {
-  uint16_t at = 0x0801, num;
-  int i;
-  while ((at = read_line(at, &num)) != 0)
-    for (i = 0; i < blen; i++)
-      if (buf[i] == T_ONERR || buf[i] == T_RESUME || buf[i] == T_TRACE) return 1;
+  uint8_t nd = 1;
+  int depth = 0, q = 0;
+  for (; j < blen; j++) {
+    uint8_t d = buf[j];
+    if (d == '"') { q = !q; continue; }
+    if (q) continue;
+    if (d == '(') depth++;
+    else if (d == ')') { if (--depth == 0) break; }
+    else if (d == ',' && depth == 1 && nd < 255) nd++;
+  }
+  return nd;
+}
+
+static int prescan(void)
+{
+  uint16_t at = 0x0801, link, num, j, k, nv = 0, na = 0;
+  nlines = 0;
+  var_max = desc_max = nfn_max = nsv_max = nsa_max = nstmt_max = 0;
+  use_onerr = 0;
+  while ((link = read_line(at, &num)) != 0) {
+    if (pf->poll) pf->poll(pf->ctx);
+    if (nlines == MAX_LINES) return -1;
+    lines[nlines].num = num, lines[nlines].at = at;
+    nlines++;
+    nstmt_max++;
+    j = 0;
+    while (j < blen) {
+      uint8_t c = buf[j];
+      if (c == '"') {
+        for (j++; j < blen && buf[j] != '"'; j++) {}
+        j++;
+        continue;
+      }
+      if (c == T_REM) break;
+      if (c == T_DATA || c == T_AMPER || c == T_SHLOAD || c == T_RECALL || c == T_STORE || c == T_SAVE ||
+          c == T_LOAD) {                  /* raw text to the statement's end */
+        int q = 0;
+        for (j++; j < blen && (q || buf[j] != ':'); j++)
+          if (buf[j] == '"') q = !q;
+        continue;
+      }
+      if (c == ':') { nstmt_max++; j++; continue; }
+      if (c == T_ONERR || c == T_RESUME || c == T_TRACE) use_onerr = 1;
+      if (c == T_DEF) nfn_max++;
+      if (!is_letter(c)) { j++; continue; }
+      {                                   /* a name, as read_name reads it */
+        uint8_t c1 = c, c2 = 0, type = 0;
+        j++;
+        skip_spaces(&j);
+        if (j < blen && (is_letter(buf[j]) || is_digit(buf[j]))) {
+          c2 = buf[j++];
+          for (;;) {
+            skip_spaces(&j);
+            if (j < blen && (is_letter(buf[j]) || is_digit(buf[j]))) j++;
+            else break;
+          }
+        }
+        skip_spaces(&j);
+        if (j < blen && buf[j] == '$') type = 2, j++;
+        else if (j < blen && buf[j] == '%') type = 1, j++;
+        skip_spaces(&j);
+        if (j < blen && buf[j] == '(') {
+          uint8_t nd = scan_dims(j);
+          for (k = 0; k < na; k++)
+            if (arrays[k].c1 == c1 && arrays[k].c2 == c2 && arrays[k].type == type) break;
+          if (k == na) {
+            if (na == MAX_ARRAYS) return -1;
+            arrays[na].c1 = c1, arrays[na].c2 = c2, arrays[na].type = type, arrays[na].ndims = nd;
+            na++;
+            desc_max = (uint16_t)(desc_max + 4 + 2 * nd);
+            nsa_max += type == 2;
+          } else if (nd > arrays[k].ndims) {
+            desc_max = (uint16_t)(desc_max + 2 * (nd - arrays[k].ndims));
+            arrays[k].ndims = nd;
+          }
+        } else {
+          for (k = 0; k < nv; k++)
+            if (vars[k].c1 == c1 && vars[k].c2 == c2 && vars[k].type == type) break;
+          if (k == nv) {
+            if (nv == MAX_VARS) return -1;
+            vars[nv].c1 = c1, vars[nv].c2 = c2, vars[nv].type = type;
+            nv++;
+            var_max = (uint16_t)(var_max + (type == 1 ? 2 : type == 2 ? 4 : 5));
+            nsv_max += type == 2;
+          }
+        }
+      }
+    }
+    at = link;
+  }
+  if (nfn_max > MAX_FNS) nfn_max = MAX_FNS;
   return 0;
+}
+
+/* ---- the fixed regions, filled as the compile meets the names ---- */
+
+/* a variable's slot (zeroed), a string's among the collector's roots */
+static void program_var(uint16_t i)
+{
+  uint8_t size = vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5, k;
+  if ((uint16_t)(var_at + size) > fn_base) { overflow = 1; return; }
+  var_off[i] = var_at;
+  for (k = 0; k < size; k++) out((uint16_t)(var_at + k), 0);
+  var_at = (uint16_t)(var_at + size);
+  if (vars[i].type == 2) {
+    uint16_t r = (uint16_t)(svlist_base + 2 * nsvars);
+    if (nsvars >= svlist_cap) { overflow = 1; return; }
+    out(r, (uint8_t)var_off[i]), out((uint16_t)(r + 1), (uint8_t)(var_off[i] >> 8));
+    nsvars++;
+  }
+}
+
+/* an array's descriptor: no storage yet, its dimension count, its element
+ * size (and the pristine copy CLEAR restores from); a string array's among
+ * the roots */
+static void program_array(uint16_t i)
+{
+  uint8_t size = (uint8_t)(4 + 2 * arrays[i].ndims), k;
+  uint8_t el = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
+  uint16_t c = (uint16_t)(desc_copy_base + (desc_at - desc_base));
+  if ((uint16_t)(desc_at + size) > (uint16_t)(desc_copy_base - DESC_SPARE)) { overflow = 1; return; }
+  desc_off[i] = desc_at;
+  for (k = 0; k < size; k++) {
+    uint8_t v = k == 2 ? arrays[i].ndims : k == 3 ? el : 0;
+    out((uint16_t)(desc_at + k), v), out((uint16_t)(c + k), v);
+  }
+  desc_at = (uint16_t)(desc_at + size);
+  if (arrays[i].type == 2) {
+    uint16_t r = (uint16_t)(salist_base + 2 * nsarrays);
+    if (nsarrays >= salist_cap) { overflow = 1; return; }
+    out(r, (uint8_t)desc_off[i]), out((uint16_t)(r + 1), (uint8_t)(desc_off[i] >> 8));
+    nsarrays++;
+  }
+}
+
+/* line i's code: its entry in the line table, LINE, its statements */
+static void compile_line(uint16_t i)
+{
+  uint16_t num;
+  line_i = i;
+  read_line(lines[i].at, &num);
+  out(entry(i), (uint8_t)pc), out((uint16_t)(entry(i) + 1), (uint8_t)(pc >> 8));
+  op16(OP_LINE, num);
+  for (;;) {
+    if (pf->poll) pf->poll(pf->ctx);
+    if (nstmts < nstmt_max) {
+      out((uint16_t)(stmt_base + 2 * nstmts), (uint8_t)pc), out((uint16_t)(stmt_base + 2 * nstmts + 1), (uint8_t)(pc >> 8));
+      nstmts++;
+    }
+    statement();
+    if (p >= blen || peek() == 0) break;
+    if (peek() == ':') { p++; continue; }
+    error_here(E_SYNTAX);                 /* something left that is not a statement */
+  }
 }
 
 int as816_compile(const Platform *platform, CompileStats *st)
@@ -1195,102 +1310,66 @@ int as816_compile(const Platform *platform, CompileStats *st)
   overflow = 0;
   direct = 0;
   dvar_at = 0;
-  use_onerr = scan_onerr();
-  code_base = (uint16_t)(pf->prog_start + HEADER_SIZE);
-  const_base = str_base = 0;
-  pass = 1;
-  run_pass();
-  if (overflow) return -1;
+  if (prescan()) return -1;
 
-  /* the layout */
-  const_base = pc;
-  str_base = (uint16_t)(const_base + 7 * nconsts);
-  var_base = (uint16_t)(str_base + str_bytes);
-  for (i = 0, a = var_base; i < nvars; i++) {
-    var_off[i] = a;
-    a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5));
-  }
-  fn_base = a;
-  a = (uint16_t)(a + 4 * nfns);
-  desc_base = a;
-  for (i = 0; i < narrays; i++) {
-    desc_off[i] = a;
-    a = (uint16_t)(a + 4 + 2 * arrays[i].ndims);
-  }
-  desc_bytes = (uint16_t)(a - desc_base);
-  a = (uint16_t)(a + DESC_SPARE);              /* room for direct lines' arrays */
-  desc_copy_base = a;
-  a = (uint16_t)(a + desc_bytes + DESC_SPARE);
-  nsvars = nsarrays = 0;
-  for (i = 0; i < nvars; i++) nsvars += vars[i].type == 2;
-  for (i = 0; i < narrays; i++) nsarrays += arrays[i].type == 2;
-  svlist_base = a;
-  svlist_cap = (uint16_t)(nsvars + SV_SPARE);
+  /* the layout: the fixed regions, then the code */
+  a = (uint16_t)(pf->prog_start + HEADER_SIZE);
+  linetab = a;
+  a = (uint16_t)(a + 2 * (nlines + 2));
+  var_base = var_at = a;
+  fn_base = (uint16_t)(a + var_max);
+  desc_base = desc_at = (uint16_t)(fn_base + 4 * nfn_max);
+  desc_copy_base = (uint16_t)(desc_base + desc_max + DESC_SPARE);   /* room for direct lines' arrays */
+  svlist_base = (uint16_t)(desc_copy_base + desc_max + DESC_SPARE);
+  svlist_cap = (uint16_t)(nsv_max + SV_SPARE);
   salist_base = (uint16_t)(svlist_base + 2 * svlist_cap);
-  salist_cap = (uint16_t)(nsarrays + SA_SPARE);
+  salist_cap = (uint16_t)(nsa_max + SA_SPARE);
   stmt_base = (uint16_t)(salist_base + 2 * salist_cap);
-  fstack_base = (uint16_t)(stmt_base + 2 * nstmts);
+  code_base = (uint16_t)(stmt_base + 2 * nstmt_max);
+  fstack_base = STACKS_BASE;
   sstack_base = (uint16_t)(fstack_base + FSTACK_SIZE);
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
-  heap_base = (uint16_t)(cstack_base + CSTACK_SIZE);
-  if (heap_base < fstack_base || heap_base > DIRECT_BASE) return -1;
+  if (code_base < pf->prog_start || code_base >= STACKS_BASE) return -1;
 
-  pass = 2;
-  run_pass();
-  if (overflow) return -1;
+  /* the code, line by line */
+  nvars = narrays = nfns = nconsts = nstmts = nsvars = nsarrays = 0;
+  memset(const_head, 0, sizeof const_head);
+  str_bytes = 0;
+  pc = code_base;
+  clen = 0;
+  for (a = fn_base; a < desc_base; a++) out(a, 0);   /* the FN entries: none defined */
+  for (i = 0; i < nlines; i++) compile_line(i);
+  line_i = nlines;
+  out(entry(nlines), (uint8_t)pc), out((uint16_t)(entry(nlines) + 1), (uint8_t)(pc >> 8));
+  op(OP_END);                             /* running off the end */
+  out(entry(nlines + 1), (uint8_t)DIRECT_BASE), out((uint16_t)(entry(nlines + 1) + 1), (uint8_t)(DIRECT_BASE >> 8));
+  flush_code(clen);
+  if (overflow || pc > STACKS_BASE) return -1;
+  desc_bytes = (uint16_t)(desc_at - desc_base);
 
-  /* constants; variables zero; descriptors: no storage yet, their count */
-  for (i = 0; i < nconsts; i++)
-    for (a = 0; a < 7; a++) out((uint16_t)(const_base + 7 * i + a), consts[i][a]);
-  for (a = var_base; a < desc_base; a++) out(a, 0);
-  for (i = 0; i < narrays; i++) {
-    uint16_t d = desc_off[i];
-    uint8_t size = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
-    out(d, 0), out((uint16_t)(d + 1), 0);
-    out((uint16_t)(d + 2), arrays[i].ndims), out((uint16_t)(d + 3), size);
-    /* the pristine copy CLEAR restores from */
-    out((uint16_t)(d - desc_base + desc_copy_base), 0);
-    out((uint16_t)(d - desc_base + desc_copy_base + 1), 0);
-    out((uint16_t)(d - desc_base + desc_copy_base + 2), arrays[i].ndims);
-    out((uint16_t)(d - desc_base + desc_copy_base + 3), size);
-  }
-  /* the collector's roots: the string variables, the string arrays */
-  {
-    uint16_t at = svlist_base;
-    for (i = 0; i < nvars; i++)
-      if (vars[i].type == 2) {
-        out(at, (uint8_t)var_off[i]), out((uint16_t)(at + 1), (uint8_t)(var_off[i] >> 8));
-        at = (uint16_t)(at + 2);
-      }
-    at = salist_base;                     /* (after the string variables' spare roots) */
-    for (i = 0; i < narrays; i++)
-      if (arrays[i].type == 2) {
-        out(at, (uint8_t)desc_off[i]), out((uint16_t)(at + 1), (uint8_t)(desc_off[i] >> 8));
-        at = (uint16_t)(at + 2);
-      }
-  }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[22];
+    uint16_t h = pf->prog_start, vals[24];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
-    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = DIRECT_BASE;
+    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = pc, vals[5] = STACKS_BASE;   /* the array heap */
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
     vals[11] = 0x0800;                     /* DATA: READ from the text's start, as RESTORE */
-    vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
+    vals[12] = pc, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
     vals[17] = 0;                          /* direct lines' variables: none yet */
-    vals[18] = stmt_base, vals[19] = nstmts, vals[20] = const_base;   /* statements; the code's end */
+    vals[18] = stmt_base, vals[19] = nstmts, vals[20] = pc;   /* statements; the code's end */
     vals[21] = pf->text_bank;              /* the program's text (READ's DATA) */
-    for (i = 0; i < 22; i++) {
+    vals[22] = linetab, vals[23] = nlines;
+    for (i = 0; i < 24; i++) {
       out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }
   }
   if (st) {
-    st->code_size = (uint16_t)(const_base - code_base);
+    st->code_size = (uint16_t)(pc - code_base);
     st->lines = nlines, st->vars = nvars, st->arrays = narrays, st->consts = nconsts;
     st->strings = str_bytes;
-    st->end = heap_base;
+    st->end = pc;
   }
   flush();
   return 0;
@@ -1304,7 +1383,6 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
   pf = platform;
   overflow = 0;
   direct = 1;
-  pass = 2;
   for (blen = 0; tok[blen] && blen < sizeof buf - 1; blen++) buf[blen] = tok[blen];
   buf[blen] = 0;
   p = 0;
@@ -1365,7 +1443,6 @@ uint16_t as816_adopt(const Platform *platform, const uint8_t name[3], uint8_t nd
   pf = platform;
   overflow = 0;
   direct = 1;
-  pass = 2;
   if (ndims) {
     i = array_slot(name[0], name[1], name[2], ndims);
     if (i >= 0 && !overflow) a = desc_off[i];
