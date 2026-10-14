@@ -20,9 +20,9 @@
         .p816
         .smart  off
 
-        .import fp_load_fac, fp_load_arg, fp_store_fac, fp_addt, fp_subt, fp_cmp
-        .import fp_sgn, fp_ayint, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
-        .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_add, fp_table
+        .import fp_addt, fp_subt, fp_cmp
+        .import fp_sgn, fp_givayf, fp_negop, fp_fout, fp_round, fp_multt
+        .import fp_divt, fp_pwrt, fp_float, fp_uint16, fp_table
         .import fp_int, fp_abs, fp_sqr, fp_rnd, fp_log, fp_exp, fp_cos, fp_sin, fp_tan, fp_atn
         .import fp_conint, fp_fin, fp_getadr, fp_ayint16, fp_next, fp_packed_int, fp_int_packed, fp_whole
 

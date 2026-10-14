@@ -5,9 +5,10 @@ all), compiled to bytecode on `RUN` and run by a 65816 interpreter that keeps
 the program and all its data outside banks 0/1.  Later, a 16-bit ProDOS 8
 underneath it.
 
-Status: **design, measurement, and the float library.**  `fp816` (every
-AppleSoft float routine, bit-exact with the ROM) is done; the compiler and
-interpreter are next.
+Status: **working, on KEGS and the real IIgs** - M1-M5 done (see README.md for
+what it does, docs/SPEED.md for the speed work).  This file keeps the
+design's decisions and the proposals still open.
+
 Decisions marked *(user)* are settled; the rest are proposals.
 
 ## Scope

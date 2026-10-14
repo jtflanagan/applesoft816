@@ -1124,11 +1124,10 @@ overflow:
         jmp     fp_error
 
 ; SHIFT.RIGHT ($E8F0) and friends.  X points at the operand's exponent byte
-; (FAC or ARG, or RESULT-1 for FMULT).  The ROM's "op $nn,x" is direct-page
+; (FAC or ARG; the ROM's FMULT also used RESULT-1 through SHIFT.RIGHT.1,
+; which stage 2's FMULT does not need).  The ROM's "op $nn,x" is direct-page
 ; indexed, which on the 65816 is D+nn+X: the same code works on any direct
 ; page.
-shift_right_1:
-        ldx     #$61
 shift_right_2:
         ldy     $04,x
         sty     FAC_EXT
@@ -1336,40 +1335,6 @@ sqs:
         .repeat 511, n
         .word   ((n - 255) * (n - 255)) / 4
         .endrepeat
-
-; MULTIPLY.1 ($E9B0), MULTIPLY.2 ($E9B5): stage 1's, kept for the functions
-; that reach them (none now) and as the reference
-multiply_1:
-        bne     multiply_2
-        jmp     shift_right_1
-
-multiply_2:
-        lsr     a
-        ora     #$80
-@le9b8: tay
-        bcc     @le9d4
-        clc
-        lda     RESULT+3
-        adc     ARG+4
-        sta     RESULT+3
-        lda     RESULT+2
-        adc     ARG+3
-        sta     RESULT+2
-        lda     RESULT+1
-        adc     ARG+2
-        sta     RESULT+1
-        lda     RESULT
-        adc     ARG+1
-        sta     RESULT
-@le9d4: ror     RESULT
-        ror     RESULT+1
-        ror     RESULT+2
-        ror     RESULT+3
-        ror     FAC_EXT
-        tya
-        lsr     a
-        bne     @le9b8
-        rts
 
 ; ADD.EXPONENTS ($EA0E).  On underflow it drops its caller's frame (PLA PLA)
 ; and zeroes FAC, returning to the caller's caller - kept as in the ROM.

@@ -32,6 +32,16 @@
 // machine, instead of the PC build - and check the two images are identical
 // byte for byte; the compile's cycles are reported.
 //
+// --vm compiles lazily, as the shell's RUN does: the program laid out, each
+// line compiled (by the PC build, natively) when the VM first jumps to it -
+// the VM's request 7 reaches a hook at its shell entry.  Environment:
+//   GSRUN_FULL=1     compile it all first (--cc always does)
+//   GSRUN_LAZY=1     report each lazy compile (the entry, the limit, the result)
+//   GSRUN_CC_LAZY=1  with --cc: time the 65816 build's lazy start instead
+//   GSRUN_HIST=FILE  cycles per PC (tools/vmprof.py), GSRUN_CCPROF=FILE the
+//                    65816 compiler's (tools/ccprof.py); GSRUN_TRACE=N,
+//                    GSRUN_BREAK=PC, GSRUN_LAST, GSRUN_GUARD=N: debugging
+//
 // ROM AppleSoft: cold start at $E000, the program installed at the first
 // prompt, RUN typed; the output is every COUT byte from RUN until AppleSoft
 // reaches RESTART (END, STOP, an error and its message).  --vm: the program
