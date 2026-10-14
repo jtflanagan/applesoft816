@@ -71,3 +71,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | 5: the scan's text in windows, its byte skipping in assembly | 560,914 | 6,631,982 | 18,068,884 | 9,574,228 | 49,710,745 | 1,818,284 at RUN (cold call; ~1.43M warm), 9,908,565 for COMPILE |
 | 6: FMULT by quarter squares (fp816 stage 2) | 560,914 | 6,215,854 | 17,767,884 | 6,944,742 | 49,438,014 | |
 | 7: FDIV's loop in 16-bit halves | 560,914 | 5,943,854 | 17,452,526 | 6,804,628 | 49,396,078 | |
+| 8: PUSH + load + operation fused (ARGV/ARGK/ARGKI, the A forms) | 560,914 | 5,421,854 | 16,930,526 | 6,778,528 | 49,311,563 | |

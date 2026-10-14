@@ -171,6 +171,16 @@ static void emit16(uint16_t v) { emit8((uint8_t)v); emit8((uint8_t)(v >> 8)); }
 static void op(int o) { emit16(pf->optable[o]); }
 static void op16(int o, uint16_t v) { op(o); emit16(v); }
 
+/* ---- the fusion: PUSH, a simple numeric load, then the operation that pops
+ * it back become ARGV/ARGK/ARGKI and the operation's A form (no stack: ARG
+ * = FAC rounded, FAC = the operand - the same state) ---- */
+static uint16_t push_end;           /* pc after the last numeric PUSH */
+static uint16_t load_at, load_end;  /* the last simple load: LDV, LDC, LDCI */
+static uint8_t load_kind;           /* OP_ARGV, OP_ARGK, OP_ARGKI */
+static uint16_t load_arg;           /* LDV's variable, LDC's constant */
+static int16_t load_const;          /* LDCI's index in consts (-1: none) */
+static void fuse_forget(void) { push_end = load_end = 0; }
+
 /* ---- scanning: CHRGET skips spaces ---- */
 static uint8_t peek(void)
 {
@@ -322,16 +332,24 @@ static uint16_t const_find(const uint8_t fac[7])
 static void ldc(const uint8_t fac[7])
 {
   uint16_t i = const_find(fac), k;
-  if (i) { op16(OP_LDC, const_addr[i - 1]); return; }
+  load_at = pc;
+  if (i) {
+    op16(OP_LDC, const_addr[i - 1]);
+    load_kind = OP_ARGK, load_arg = const_addr[i - 1], load_end = pc;
+    return;
+  }
   if (direct) {
     if ((uint16_t)(str_at + 7) > DIRECT_VARS) { overflow = 1; return; }
     for (k = 0; k < 7; k++) out((uint16_t)(str_at + k), fac[k]);
     op16(OP_LDC, str_at);
+    load_kind = OP_ARGK, load_arg = str_at, load_end = pc;
     str_at = (uint16_t)(str_at + 7);
     return;
   }
   op(OP_LDCI);
+  load_kind = OP_ARGKI, load_const = -1;
   if (nconsts < MAX_CONSTS) {               /* (a full table: inline every time) */
+    load_const = (int16_t)nconsts;
     uint8_t h = const_hash(fac);
     memcpy(consts[nconsts], fac, 7);
     const_addr[nconsts] = pc;
@@ -339,6 +357,7 @@ static void ldc(const uint8_t fac[7])
     const_head[h] = ++nconsts;
   }
   for (k = 0; k < 7; k++) emit8(fac[k]);
+  load_end = pc;
 }
 
 /* a numeric literal at buf[p]: FIN's value, p past it; 0 for FIN's
@@ -464,16 +483,41 @@ static int expr(void);
 /* perform a pending operator, its right operand of type t now in FAC/SACC;
  * returns the result's type.  The ROM's checks, at the same point:
  * FRM.PERFORM.1's CHKNUM for arithmetic, RELOPS's CHKVAL for relations. */
+/* the PUSH and load just emitted, made ARGV/ARGK/ARGKI; 1 if done (then
+ * the operation's A form follows), 0 if they are not there */
+static int fuse(void)
+{
+  uint16_t start = (uint16_t)(push_end - 2);
+  uint8_t c[7], k;
+  if (!push_end || load_end != pc || load_at != push_end || (uint16_t)(pc - start) > clen) return 0;
+  if (load_kind == OP_ARGKI) memcpy(c, cbuf + clen - 7, 7);
+  clen = (uint8_t)(clen - (pc - start));
+  pc = start;
+  if (load_kind == OP_ARGKI) {
+    op(OP_ARGKI);
+    if (load_const >= 0) const_addr[load_const] = pc;
+    for (k = 0; k < 7; k++) emit8(c[k]);
+  } else
+    op16(load_kind, load_arg);
+  fuse_forget();
+  return 1;
+}
+
 static int perform(const Pending *x, int t)
 {
+  static const uint8_t fused[] = {   /* OP_ADD..OP_OR: their A forms */
+    OP_ADDA, OP_SUBA, OP_MULA, OP_DIVA, OP_POWA, 0, 0, OP_ANDA, OP_ORA };
   if (x->opcode == OP_REL) {
     if (t != (x->str ? TY_STR : TY_NUM)) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
-    op(x->str ? OP_SREL : OP_REL);
+    op(x->str ? OP_SREL : !x->str && fuse() ? OP_RELA : OP_REL);
     emit8(x->mask);
     return TY_NUM;
   }
   if (t != TY_NUM) { error_here(E_TYPE_MISMATCH); return TY_ERR; }
-  op(x->opcode);
+  if (x->opcode >= OP_ADD && x->opcode <= OP_OR && fused[x->opcode - OP_ADD] && fuse())
+    op(fused[x->opcode - OP_ADD]);
+  else
+    op(x->opcode);
   return TY_NUM;
 }
 
@@ -501,8 +545,12 @@ static int load_name(const Name *nm)
     a = array_slot(nm->c1, nm->c2, nm->type, (uint8_t)n);
     if (a < 0) { error_here(E_BAD_SUBSCRIPT); return TY_ERR; }
     op16(nm->type == 2 ? OP_SLDA : nm->type == 1 ? OP_LDAI : OP_LDA, desc_off[a]);
-  } else
-    op16(nm->type == 2 ? OP_SLDV : nm->type == 1 ? OP_LDVI : OP_LDV, var_slot(nm->c1, nm->c2, nm->type));
+  } else {
+    uint16_t v = var_slot(nm->c1, nm->c2, nm->type);
+    load_at = pc;
+    op16(nm->type == 2 ? OP_SLDV : nm->type == 1 ? OP_LDVI : OP_LDV, v);
+    if (nm->type == 0) load_kind = OP_ARGV, load_arg = v, load_end = pc;
+  }
   return nm->type == 2 ? TY_STR : TY_NUM;
 }
 
@@ -714,6 +762,7 @@ static int expr(void)
     if (t == TY_STR && opcode != OP_REL) { error_here(E_TYPE_MISMATCH); return TY_ERR; }   /* CHKNUM */
     if (np == MAX_PENDING) { error_here(E_FORMULA); return TY_ERR; }
     op(t == TY_STR ? OP_SPUSH : OP_PUSH);
+    if (t != TY_STR) push_end = pc;
     pend[np].prec = prec, pend[np].opcode = opcode, pend[np].mask = mask, pend[np].str = t == TY_STR;
     np++;
     t = element(pend, &np);
@@ -1348,6 +1397,7 @@ static void compile_line(uint16_t i)
 {
   uint16_t num = lines[i].num;
   line_i = i;
+  fuse_forget();
   read_line(lines[i].at, &num);
   out(entry(i), (uint8_t)pc), out((uint16_t)(entry(i) + 1), (uint8_t)(pc >> 8));
   op16(OP_LINE, num);
@@ -1569,6 +1619,7 @@ static int direct_line(const Platform *platform, const uint8_t *tok, uint16_t *e
   pc = DIRECT_BASE;
   clen = 0;
   code_limit = DIRECT_DATA;
+  fuse_forget();
   op(OP_END);                               /* where IF false and ON past its list go */
   *entry = pc;
   for (;;) {

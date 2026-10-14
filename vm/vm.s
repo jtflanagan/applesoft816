@@ -204,6 +204,8 @@ optable:
         .word   op_hgr, op_hgr2, op_hcolor, op_hx, op_hplot, op_hplotto, op_hposn, op_shape
         .word   op_draw, op_xdraw, op_rot, op_scale, op_usr, op_amper, op_list, op_new, op_del, op_pdl
         .word   op_ldci, op_sliti
+        .word   op_argv, op_argk, op_argki, op_adda, op_suba, op_mula, op_diva, op_powa
+        .word   op_anda, op_ora, op_rela
 OP_COUNT = (* - optable) / 2
 
 ; =========================================================================
@@ -824,6 +826,83 @@ op_ldci:
         .a8
         jmp     ($0000,x)
 
+; ARGV v / ARGK k / ARGKI k: PUSH, a load and the next operation's pop
+; without the stack (the compiler fuses them): ARG = FAC rounded (FRM.STACK),
+; FAC = the operand, SGNCPR = ARGSIGN eor FACSIGN (FRM.PERFORM.2)
+fac_to_arg:
+        jsr     round_fac
+        rep     #$20
+        .a16
+        lda     FAC
+        sta     ARG
+        lda     FAC+2
+        sta     ARG+2
+        lda     FAC+4           ; low mantissa byte, the sign
+        sta     ARG+4
+        sep     #$20
+        .a8
+        rts
+op_argv:
+        jsr     fac_to_arg
+        ldy     a:$0002,x
+        lda     a:$0000,y
+        sta     FAC
+        lda     a:$0001,y
+        sta     FACSIGN
+        ora     #$80
+        sta     FAC+1
+        lda     a:$0002,y
+        sta     FAC+2
+        lda     a:$0003,y
+        sta     FAC+3
+        lda     a:$0004,y
+        sta     FAC+4
+        stz     FAC_EXT
+        lda     ARGSIGN
+        eor     FACSIGN
+        sta     SGNCPR
+        NEXTOP  4
+op_argk:
+        jsr     fac_to_arg
+        ldy     a:$0002,x
+        rep     #$20
+        .a16
+        lda     a:$0000,y
+        sta     FAC
+        lda     a:$0002,y
+        sta     FAC+2
+        lda     a:$0004,y
+        sta     FAC+4
+        sep     #$20
+        .a8
+        lda     a:$0006,y
+        sta     FAC_EXT
+        lda     ARGSIGN
+        eor     FACSIGN
+        sta     SGNCPR
+        NEXTOP  4
+op_argki:
+        jsr     fac_to_arg
+        lda     a:$0008,x
+        sta     FAC_EXT
+        rep     #$21
+        .a16
+        lda     a:$0002,x
+        sta     FAC
+        lda     a:$0004,x
+        sta     FAC+2
+        lda     a:$0006,x
+        sta     FAC+4
+        txa
+        adc     #$0009
+        tax
+        sep     #$20
+        .a8
+        lda     ARGSIGN
+        eor     FACSIGN
+        sta     SGNCPR
+        jmp     ($0000,x)
+
 ; LDV v: FAC = the packed variable at v (LOAD.FAC.FROM.YA)
 op_ldv:
         ldy     a:$0002,x
@@ -927,19 +1006,26 @@ poparg: ldy     VM_FSP
         sta     SGNCPR
         rts
 
+; (each binary operation's A entry: its operand is in ARG already - ARGV,
+; ARGK, ARGKI put it there, fused from PUSH, a load and the pop)
 op_add: jsr     poparg
+op_adda:
         FPCHK   fp_addt
         NEXTOP  2
 op_sub: jsr     poparg
+op_suba:
         FPCHK   fp_subt
         NEXTOP  2
 op_mul: jsr     poparg
+op_mula:
         FPCHK   fp_multt
         NEXTOP  2
 op_div: jsr     poparg
+op_diva:
         FPCHK   fp_divt
         NEXTOP  2
 op_pow: jsr     poparg
+op_powa:
         FPCHK   fp_pwrt
         NEXTOP  2
 op_neg: jsr     poparg          ; unary minus: the ROM pushed and pops too
@@ -956,6 +1042,7 @@ op_not: jsr     poparg
 
 ; AND ($DF55), OR ($DF4F): on the exponents (0 = false); FAC = 0 or 1
 op_and: jsr     poparg
+op_anda:
         ldy     #$0000
         lda     ARG
         beq     sngflt
@@ -964,6 +1051,7 @@ op_and: jsr     poparg
         iny
         bra     sngflt
 op_or:  jsr     poparg
+op_ora:
         ldy     #$0000
         lda     ARG
         ora     FAC
@@ -978,6 +1066,7 @@ sngflt: sty     FP_INT
 ; CMPDONE ($DFC1): (result + 1) * 2 + C, AND the operator mask m (> 1, = 2,
 ; < 4); FAC = 0 or 1 (FLOAT)
 op_rel: jsr     poparg
+op_rela:
         lda     ARGSIGN
         ora     #$7F
         and     ARG+1
