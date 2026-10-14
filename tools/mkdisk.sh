@@ -3,6 +3,8 @@
 # the live tests: ProDOS 8 (2.4.3, from AppleWin's disk) and its boot
 # blocks, AS816.SYSTEM first (so ProDOS runs it), AS816.VM, AS816.CC, then
 # Lemonade, BM1-BM8 and any programs named, tokenized by AppleSoft itself.
+#   MASTER=1 tools/mkdisk.sh IMAGE.po: only what boots (ProDOS and the AS816
+#   files) - the template for a disk of one's own
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/.."
@@ -40,8 +42,10 @@ $pd "$img" put AS816.SYSTEM FF 2000 "$root/sys/AS816.SYSTEM"
 $pd "$img" put AS816.VM 06 0000 "$root/vm/vm.bin"
 $pd "$img" put AS816.SH 06 0000 "$root/cc/sh.bin"
 $pd "$img" put AS816.CC 06 0000 "$root/cc/cc.bin"
-for f in "$root/bench/lemonade/LEMONADE.tok" "$root"/bench/rugg_feldman/BM*.bas "$@"; do
-  name=$(tok "$f")
-  $pd "$img" put "$name" FC 0801 "$work/$name.tok"
-done
+if [ -z "${MASTER:-}" ]; then
+  for f in "$root/bench/lemonade/LEMONADE.tok" "$root"/bench/rugg_feldman/BM*.bas "$@"; do
+    name=$(tok "$f")
+    $pd "$img" put "$name" FC 0801 "$work/$name.tok"
+  done
+fi
 $pd "$img" ls
