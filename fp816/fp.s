@@ -59,6 +59,7 @@ LINNUM   = $50          ; GETADR's result, 2 bytes
 FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 ; stage 2's scratch ($67-$81: free in AppleSoft's offsets and the VM's)
 DW_A = $67                      ; 4: ARG's mantissa, little-endian (FDIVT)
+FOUT_V = $67                    ; 4: FOUT's digit loop: the mantissa, little-endian
 DW_F = $6B                      ; 4: FAC's
 DW_Q = $6F                      ; 2: quotient bits coming in, behind a sentinel 1
 DW_R = $71                      ; 6: the quotient words: bits 1-16, 17-32, then 33-34
@@ -1446,14 +1447,23 @@ copy_result_into_fac:
         sta     FAC+4
         jmp     normalize_fac_2
 
-; COPY.FAC.TO.ARG.ROUNDED ($EB63)
+; COPY.FAC.TO.ARG.ROUNDED ($EB63); MAF: ARG = FAC, FAC.EXTENSION = 0 -
+; stage 2: three 16-bit moves, leaving what the ROM's loop leaves (A = the
+; exponent, X = 0, Z set; C as it was)
 copy_fac_to_arg_rounded:
         jsr     round_fac
-maf:    ldx     #$06
-@leb68: lda     FAC-1,x
-        sta     SHIFTEXT,x
-        dex
-        bne     @leb68
+maf:    rep     #$20
+        .a16
+        lda     FAC
+        sta     ARG
+        lda     FAC+2
+        sta     ARG+2
+        lda     FAC+4
+        sta     ARG+4
+        sep     #$20
+        .a8
+        lda     FAC
+        ldx     #$00
         stx     FAC_EXT
         rts
 
@@ -1777,6 +1787,16 @@ con_999999999:  .byte $9E, $6E, $6B, $27, $FD
 con_billion:    .byte $9E, $6E, $6B, $28, $00
 con_half:       .byte $80, $00, $00, $00, $00
 ; DECTBL ($EE69): -1e8, +1e7, -1e6, ... +10, -1 as 32-bit two's complement
+dectbl_le:                      ; (stage 2: each entry's bytes reversed)
+        .byte   $00, $1F, $0A, $FA
+        .byte   $80, $96, $98, $00
+        .byte   $C0, $BD, $F0, $FF
+        .byte   $A0, $86, $01, $00
+        .byte   $F0, $D8, $FF, $FF
+        .byte   $E8, $03, $00, $00
+        .byte   $9C, $FF, $FF, $FF
+        .byte   $0A, $00, $00, $00
+        .byte   $FF, $FF, $FF, $FF
 dectbl: .byte   $FA, $0A, $1F, $00
         .byte   $00, $98, $96, $80
         .byte   $FF, $F0, $BD, $C0
@@ -1858,25 +1878,33 @@ fout_1: lda     #$2D            ; '-'
 @ledbb: sty     SERPNT
 @ledbd: ldy     #$00
         ldx     #$80
-@ledc1: lda     FAC+4
-        clc
-        adc     dectbl+3,y
-        sta     FAC+4
+        rep     #$20            ; stage 2: the mantissa as two little-endian
+        .a16                    ; words (X stays 8-bit: its sign is the phase)
         lda     FAC+3
-        adc     dectbl+2,y
-        sta     FAC+3
-        lda     FAC+2
-        adc     dectbl+1,y
-        sta     FAC+2
+        xba
+        sta     FOUT_V
         lda     FAC+1
-        adc     dectbl,y
-        sta     FAC+1
+        xba
+        sta     FOUT_V+2
+        sep     #$20
+        .a8
+@outer: rep     #$20
+        .a16
+@ledc1: lda     FOUT_V          ; + the power of ten (dectbl, little-endian)
+        clc
+        adc     dectbl_le,y
+        sta     FOUT_V
+        lda     FOUT_V+2
+        adc     dectbl_le+2,y
+        sta     FOUT_V+2
         inx
         bcs     @lede5
         bpl     @ledc1
         bmi     @lede7
 @lede5: bmi     @ledc1
-@lede7: txa
+@lede7: sep     #$20            ; (C kept)
+        .a8
+        txa
         bcc     @ledee
         eor     #$FF
         adc     #$0A
@@ -1903,7 +1931,17 @@ fout_1: lda     #$2D            ; '-'
         and     #$80
         tax
         cpy     #$24
-        bne     @ledc1
+        bne     @outer
+        rep     #$20            ; the mantissa back, as the ROM leaves it
+        .a16
+        lda     FOUT_V
+        xba
+        sta     FAC+3
+        lda     FOUT_V+2
+        xba
+        sta     FAC+1
+        sep     #$20
+        .a8
 ; FOUT.3 ($EE17): drop trailing zeros (and a bare point), then the exponent
         ldy     SERPNT
 @lee19: lda     [FP_BUF],y

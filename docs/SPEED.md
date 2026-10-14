@@ -73,3 +73,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | 7: FDIV's loop in 16-bit halves | 560,914 | 5,943,854 | 17,452,526 | 6,804,628 | 49,396,078 | |
 | 8: PUSH + load + operation fused (ARGV/ARGK/ARGKI, the A forms) | 560,914 | 5,421,854 | 16,930,526 | 6,778,528 | 49,311,563 | |
 | 9: subscripts: fp_ayint16 (fast AYINT), one-dimension element address by shifts | 560,914 | 5,421,854 | 13,448,210 | 6,778,528 | 49,122,115 | |
+| 10: FOUT's digit loop and MAF in 16-bit | 560,914 | 5,421,854 | 13,448,210 | 6,756,528 | 48,996,873 | |
