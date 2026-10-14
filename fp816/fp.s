@@ -61,6 +61,7 @@ FP_INT   = $F8          ; 2 bytes: GIVAYF's input, low first (ours)
 DW_A = $67                      ; 4: ARG's mantissa, little-endian (FDIVT)
 FOUT_V = $67                    ; 4: FOUT's digit loop: the mantissa, little-endian
 NX_OUT = $C2                    ; 5: fp_int_packed's packed number (free in the VM's too)
+FIN_V = $C7                     ; 2: fin_fast's value
 DW_F = $6B                      ; 4: FAC's
 DW_Q = $6F                      ; 2: quotient bits coming in, behind a sentinel 1
 DW_R = $71                      ; 6: the quotient words: bits 1-16, 17-32, then 33-34
@@ -384,9 +385,115 @@ fp_getadr:
 ; FP_TXT is left on the character that ended the number.
 fp_fin:
         ENTER
+        jsr     fin_fast
+        bcc     @done
         jsr     chrget
         jsr     fin
-        LEAVE
+@done:  LEAVE
+
+; FIN's plain case: after any spaces, one to four digits (no leading zero
+; but a lone 0) then a character that is not a digit, ".", "E" or a space:
+; FAC = that whole number as FIN leaves it (exact; sign and rounding bytes
+; 0, as the ROM's FIN gives for every one), FP_TXT at the character after.
+; C set: not this case, nothing changed.  (fptest's FIN family checks it.)
+fin_fast:
+        rep     #$10
+        .i16
+        ldy     #$0001
+@sp:    lda     [FP_TXT],y
+        cmp     #' '
+        bne     @d1
+        iny
+        bra     @sp
+@d1:    sec
+        sbc     #'0'
+        cmp     #10
+        bcc     @ok
+@no:    sep     #$30
+        sec
+        rts
+@ok:    sta     FIN_V           ; the value so far (16-bit, high byte below)
+        stz     FIN_V+1
+        ldx     #$0003          ; up to three more digits
+        cmp     #0
+        bne     @more
+        iny                     ; a lone 0: the next must not be a digit
+        bra     @end
+@more:  iny
+        lda     [FP_TXT],y
+        sec
+        sbc     #'0'
+        cmp     #10
+        bcs     @end
+        pha                     ; V = V * 10 + the digit
+        rep     #$20
+        .a16
+        lda     FIN_V
+        asl     a
+        sta     FIN_V
+        asl     a
+        asl     a
+        clc
+        adc     FIN_V
+        sta     FIN_V
+        sep     #$20
+        .a8
+        pla
+        clc
+        adc     FIN_V
+        sta     FIN_V
+        bcc     @nc
+        inc     FIN_V+1
+@nc:    dex
+        bpl     @more           ; (a fifth digit: no)
+        bra     @no
+@end:   lda     [FP_TXT],y      ; the character after: not part of a number
+        cmp     #'0'
+        bcc     @t1
+        cmp     #'9'+1
+        bcc     @no
+@t1:    cmp     #'.'
+        beq     @no
+        cmp     #'E'
+        beq     @no
+        cmp     #' '
+        beq     @no
+        rep     #$21            ; FP_TXT at it
+        .a16
+        tya
+        adc     FP_TXT
+        sta     FP_TXT
+        bcc     @nb
+        sep     #$20
+        .a8
+        inc     FP_TXT+2
+        rep     #$20
+        .a16
+@nb:    stz     FAC+3           ; FAC: mantissa 3, 4 zero (and 2 below)
+        stz     FAC+1
+        lda     FIN_V
+        beq     @zero
+        ldx     #$0090          ; normalize: exponent in X
+        cmp     #$0100
+        bcs     @norm
+        xba
+        ldx     #$0088
+@norm:  cmp     #$8000
+        bcs     @put
+        asl     a
+        dex
+        bra     @norm
+@put:   xba
+        sta     FAC+1           ; mantissa 1, 2
+        txa
+@zero:  sep     #$30
+        .a8
+        .i8
+        sta     FAC             ; the exponent (0 for 0)
+        stz     FACSIGN
+        stz     FAC_EXT
+        clc
+        rts
 
 fp_negop:
         ENTER

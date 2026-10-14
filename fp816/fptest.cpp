@@ -476,6 +476,19 @@ int main(int argc, char** argv)
   memset(g_seed, 0, 5);
   g_cprmask = 0;
 
+  // FPTEST_FINDUMP=1: the ROM's FIN on every integer 0-65535, its FAC (for
+  // studying a fast path) - then exit
+  if (getenv("FPTEST_FINDUMP")) {
+    for (long v = 0; v <= 65535; v++) {
+      Fac f;
+      std::string t = std::to_string(v) + ":";
+      t += char(0);
+      if (!m.rom_fin(t, f)) { printf("%ld error\n", v); continue; }
+      printf("%ld %02X %02X%02X%02X%02X %02X %02X\n", v, f.exp, f.m[0], f.m[1], f.m[2], f.m[3], f.sign, f.ext);
+    }
+    return 0;
+  }
+
   // FIN: number text -> FAC, entered the way AppleSoft does (CHRGET, FIN)
   if (!getenv("FPTEST_ONLY") || strstr("FIN", getenv("FPTEST_ONLY"))) {
     long bad = 0, errs = 0;
