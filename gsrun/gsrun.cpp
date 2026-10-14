@@ -469,6 +469,13 @@ int main(int argc, char** argv)
     Platform pf{};
     pf.ctx = &vp, pf.read = pf_read, pf.write = pf_write, pf.fin = pf_fin;
     pf.prog_start = prog_start, pf.optable = handlers.data();
+    // the program's text where the VM's READ finds its DATA (and the 65816
+    // compiler reads it): $0801 of TEXT_BANK, a 0 before it
+    constexpr uint32_t TEXT_BANK = 0x090000;
+    pf.text_bank = uint8_t(TEXT_BANK >> 16);
+    m.c.mem[TEXT_BANK + 0x800] = 0;
+    memcpy(&m.c.mem[TEXT_BANK + 0x801], prog.data(), prog.size());
+    m.c.mem[TEXT_BANK + 0x801 + prog.size()] = 0, m.c.mem[TEXT_BANK + 0x802 + prog.size()] = 0;
     CompileStats st{};
     if (as816_compile(&pf, &st) != 0) { fprintf(stderr, "gsrun: the program does not fit the VM bank\n"); return 1; }
     fprintf(stderr, "gsrun: compiled %u lines: %u bytes of code, %u variables, %u arrays, %u constants\n",
@@ -486,10 +493,8 @@ int main(int argc, char** argv)
       memset(&m.c.mem[VM_BANK] + vm.size(), 0, 0x10000 - vm.size());
       auto cc = slurp(cc_path);
       if (cc.size() < 12 || memcmp(&cc[4], "CC16", 4)) { fprintf(stderr, "%s: not a compiler image\n", cc_path); return 2; }
-      constexpr uint32_t CC_BANK = 0x070000, TEXT_BANK = 0x090000;
+      constexpr uint32_t CC_BANK = 0x070000;
       memcpy(&m.c.mem[CC_BANK], cc.data(), cc.size());
-      memcpy(&m.c.mem[TEXT_BANK + 0x801], prog.data(), prog.size());
-      m.c.mem[TEXT_BANK + 0x801 + prog.size()] = 0, m.c.mem[TEXT_BANK + 0x802 + prog.size()] = 0;
       uint32_t params = 0x080000 | (cc[8] | cc[9] << 8);
       m.c.mem[params + 0] = uint8_t(VM_BANK >> 16);
       m.c.mem[params + 1] = uint8_t(TEXT_BANK >> 16);

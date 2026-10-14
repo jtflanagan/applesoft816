@@ -58,6 +58,8 @@ typedef struct Platform {
   void (*poll)(void *ctx);
   /* from the VM image's header */
   uint16_t prog_start;          /* first free byte of the VM bank */
+  uint8_t text_bank;            /* the bank the program's text is in, at $0801 (READ reads
+                                 * DATA there; $0800 must be 0) */
   const uint16_t *optable;      /* handler address of each operation */
 } Platform;
 

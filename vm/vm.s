@@ -89,7 +89,7 @@ RC_Y     = $BC
 RC_P     = $BD
 RC_TGT   = $BE          ; 3: long pointer to romcall's JSR operand in bank 0
 VM_INMODE = $CE         ; 1: INPUTFLG: 0 INPUT, $98 READ, $40 GET
-DATPTR   = $CF          ; 2: READ's place in the DATA pool (this bank)
+DATPTR   = $CF          ; 2: READ's place in the program's text (VM_TXTBANK)
 DATLIN   = $D1          ; 2: the line of the DATA being read
 VM_INSTMT = $D3         ; 2: the INPUT operation's IP (?REENTER starts it again)
 INPTR    = $D5          ; 3: the input text pointer between items (long)
@@ -105,6 +105,7 @@ VM_DENTRY = $E6         ; 2: vm_direct's code (the shell's direct line)
 VM_FRESH = $E8          ; 1: vm_direct CLEARs first (the image is new, or was edited)
 VM_CONTIP = $E9         ; 2: where CONT goes on (OLDTEXT; 0: ?CAN'T CONTINUE)
 VM_CONTLIN = $EB        ; 2: ... and its line (OLDLIN)
+VM_TXTBANK = $ED        ; 1: the program's text's bank (header +$2A): READ's DATA
 LINNUM   = $50          ; 2: GETADR's result (fp816)
 
 ERR_NEXT_WITHOUT_FOR  = $00
@@ -270,6 +271,8 @@ vm_setup:
         sta     VM_CLIM
         lda     a:$000C,y       ; the string temporary stack
         sta     VM_SSP
+        lda     a:$002A,y       ; (and the text's bank, below)
+        sta     VM_T0
         lda     #$FFFF
         sta     CURLIN
         lda     COUT_VEC        ; patch the COUT trampoline
@@ -295,6 +298,8 @@ vm_setup:
         .a8
         lda     VM_CMDVEC+2
         sta     cmd_target+2
+        lda     VM_T0
+        sta     VM_TXTBANK
         stz     VM_IOQUIET
         lda     #$FF            ; no command being gathered; a line starts
         sta     VM_CMDLEN
@@ -2807,14 +2812,13 @@ op_inpstart:
         ldx     VM_IP
         NEXTOP  4
 
-; READSTART: from DATPTR in the pool (this bank)
+; READSTART: from DATPTR in the program's text
 op_readstart:
         lda     #$98
         sta     VM_INMODE
         ldy     DATPTR
         sty     INPTR
-        phk
-        pla
+        lda     VM_TXTBANK
         sta     INPTR+2
         NEXTOP  2
 
@@ -2888,26 +2892,67 @@ op_item:
         jsr     outdo
         jsr     inlin
         jmp     instart
-@findata:                       ; READ: the next DATA statement (FINDATA)
-        ldy     FP_TXT          ; at a record's 0: its line follows
-        iny
-        lda     a:$0001,y
-        cmp     #$FF
-        bne     @rec
-        lda     a:$0000,y
-        cmp     #$FF
-        bne     @rec
-        lda     #$2A            ; ?OUT OF DATA (in the READ's line)
-        jmp     vm_error
-@rec:   rep     #$20
+@findata:                       ; READ: the next DATA statement in the text
+        jmp     findata         ; (FINDATA), FP_TXT at a ":" or a line's 0
+
+; FINDATA ($D995): from FP_TXT, at a ":" or a line's 0, to the next
+; statement that is DATA (DATAN between: ":" or 0 ends a statement, quotes
+; respected); DATLIN its line; FP_TXT at the DATA token (its text - 1)
+findata:
+@fd:    lda     [FP_TXT]
+        bne     @stmt           ; ":": the next statement follows it
+        rep     #$20
         .a16
-        lda     a:$0000,y
+        ldy     #$0001          ; a line's 0: the next line's link, number,
+        lda     [FP_TXT],y      ; text
+        beq     @nodata
+        ldy     #$0003
+        lda     [FP_TXT],y
         sta     DATLIN
+        lda     FP_TXT
+        clc
+        adc     #$0004          ; (the number's high byte: the text - 1)
+        sta     FP_TXT
         sep     #$20
         .a8
-        iny                     ; the text - 1 (the line's high byte)
-        sty     FP_TXT
+@stmt:  ldy     #$0001
+        lda     [FP_TXT],y
+        cmp     #$83            ; DATA
+        beq     @data
+        stz     VM_T0           ; not DATA: to its end (in quotes: VM_T0)
+@scan:  iny
+        lda     [FP_TXT],y
+        beq     @at
+        cmp     #'"'
+        bne     @nq
+        lda     VM_T0
+        eor     #$01
+        sta     VM_T0
+        bra     @scan
+@nq:    cmp     #':'
+        bne     @scan
+        lda     VM_T0
+        bne     @scan
+@at:    rep     #$21
+        .a16
+        tya
+        adc     FP_TXT
+        sta     FP_TXT
+        sep     #$20
+        .a8
+        bra     @fd
+@data:  rep     #$20
+        .a16
+        inc     FP_TXT
+        sep     #$20
+        .a8
         jmp     instart
+        .a16
+@nodata:
+        sep     #$20
+        .a8
+        lda     #$2A            ; ?OUT OF DATA (in the READ's line)
+        jmp     vm_error
 
 ; INSTART ($DC2B): the item's first character
 instart:

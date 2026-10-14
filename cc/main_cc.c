@@ -104,6 +104,7 @@ int cc_main(void)
   fp_fin_addr = (uint16_t)(vm_word(0x16) + 0x50);
   pf.ctx = 0, pf.read = pf_read, pf.write = pf_write, pf.fin = pf_fin, pf.poll = 0;
   pf.prog_start = vm_word(0x0E);
+  pf.text_bank = cc_params.text_bank;
   pf.optable = optab;
   switch (cc_params.req) {
   case 0:

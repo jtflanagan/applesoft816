@@ -58,7 +58,7 @@ enum {
 #define FSTACK_SIZE 600
 #define SSTACK_SIZE 256
 #define CSTACK_SIZE 4096
-#define HEADER_SIZE 42
+#define HEADER_SIZE 44
 #define SV_SPARE 16                  /* string roots kept free for direct lines' variables */
 #define SA_SPARE 8                   /* ... and for their string arrays */
 #define DESC_SPARE 96                /* descriptor bytes kept free for direct lines' arrays */
@@ -100,7 +100,6 @@ static uint16_t line_at;            /* the text address of buf[0] */
 static uint16_t str_bytes;          /* string literal pool size, this pass */
 
 /* the layout, fixed after pass 1 */
-static uint16_t data_base, data_bytes, data_at;   /* the DATA pool */
 static Var fns[MAX_FNS];                          /* DEF FN names */
 static uint16_t fn_addr[MAX_FNS];                 /* a direct line's FN entries */
 static uint16_t nfns, fn_base, desc_copy_base, desc_bytes;
@@ -848,24 +847,6 @@ static void st_dim(void)
   }
 }
 
-/* DATA: its text, as it stands in the program (PARSE leaves it), up to the
- * statement's end, into the pool: [line][text][0] */
-static void st_data(void)
-{
-  int s0 = p, q = 0;
-  uint16_t num = lines[line_i].num;
-  while (p < blen && buf[p] && (q || buf[p] != ':')) {
-    if (buf[p] == '"') q = !q;
-    p++;
-  }
-  if (pass == 2) {
-    int i;
-    out(data_at++, (uint8_t)num), out(data_at++, (uint8_t)(num >> 8));
-    for (i = s0; i < p; i++) out(data_at++, buf[i]);
-    out(data_at++, 0);
-  }
-  data_bytes = (uint16_t)(data_bytes + 2 + (p - s0) + 1);
-}
 
 /* the variables of INPUT / READ / GET, each an ITEM */
 static void input_items(void)
@@ -1024,7 +1005,7 @@ static void statement(void)
   case T_NEXT: st_next(); return;
   case T_DIM: st_dim(); return;
   case T_REM: p = blen; return;
-  case T_DATA: if (direct) skip_statement(); else st_data(); return;
+  case T_DATA: skip_statement(); return;    /* READ reads it from the program's text */
   case T_INPUT: if (direct) { illegal_direct(); return; } st_input(); return;
   case T_READ: op(OP_READSTART); input_items(); return;
   case T_GET: if (direct) { illegal_direct(); return; } op(OP_GETSTART); input_items(); return;
@@ -1171,9 +1152,6 @@ static void run_pass(void)
   lit_i = 0;
   str_bytes = 0;
   str_at = str_base;
-  data_bytes = 1;                         /* the pool's leading 0 */
-  data_at = data_base;
-  if (pass == 2) out(data_at++, 0);
   line_i = 0;
   for (;;) {
     if (!(link = read_line(at, &num))) break;
@@ -1196,8 +1174,6 @@ static void run_pass(void)
   lines[nlines].num = 0xFFFF, lines[nlines].addr = pc;   /* running off the end: END */
   op(OP_END);
   if (pass == 2) flush_code(clen);
-  if (pass == 2) out(data_at++, 0xFF), out(data_at++, 0xFF);
-  data_bytes = (uint16_t)(data_bytes + 2);
 }
 
 /* does the program use ONERR, RESUME or TRACE (statement marks needed)?
@@ -1229,8 +1205,7 @@ int as816_compile(const Platform *platform, CompileStats *st)
   /* the layout */
   const_base = pc;
   str_base = (uint16_t)(const_base + 7 * nconsts);
-  data_base = (uint16_t)(str_base + str_bytes);
-  var_base = (uint16_t)(data_base + data_bytes);
+  var_base = (uint16_t)(str_base + str_bytes);
   for (i = 0, a = var_base; i < nvars; i++) {
     var_off[i] = a;
     a = (uint16_t)(a + (vars[i].type == 1 ? 2 : vars[i].type == 2 ? 4 : 5));
@@ -1296,16 +1271,17 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   /* the header (vm_run reads it) */
   {
-    uint16_t h = pf->prog_start, vals[21];
+    uint16_t h = pf->prog_start, vals[22];
     vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
     vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE), vals[4] = heap_base, vals[5] = DIRECT_BASE;
     vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
-    vals[11] = data_base;
+    vals[11] = 0x0800;                     /* DATA: READ from the text's start, as RESTORE */
     vals[12] = heap_base, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
     vals[16] = desc_bytes;
     vals[17] = 0;                          /* direct lines' variables: none yet */
     vals[18] = stmt_base, vals[19] = nstmts, vals[20] = const_base;   /* statements; the code's end */
-    for (i = 0; i < 21; i++) {
+    vals[21] = pf->text_bank;              /* the program's text (READ's DATA) */
+    for (i = 0; i < 22; i++) {
       out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
       out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
     }

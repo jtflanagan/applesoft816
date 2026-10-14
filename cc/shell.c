@@ -430,8 +430,8 @@ static void direct_tokens(void)
 /* ---- the program in memory: lines in, out, listed ---- */
 static void new_program(void)
 {
-  static const uint8_t z[2] = {0, 0};
-  to_text(0x0801, z, 2);
+  static const uint8_t z[3] = {0, 0, 0};
+  to_text(0x0800, z, 3);                 /* the 0 before the text: READ's start (RESTORE) */
   prog_end = 0x0803;
   compiled = 0;
 }
