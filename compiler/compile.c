@@ -81,6 +81,8 @@ typedef struct { uint8_t c1, c2, type, ndims; } Array;
 
 static const Platform *pf;
 static uint16_t pc;                 /* the emit position (an address in the VM bank) */
+static uint16_t code_limit;         /* the code may not reach it (the stacks, the array heap's
+                                     * free pointer, a direct line's data) */
 static int overflow;                /* the image does not fit */
 
 NOINIT static Line lines[MAX_LINES];
@@ -99,6 +101,7 @@ NOINIT static uint16_t const_addr[MAX_CONSTS];
 static uint16_t nconsts;
 NOINIT static uint16_t const_head[CONST_HASH], const_next[MAX_CONSTS];   /* index + 1, 0 = none */
 static uint16_t line_at;            /* the text address of buf[0] */
+NOINIT static uint8_t done[MAX_LINES / 8];   /* the lines with code (the lazy compile) */
 static uint16_t str_bytes;          /* string literal bytes */
 
 /* the layout, fixed by the scan */
@@ -146,12 +149,12 @@ static uint8_t cbuf[256];
 static uint8_t clen;
 static void flush_code(uint16_t n)
 {
-  if (n) pf->write(pf->ctx, (uint16_t)(pc - n), cbuf, n);
+  if (n && !overflow) pf->write(pf->ctx, (uint16_t)(pc - n), cbuf, n);
   clen = 0;
 }
 static void emit8(uint8_t v)
 {
-  if (++pc == 0) overflow = 1;
+  if (++pc > code_limit || pc == 0) overflow = 1;
   cbuf[clen++] = v;
   if (!clen) flush_code(256);
 }
@@ -214,6 +217,7 @@ static uint8_t keys_clean;          /* var_of, array_of, dims_of all 0 (bss: not
 static uint16_t var_at, desc_at;    /* the next variable's slot, the next descriptor */
 static void program_var(uint16_t i);
 static void program_array(uint16_t i);
+static int direct_line(const Platform *platform, const uint8_t *tok, uint16_t *entry);
 
 /* a direct line's new array: its descriptor (and the pristine copy CLEAR
  * restores) in the room kept after the program's, the header's count of
@@ -222,8 +226,8 @@ static void direct_array(uint16_t i)
 {
   uint8_t size = (uint8_t)(4 + 2 * arrays[i].ndims), k;
   uint8_t el = arrays[i].type == 1 ? 2 : arrays[i].type == 2 ? 4 : 5;
-  uint16_t a = (uint16_t)(desc_base + desc_bytes), c = (uint16_t)(desc_copy_base + desc_bytes);
-  if ((uint16_t)(desc_bytes + size) > (uint16_t)(desc_copy_base - desc_base) ||
+  uint16_t a = desc_at, c = (uint16_t)(desc_copy_base + (desc_at - desc_base));
+  if ((uint16_t)(desc_at + size) > desc_copy_base ||
       (arrays[i].type == 2 && nsarrays >= salist_cap)) {
     overflow = 1;
     return;
@@ -233,7 +237,8 @@ static void direct_array(uint16_t i)
     uint8_t v = k == 2 ? arrays[i].ndims : k == 3 ? el : 0;
     out((uint16_t)(a + k), v), out((uint16_t)(c + k), v);
   }
-  desc_bytes = (uint16_t)(desc_bytes + size);
+  desc_at = (uint16_t)(desc_at + size);
+  desc_bytes = (uint16_t)(desc_at - desc_base);
   out((uint16_t)(pf->prog_start + 0x20), (uint8_t)desc_bytes), out((uint16_t)(pf->prog_start + 0x21), (uint8_t)(desc_bytes >> 8));
   if (arrays[i].type == 2) {
     uint16_t r = (uint16_t)(salist_base + 2 * nsarrays);
@@ -1315,7 +1320,44 @@ __attribute__((noinline)) static void compile_line(uint16_t i)
   }
 }
 
-int as816_compile(const Platform *platform, CompileStats *st)
+/* the header (vm_run reads it), as things stand */
+static void put_header(void)
+{
+  uint16_t h = pf->prog_start, vals[24], i;
+  desc_bytes = (uint16_t)(desc_at - desc_base);
+  vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
+  vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE);
+  vals[4] = STACKS_BASE, vals[5] = pc;   /* the array heap: free pointer (down), floor */
+  vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
+  vals[11] = 0x0800;                     /* DATA: READ from the text's start, as RESTORE */
+  vals[12] = STACKS_BASE, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
+  vals[16] = desc_bytes;
+  vals[17] = 0;                          /* direct lines' variables: none yet */
+  vals[18] = stmt_base, vals[19] = nstmts, vals[20] = pc;   /* statements; the code's end */
+  vals[21] = pf->text_bank;              /* the program's text (READ's DATA) */
+  vals[22] = linetab, vals[23] = nlines;
+  for (i = 0; i < 24; i++) {
+    if (i == 4 || i == 12 || i == 17) continue;   /* (the VM's and direct lines': set at start) */
+    out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
+    out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
+  }
+}
+static void put_header_start(void)
+{
+  uint16_t h = pf->prog_start;
+  out((uint16_t)(h + 8), (uint8_t)STACKS_BASE), out((uint16_t)(h + 9), (uint8_t)(STACKS_BASE >> 8));
+  out((uint16_t)(h + 0x18), (uint8_t)STACKS_BASE), out((uint16_t)(h + 0x19), (uint8_t)(STACKS_BASE >> 8));
+  out((uint16_t)(h + 0x22), 0), out((uint16_t)(h + 0x23), 0);
+  put_header();
+}
+
+static void put_entry(uint16_t i, uint16_t v)
+{
+  out(entry(i), (uint8_t)v), out((uint16_t)(entry(i) + 1), (uint8_t)(v >> 8));
+}
+
+/* the scan and the layout, everything forgotten; 0, or -1 if it does not fit */
+static int layout(const Platform *platform)
 {
   uint16_t i, a;
   pf = platform;
@@ -1329,7 +1371,7 @@ int as816_compile(const Platform *platform, CompileStats *st)
   }
   if (prescan()) return -1;
 
-  /* the layout: the fixed regions, then the code */
+  /* the fixed regions, then the code */
   a = (uint16_t)(pf->prog_start + HEADER_SIZE);
   linetab = a;
   a = (uint16_t)(a + 2 * (nlines + 2));
@@ -1348,49 +1390,103 @@ int as816_compile(const Platform *platform, CompileStats *st)
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
   if (code_base < pf->prog_start || code_base >= STACKS_BASE) return -1;
 
-  /* the code, line by line; the last compile's names forgotten */
+  /* the last compile's names forgotten */
   for (i = 0; i < nvars; i++) var_of[name_key(vars[i].c1, vars[i].c2, vars[i].type)] = 0;
   for (i = 0; i < narrays; i++) array_of[name_key(arrays[i].c1, arrays[i].c2, arrays[i].type)] = 0;
   nvars = narrays = nfns = nconsts = nstmts = nsvars = nsarrays = 0;
   memset(const_head, 0, sizeof const_head);
+  memset(done, 0, sizeof done);
   str_bytes = 0;
   pc = code_base;
   clen = 0;
+  code_limit = STACKS_BASE;
   for (a = fn_base; a < desc_base; a++) out(a, 0);   /* the FN entries: none defined */
-  for (i = 0; i < nlines; i++) compile_line(i);
-  line_i = nlines;
-  out(entry(nlines), (uint8_t)pc), out((uint16_t)(entry(nlines) + 1), (uint8_t)(pc >> 8));
-  op(OP_END);                             /* running off the end */
-  out(entry(nlines + 1), (uint8_t)DIRECT_BASE), out((uint16_t)(entry(nlines + 1) + 1), (uint8_t)(DIRECT_BASE >> 8));
-  flush_code(clen);
-  if (overflow || pc > STACKS_BASE) return -1;
-  desc_bytes = (uint16_t)(desc_at - desc_base);
+  return 0;
+}
 
-  /* the header (vm_run reads it) */
-  {
-    uint16_t h = pf->prog_start, vals[24];
-    vals[0] = code_base, vals[1] = fstack_base, vals[2] = cstack_base;
-    vals[3] = (uint16_t)(cstack_base + CSTACK_SIZE);
-    vals[4] = STACKS_BASE, vals[5] = pc;   /* the array heap: free pointer (down), floor */
-    vals[6] = sstack_base, vals[7] = svlist_base, vals[8] = nsvars, vals[9] = salist_base, vals[10] = nsarrays;
-    vals[11] = 0x0800;                     /* DATA: READ from the text's start, as RESTORE */
-    vals[12] = STACKS_BASE, vals[13] = var_base, vals[14] = desc_base, vals[15] = desc_copy_base;
-    vals[16] = desc_bytes;
-    vals[17] = 0;                          /* direct lines' variables: none yet */
-    vals[18] = stmt_base, vals[19] = nstmts, vals[20] = pc;   /* statements; the code's end */
-    vals[21] = pf->text_bank;              /* the program's text (READ's DATA) */
-    vals[22] = linetab, vals[23] = nlines;
-    for (i = 0; i < 24; i++) {
-      out((uint16_t)(h + 2 * i), (uint8_t)vals[i]);
-      out((uint16_t)(h + 2 * i + 1), (uint8_t)(vals[i] >> 8));
+static void stats(CompileStats *st)
+{
+  if (!st) return;
+  st->code_size = (uint16_t)(pc - code_base);
+  st->lines = nlines, st->vars = nvars, st->arrays = narrays, st->consts = nconsts;
+  st->strings = str_bytes;
+  st->end = pc;
+}
+
+int as816_compile(const Platform *platform, CompileStats *st)
+{
+  uint16_t i;
+  if (layout(platform)) return -1;
+  for (i = 0; i < nlines; i++) compile_line(i), done[i >> 3] |= (uint8_t)(1u << (i & 7));
+  line_i = nlines;
+  put_entry(nlines, pc);
+  op(OP_END);                             /* running off the end */
+  put_entry((uint16_t)(nlines + 1), DIRECT_BASE);
+  flush_code(clen);
+  if (overflow) return -1;
+  put_header_start();
+  stats(st);
+  flush();
+  return 0;
+}
+
+/* ---- the lazy compile: RUN lays the program out (as816_start), a line
+ * compiles when control first reaches it (as816_more) ---- */
+#define RUN_LINES 16                      /* lines compiled at once */
+
+int as816_start(const Platform *platform, CompileStats *st)
+{
+  uint16_t i;
+  if (layout(platform)) return -1;
+  /* the entry: GOTO line 0 (it compiles then); running off the end: END */
+  op16(OP_GOTO, entry(0));
+  put_entry(nlines, pc);
+  op(OP_END);
+  put_entry((uint16_t)(nlines + 1), DIRECT_BASE);
+  for (i = 0; i < nlines; i++) put_entry(i, 0);
+  flush_code(clen);
+  if (overflow) return -1;
+  put_header_start();
+  stats(st);
+  flush();
+  return 0;
+}
+
+int as816_more(const Platform *platform, uint16_t e, uint16_t limit)
+{
+  uint16_t i = (uint16_t)((e - linetab) >> 1), first = i, pc0, nstmts0 = nstmts, nconsts0 = nconsts;
+  uint8_t n = 0;
+  pf = platform;
+  overflow = 0;
+  direct = 0;
+  if (e < linetab || i >= nlines || (done[i >> 3] & (1u << (i & 7)))) return 0;   /* (has code) */
+  pc0 = pc;
+  clen = 0;
+  code_limit = limit;
+  while (i < nlines && !(done[i >> 3] & (1u << (i & 7))) && n < RUN_LINES) {
+    compile_line(i);
+    done[i >> 3] |= (uint8_t)(1u << (i & 7));
+    i++, n++;
+  }
+  line_i = i;
+  op16(OP_GOTO, entry(i));                /* on into the next line (entry nlines: END) */
+  flush_code(clen);
+  if (overflow) {                         /* none of it kept: it never ran */
+    for (; i > first; i--) {
+      done[(i - 1) >> 3] &= (uint8_t)~(1u << ((i - 1) & 7));
+      put_entry((uint16_t)(i - 1), 0);
     }
+    while (nconsts > nconsts0) {          /* (each new one was its chain's head) */
+      nconsts--;
+      const_head[const_hash(consts[nconsts])] = const_next[nconsts];
+    }
+    pc = pc0, nstmts = nstmts0;
+    overflow = 0;
+    put_header();
+    flush();
+    return -1;
   }
-  if (st) {
-    st->code_size = (uint16_t)(pc - code_base);
-    st->lines = nlines, st->vars = nvars, st->arrays = narrays, st->consts = nconsts;
-    st->strings = str_bytes;
-    st->end = pc;
-  }
+  put_header();
   flush();
   return 0;
 }
@@ -1400,6 +1496,23 @@ int as816_compile(const Platform *platform, CompileStats *st)
 int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
 {
   uint16_t nv = nvars, nf = nfns, nsv = nsvars, dv = dvar_at, na = narrays, nsa = nsarrays, db = desc_bytes;
+  uint16_t pc0 = pc, limit0 = code_limit, line0 = line_i;   /* the program's (a lazy compile goes on there) */
+  int r = direct_line(platform, tok, entry);
+  pc = pc0, code_limit = limit0, line_i = line0;
+  if (r) {                                 /* forget what it made: it never runs */
+    nvars = nv, nfns = nf, dvar_at = dv, narrays = na;
+    nsvars = nsv, nsarrays = nsa, desc_bytes = db, desc_at = (uint16_t)(desc_base + db);
+    out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
+    out((uint16_t)(pf->prog_start + 0x14), (uint8_t)nsarrays), out((uint16_t)(pf->prog_start + 0x15), (uint8_t)(nsarrays >> 8));
+    out((uint16_t)(pf->prog_start + 0x20), (uint8_t)desc_bytes), out((uint16_t)(pf->prog_start + 0x21), (uint8_t)(desc_bytes >> 8));
+    flush();
+    return -1;
+  }
+  return 0;
+}
+
+static int direct_line(const Platform *platform, const uint8_t *tok, uint16_t *entry)
+{
   pf = platform;
   overflow = 0;
   direct = 1;
@@ -1411,6 +1524,7 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
   str_at = DIRECT_DATA;
   pc = DIRECT_BASE;
   clen = 0;
+  code_limit = DIRECT_DATA;
   op(OP_END);                               /* where IF false and ON past its list go */
   *entry = pc;
   for (;;) {
@@ -1424,16 +1538,7 @@ int as816_direct(const Platform *platform, const uint8_t *tok, uint16_t *entry)
   flush_code(clen);
   flush();
   direct = 0;
-  if (overflow) {                          /* forget what it made: it never runs */
-    nvars = nv, nfns = nf, dvar_at = dv, narrays = na;
-    nsvars = nsv, nsarrays = nsa, desc_bytes = db;
-    out((uint16_t)(pf->prog_start + 0x10), (uint8_t)nsvars), out((uint16_t)(pf->prog_start + 0x11), (uint8_t)(nsvars >> 8));
-    out((uint16_t)(pf->prog_start + 0x14), (uint8_t)nsarrays), out((uint16_t)(pf->prog_start + 0x15), (uint8_t)(nsarrays >> 8));
-    out((uint16_t)(pf->prog_start + 0x20), (uint8_t)desc_bytes), out((uint16_t)(pf->prog_start + 0x21), (uint8_t)(desc_bytes >> 8));
-    flush();
-    return -1;
-  }
-  return 0;
+  return overflow ? -1 : 0;
 }
 
 /* ---- the program's variables, by name (CHAIN carries them across) ---- */

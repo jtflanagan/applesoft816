@@ -72,6 +72,16 @@ typedef struct CompileStats {
 /* Compile the program; returns 0, or -1 if it does not fit the bank. */
 int as816_compile(const Platform *pf, CompileStats *st);
 
+/* The lazy compile: lay the program out with no line compiled; a jump to a
+ * line without code (its line-table entry 0) asks for as816_more.  0, or
+ * -1 if it does not fit the bank. */
+int as816_start(const Platform *pf, CompileStats *st);
+/* Compile the line of line-table entry e and the lines after it that have
+ * no code (a run), into the code's end, below limit (the array heap's free
+ * pointer); the line table and the header follow.  0, or -1 if it does not
+ * fit (then nothing of it is kept). */
+int as816_more(const Platform *pf, uint16_t e, uint16_t limit);
+
 /* Compile a direct line (its tokens, ending in 0) against the last compile's
  * tables, into the top of the VM bank (vm_direct runs it from *entry): its
  * variables are the program's, new ones made there.  0, or -1 if it does

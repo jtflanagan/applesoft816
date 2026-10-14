@@ -106,6 +106,8 @@ VM_FRESH = $E8          ; 1: vm_direct CLEARs first (the image is new, or was ed
 VM_CONTIP = $E9         ; 2: where CONT goes on (OLDTEXT; 0: ?CAN'T CONTINUE)
 VM_CONTLIN = $EB        ; 2: ... and its line (OLDLIN)
 VM_TXTBANK = $ED        ; 1: the program's text's bank (header +$2A): READ's DATA
+VM_LAZY  = $EE          ; 2: the line-table entry to compile (the shell's request 7);
+                        ;    0 back: it did not fit
 LINNUM   = $50          ; 2: GETADR's result (fp816)
 
 ERR_NEXT_WITHOUT_FOR  = $00
@@ -1080,8 +1082,30 @@ op_prcomma:
 
 op_goto:
         ldy     a:$0002,x       ; the line's entry in the line table
+        lda     a:$0001,y       ; (0: no code yet - code is above $3000)
+        beq     @lazy
         ldx     a:$0000,y
         jmp     ($0000,x)
+@lazy:  jsr     lazy
+        jmp     ($0000,x)
+
+; lazy: Y = a line-table entry whose line has no code yet: compile it (and
+; a run of lines after it: the shell's request 7, the compiler's
+; as816_more), X = its code.  ?OUT OF MEMORY if it does not fit (X, the
+; operation's IP, says where).
+lazy:   sty     VM_LAZY
+        phy
+        lda     #7
+        sta     VM_CBREQ
+        jsr     shell_call      ; (X kept)
+        ply
+        lda     VM_LAZY
+        ora     VM_LAZY+1
+        beq     @oom
+        ldx     a:$0000,y
+        rts
+@oom:   lda     #ERR_OUT_OF_MEMORY
+        jmp     vm_error
 
 ; IFNOT e: IF's test - FAC's exponent 0 means false: go to entry e's code
 ; (the next line's)
@@ -1089,7 +1113,11 @@ op_ifnot:
         lda     FAC
         bne     @true
         ldy     a:$0002,x
+        lda     a:$0001,y
+        beq     @lazy
         ldx     a:$0000,y
+        jmp     ($0000,x)
+@lazy:  jsr     lazy
         jmp     ($0000,x)
 @true:  NEXTOP  4
 
@@ -1115,7 +1143,11 @@ op_gosub:
         lda     #FRAME_GOSUB
         sta     a:$0004,y
         ldy     a:$0002,x       ; the line's entry
+        lda     a:$0001,y
+        beq     @lazy
         ldx     a:$0000,y
+        jmp     ($0000,x)
+@lazy:  jsr     lazy
         jmp     ($0000,x)
         .a16
 @full:  sep     #$20
@@ -3274,7 +3306,15 @@ op_on:  stx     VM_IP
         beq     @undef
         tay
         lda     a:$0000,y
-        sta     VM_T2           ; the target
+        bne     @have
+        sep     #$20            ; no code yet: compiled now
+        .a8
+        ldx     VM_IP
+        jsr     lazy
+        rep     #$20
+        .a16
+        txa
+@have:  sta     VM_T2           ; the target
         lda     VM_T1           ; this operation's length: 4 + 2k
         asl     a
         clc
@@ -4236,8 +4276,12 @@ clear_all:
 
 ; RUN e: CLEAR, then the program from entry e's code
 op_run: ldy     a:$0002,x
-        ldx     a:$0000,y
-        stx     VM_T5
+        lda     a:$0001,y
+        bne     @have
+        jsr     lazy
+        bra     @go
+@have:  ldx     a:$0000,y
+@go:    stx     VM_T5
         jsr     clear_all
         ldx     VM_T5
         jmp     ($0000,x)
@@ -4255,7 +4299,13 @@ op_himem:
 
 ; ONERR GOTO a: ONERR's flag ($D8 bit 7) and the handler
 op_onerr:
-        ldy     a:$0002,x
+        ldy     a:$0002,x       ; the handler compiled now, not in the error
+        lda     a:$0001,y
+        bne     @ok
+        phx
+        jsr     lazy
+        plx
+@ok:    ldy     a:$0002,x
         sty     VM_ONERR
         lda     f:$0000D8
         ora     #$80

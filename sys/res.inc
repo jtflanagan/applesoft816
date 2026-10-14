@@ -21,4 +21,5 @@ RES_IOBUF  = $A000      ; 2048: transfers
 RES_IOSIZE = $0800
 RES_TBUF   = $A800      ; 5 x 1024: OPEN's buffers for text files ($A800-$BBFF)
 RES_NTBUF  = 5
-RES_END    = $BC00
+RES_CCDP   = $BC00      ; 256: the compiler's FIN's direct page (cc/glue_cc.s)
+RES_END    = $BD00

@@ -6,7 +6,9 @@
  * Requests (cc_params.req): 0 compile once (gsrun: cold, the parameters
  * filled in by it), 1 compile, timed by the video counter, 2 a direct
  * line, 3 adopt a variable (CHAIN), 4 the variables' table into the stage
- * bank.  After the first, the shell calls warm: the tables stay. */
+ * bank, 5 lay the program out for a lazy compile (timed as 1), 6 compile
+ * from line-table entry n1, below n2 (the VM's request 7).  After the
+ * first, the shell calls warm: the tables stay. */
 #include <stdint.h>
 
 #include "compile.h"
@@ -116,6 +118,16 @@ int cc_main(void)
     cc_params.result = (int16_t)as816_compile(&pf, &cc_params.st);
     clk_poll(0);
     cc_params.clk = clk_half;
+    break;
+  case 5:
+    clk_half = 0, clk_last = peek24(0xC02E);
+    pf.poll = clk_poll;
+    cc_params.result = (int16_t)as816_start(&pf, &cc_params.st);
+    clk_poll(0);
+    cc_params.clk = clk_half;
+    break;
+  case 6:
+    cc_params.result = (int16_t)as816_more(&pf, cc_params.n1, cc_params.n2);
     break;
   case 2:
     cc_params.result = (int16_t)as816_direct(&pf, cc_params.tok, &cc_params.n1);

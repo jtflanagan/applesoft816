@@ -4,19 +4,23 @@
         .text
 
 ; int16_t fin_call(uint16_t text, uint8_t *fac): fp816's FIN on the number
-; at text (this data bank), with the VM's direct page; fac[7] = exponent,
-; mantissa, sign, rounding byte; returns the characters FIN took, or -1 for
-; its error.  The call: D = the VM's page, a JML through a pointer in bank
-; 0 (JML [abs] reads bank 0 whatever D is), back by fp816's RTL.
+; at text (this data bank), on a direct page of its own (RES_CCDP, $BC00:
+; a lazy compile runs while the program does, whose page is the VM's);
+; fac[7] = exponent, mantissa, sign, rounding byte; returns the characters
+; FIN took, or -1 for its error.  The call: D = that page, a JML through a
+; pointer in bank 0 (JML [abs] reads bank 0 whatever D is), back by fp816's
+; RTL.
         .global fin_call
 fin_call:
         sta     __rc4                   ; text
         stx     __rc5
-        lda     mos16(vm_dp)                   ; __rc6-8: the VM's direct page, long
-        sta     __rc6
-        lda     mos16(vm_dp+1)
+        stz     __rc6                   ; __rc6-8: FIN's direct page, long
+        lda     #$bc
         sta     __rc7
         stz     __rc8
+        lda     #0                      ; SHIFT.SIGN.EXT: 0, as outside QINT
+        ldy     #$a4
+        sta     [__rc6],y
         lda     __rc4                   ; FP_TXT ($FA) = text - 1, this bank
         sec
         sbc     #1

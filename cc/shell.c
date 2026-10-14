@@ -34,6 +34,7 @@
 #define VM_T0 0x30
 #define VM_CMDLEN 0x18
 #define VM_IOQUIET 0x11
+#define VM_LAZY 0xEE
 #define VMH_DIRECT 0x18
 #define VMH_CMDBUF 0x1A
 
@@ -120,14 +121,17 @@ uint8_t prog_save(const uint8_t *p)
   return e;
 }
 
-/* the program in memory, compiled; 0, having said how long the compile took */
+/* the program in memory, compiled - laid out, its lines compiled as the VM
+ * first reaches them (the lazy compile), or all of it (compile_all, for
+ * COMPILE); 0, having said how long that took */
+static uint8_t compile_all;
 static int compile_current(void)
 {
   CompileStats st;
   uint32_t clk_half;
   uint8_t e;
   if (compiled) return 0;
-  e = (uint8_t)compile(&st, &clk_half);
+  e = (uint8_t)compile(&st, &clk_half, !compile_all);
   if (e) { as_error("OUT OF MEMORY"); return 1; }
   compiled = 1;
   poke0((uint16_t)(vm_dp + VM_FRESH), 1);
@@ -590,6 +594,13 @@ uint8_t vm_command(void)
   /* a running program's command, or a direct line's (NOT DIRECT COMMAND) */
   int deferred = peek0((uint16_t)(vm_dp + VM_CURLIN + 1)) != 0xFF;
   uint16_t b;
+  if (req == 7) {                         /* the lazy compile's next run */
+    uint16_t e = vm_dp16(VM_LAZY);
+    if (compile_more(e, vm_read16((uint16_t)(prog_start + 8)))) {
+      poke0((uint16_t)(vm_dp + VM_LAZY), 0), poke0((uint16_t)(vm_dp + VM_LAZY + 1), 0);
+    }
+    return 0;
+  }
   if (req >= 4) return text_request(req);
   if (req) {                              /* a text file's (dos.c) */
     if ((k = dos_io(req)) == 0) return 0;
@@ -652,7 +663,9 @@ static int compile_command(void)
   if ((e = prog_load(p)) != 0) dos_message(dos_error(e));
   else {
     say_time = 1;
+    compile_all = 1;
     compile_current();
+    compile_all = 0;
   }
   return 1;
 }

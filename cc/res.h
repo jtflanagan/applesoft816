@@ -22,5 +22,6 @@
 #define RES_IOSIZE 0x0800u
 #define RES_TBUF 0xA800u               /* 5 x 1K: OPEN's buffers for text files */
 #define RES_NTBUF 5
-#define RES_END 0xBC00u
+#define RES_CCDP 0xBC00u               /* 256: the compiler's FIN's direct page */
+#define RES_END 0xBD00u
 #endif

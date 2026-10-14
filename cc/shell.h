@@ -16,7 +16,8 @@ extern uint16_t vm_dp;
 
 /* cccall.c: the compiler image's services */
 void cc_init(void);
-int compile(CompileStats *st, uint32_t *clk);
+int compile(CompileStats *st, uint32_t *clk, int lazy);
+int compile_more(uint16_t e, uint16_t limit);
 int compile_direct(const uint8_t *tok, uint16_t *entry);
 uint16_t compile_adopt(const uint8_t name[3], uint8_t ndims);
 void cc_tables(uint16_t *vars, uint16_t *arrays);

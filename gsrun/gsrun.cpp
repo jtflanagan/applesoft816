@@ -62,6 +62,9 @@ constexpr int CH = 0x24, CV = 0x25, WNDLFT = 0x20, WNDWDTH = 0x21, WNDTOP = 0x22
 
 // where the VM goes (any bank and pages would do)
 constexpr uint32_t VM_BANK = 0x050000, VM_DP = 0x9800, VM_STUB = 0x9900, SCRATCH = 0x9A00, CALL_AT = 0x9B80;
+constexpr uint32_t LAZY_AT = 0x9F00;
+constexpr uint32_t FIN_DP = 0x9C00;     // the compiler's FIN's own direct page (a lazy compile runs mid-program)    // the VM's shell entry (VM_CMDVEC): an RTL, and the lazy compile's hook
+constexpr int DP_CBREQ = 0x12, DP_CMDVEC = 0x1B, DP_LAZY = 0xEE;
 constexpr uint8_t STRING_BANK = 0x06;
 // its direct page (vm.s / fp.s)
 constexpr int DP_SH_BANK = 0x48, DP_COUT_VEC = 0x2A, DP_FLASH = 0x2D, DP_SPEED = 0x2E, DP_ERR = 0x2F, DP_RNDSEED = 0xC9,
@@ -129,6 +132,7 @@ struct Machine {
   int guard_n = 0;
   unsigned ring_i = 0;
   std::map<uint32_t, long>* hist = nullptr; // GSRUN_HIST/GSRUN_CCPROF: cycles spent at each PC
+  std::function<void()> lazy_hook;          // at LAZY_AT: the VM's request 7, compiled here
 
   explicit Machine(const std::vector<uint8_t>& rom)
   {
@@ -298,6 +302,7 @@ struct Machine {
       uint32_t pc = c.pc();
       uint64_t c0 = c.cycles;
       ring[ring_i++ & 63] = pc;
+      if (pc == LAZY_AT && lazy_hook) lazy_hook();
       if (break_pc && pc == break_pc && break_n++ < 60) {   // GSRUN_BREAK=pc: registers there
         fprintf(stderr, "break %06X: a=%04X x=%04X y=%04X d=%04X dp20-4F:", pc, c.a(), c.x(), c.y(), c.d());
         for (int k = 0x30; k < 0x50; k++) fprintf(stderr, " %02X", c.mem[c.d() + k]);
@@ -342,18 +347,33 @@ int pf_fin(void* ctx, const uint8_t* text, int len, uint8_t fac[7])
   Cpu816& c = v->m->c;
   memcpy(&c.mem[SCRATCH], text, size_t(len));
   c.mem[SCRATCH + len] = 0;
-  c.mem[VM_DP + DP_FP_TXT] = uint8_t(SCRATCH - 1);
-  c.mem[VM_DP + DP_FP_TXT + 1] = uint8_t((SCRATCH - 1) >> 8);
-  c.mem[VM_DP + DP_FP_TXT + 2] = 0;
-  c.mem[VM_DP + DP_FAC_EXT] = 0;
+  c.mem[FIN_DP + DP_FP_TXT] = uint8_t(SCRATCH - 1);
+  c.mem[FIN_DP + DP_FP_TXT + 1] = uint8_t((SCRATCH - 1) >> 8);
+  c.mem[FIN_DP + DP_FP_TXT + 2] = 0;
+  c.mem[FIN_DP + DP_FAC_EXT] = 0;
+  c.mem[FIN_DP + 0xA4] = 0;                       // SHIFT.SIGN.EXT, as outside QINT
+  // (a lazy compile calls this in the middle of the VM's run: its
+  // registers, PC and stack page come back as they were)
+  uint16_t a = c.a(), x = c.x(), y = c.y(), s = c.s(), d = c.d();
+  uint8_t dbr = c.dbr(), p = c.p();
+  bool e = c.e();
+  uint32_t pc = c.pc();
+  uint8_t stack[256];
+  memcpy(stack, &c.mem[0x100], 256);
+  uint64_t cycles = c.cycles;                     // (the program's count: the compile is not the run)
   bool rec = v->m->recording;
   v->m->recording = false;
-  bool ok = v->m->call_native(v->fp_table + 0x50, VM_DP, 1000000);
+  bool ok = v->m->call_native(v->fp_table + 0x50, FIN_DP, 1000000);
   v->m->recording = rec;
-  if (!ok || c.mem[VM_DP + DP_FP_ERR]) return -1;
-  memcpy(fac, &c.mem[VM_DP + DP_FAC], 6);
-  fac[6] = c.mem[VM_DP + DP_FAC_EXT];
-  return int(c.mem[VM_DP + DP_FP_TXT] | c.mem[VM_DP + DP_FP_TXT + 1] << 8) - int(SCRATCH);
+  memcpy(&c.mem[0x100], stack, 256);
+  c.reset_regs();                                 // (the STP it ended on, cleared)
+  c.set_regs(a, x, y, s, d, dbr, p, e);
+  c.set_pc(pc);
+  c.cycles = cycles;
+  if (!ok || c.mem[FIN_DP + DP_FP_ERR]) return -1;
+  memcpy(fac, &c.mem[FIN_DP + DP_FAC], 6);
+  fac[6] = c.mem[FIN_DP + DP_FAC_EXT];
+  return int(c.mem[FIN_DP + DP_FP_TXT] | c.mem[FIN_DP + DP_FP_TXT + 1] << 8) - int(SCRATCH);
 }
 
 void show(const std::vector<uint8_t>& out)
@@ -477,9 +497,33 @@ int main(int argc, char** argv)
     memcpy(&m.c.mem[TEXT_BANK + 0x801], prog.data(), prog.size());
     m.c.mem[TEXT_BANK + 0x801 + prog.size()] = 0, m.c.mem[TEXT_BANK + 0x802 + prog.size()] = 0;
     CompileStats st{};
-    if (as816_compile(&pf, &st) != 0) { fprintf(stderr, "gsrun: the program does not fit the VM bank\n"); return 1; }
-    fprintf(stderr, "gsrun: compiled %u lines: %u bytes of code, %u variables, %u arrays, %u constants\n",
-            st.lines, st.code_size, st.vars, st.arrays, st.consts);
+    // lazy (as the shell's RUN): laid out, each line compiled when first
+    // reached; GSRUN_FULL=1 (and --cc, which compares the two builds'
+    // images) compiles it all first
+    bool lazy = !cc_path && !getenv("GSRUN_FULL");
+    if ((lazy ? as816_start(&pf, &st) : as816_compile(&pf, &st)) != 0) {
+      fprintf(stderr, "gsrun: the program does not fit the VM bank\n");
+      return 1;
+    }
+    if (lazy) {
+      m.c.mem[LAZY_AT] = 0x6B;                     // RTL
+      dp[DP_CMDVEC] = uint8_t(LAZY_AT), dp[DP_CMDVEC + 1] = uint8_t(LAZY_AT >> 8), dp[DP_CMDVEC + 2] = 0;
+      m.lazy_hook = [&m, &pf, dp, prog_start]() {
+        if (dp[DP_CBREQ] != 7) return;
+        uint16_t e = uint16_t(dp[DP_LAZY] | dp[DP_LAZY + 1] << 8);
+        uint32_t h = VM_BANK + prog_start;
+        uint16_t limit = uint16_t(m.c.mem[h + 8] | m.c.mem[h + 9] << 8);
+        int r = as816_more(&pf, e, limit);
+        if (getenv("GSRUN_LAZY")) {
+          fprintf(stderr, "lazy: entry $%04X limit $%04X -> %d; entry now $%02X%02X\n", e, limit, r,
+                  m.c.mem[VM_BANK + e + 1], m.c.mem[VM_BANK + e]);
+        }
+        if (r != 0) dp[DP_LAZY] = 0, dp[DP_LAZY + 1] = 0;
+        m.c.set_regs(0, m.c.x(), m.c.y(), m.c.s(), m.c.d(), m.c.dbr(), m.c.p(), m.c.e());
+      };
+    }
+    fprintf(stderr, "gsrun: %s %u lines: %u bytes of code, %u variables, %u arrays, %u constants\n",
+            lazy ? "laid out (lazy)" : "compiled", st.lines, st.code_size, st.vars, st.arrays, st.consts);
     if (const char* img = getenv("GSRUN_IMAGE")) {   // FILE: the compiled image, prog_start to its end
       FILE* f = fopen(img, "wb");
       fwrite(&m.c.mem[VM_BANK + prog_start], 1, st.end - prog_start, f);
@@ -500,6 +544,10 @@ int main(int argc, char** argv)
       m.c.mem[params + 1] = uint8_t(TEXT_BANK >> 16);
       m.c.mem[params + 2] = uint8_t(VM_DP), m.c.mem[params + 3] = uint8_t(VM_DP >> 8);
       m.c.mem[params + 4] = 0xAA, m.c.mem[params + 5] = 0xAA;
+      // GSRUN_CC_LAZY=1: time the lazy start (request 5: the scan and the
+      // layout, what RUN costs before the program starts) instead
+      bool cc_lazy = getenv("GSRUN_CC_LAZY") != nullptr;
+      if (cc_lazy) m.c.mem[params + 20] = 5;
       uint64_t c0 = m.c.cycles;
       std::map<uint32_t, long> cch;
       const char* prof = getenv("GSRUN_CCPROF");   // FILE: "pc cycles" lines (tools/ccprof.py)
@@ -514,8 +562,13 @@ int main(int argc, char** argv)
       uint64_t cc_cycles = m.c.cycles - c0;
       int16_t res = int16_t(m.c.mem[params + 4] | m.c.mem[params + 5] << 8);
       int diffs = 0, first = -1;
-      for (uint32_t a = prog_start; a < st.end; a++)
+      for (uint32_t a = prog_start; a < st.end && !cc_lazy; a++)
         if (m.c.mem[VM_BANK + a] != ref[a]) { diffs++; if (first < 0) first = int(a); }
+      if (cc_lazy) {
+        fprintf(stderr, "gsrun: the 65816 compiler's lazy start: %llu cycles (%.3f s at 2.8 MHz)\n",
+                (unsigned long long)cc_cycles, cc_cycles / 2.8e6);
+        return 0;
+      }
       fprintf(stderr, "gsrun: the 65816 compiler: %s, result %d, %llu cycles (%.2f s at 2.8 MHz, %.2f s at 1 MHz); "
               "%d bytes differ from the PC build%s\n", ok ? "returned" : "did not return", res,
               (unsigned long long)cc_cycles, cc_cycles / 2.8e6, cc_cycles / 1.0205e6, diffs,

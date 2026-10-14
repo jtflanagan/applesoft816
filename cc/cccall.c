@@ -71,12 +71,20 @@ static uint16_t n1(void)
   return v;
 }
 
-int compile(CompileStats *st, uint32_t *clk)
+int compile(CompileStats *st, uint32_t *clk, int lazy)
 {
-  int16_t r = req(1);
+  int16_t r = req(lazy ? 5 : 1);
   get(st, CCP_ST, sizeof *st);
   get(clk, CCP_CLK, 4);
   return r;
+}
+
+/* the lazy compile's next run, from line-table entry e, below limit */
+int compile_more(uint16_t e, uint16_t limit)
+{
+  put(CCP_N1, &e, 2);
+  put(CCP_N2, &limit, 2);
+  return req(6);
 }
 
 int compile_direct(const uint8_t *tok, uint16_t *entry)
