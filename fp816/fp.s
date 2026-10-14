@@ -1445,6 +1445,27 @@ fdivt:
         jsr     add_exponents
         inc     FAC
         beq     jov
+        lda     FAC+1           ; a power of two (mantissa $80000000): the 34
+        cmp     #$80            ; quotient bits are ARG's mantissa then 0 0,
+        bne     @gen            ; nothing left over (ARG ends 0)
+        lda     FAC+2
+        ora     FAC+3
+        ora     FAC+4
+        bne     @gen
+        rep     #$20
+        .a16
+        lda     ARG+1
+        sta     RESULT
+        lda     ARG+3
+        sta     RESULT+2
+        stz     ARG+1
+        stz     ARG+3
+        sep     #$20
+        .a8
+        stz     $66
+        stz     FAC_EXT
+        jmp     copy_result_into_fac
+@gen:
         ; Stage 2: the ROM's restoring division (34 quotient bits: RESULT's
         ; 32, then 2 into FAC.EXTENSION's top; after a bit, if it is 1, ARG
         ; -= FAC; ARG <<= 1; the next bit is the bit shifted out, else

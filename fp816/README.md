@@ -43,7 +43,11 @@ squares in 16-bit halves: 1316 -> 871 cycles a call, every function that
 multiplies faster too; mutation-checked (the bug path dropped fails FMULT,
 LOG and EXP).  FDIV - the same restoring division (34 quotient bits) on
 little-endian 16-bit copies of the mantissas: 2381 -> 1962.  Stage 2's
-scratch is $67-$81, free in AppleSoft's offsets and the VM's.
+scratch is $67-$81, free in AppleSoft's offsets and the VM's.  A divisor
+of mantissa $80000000 (a power of two) gives ARG's mantissa as the quotient
+with nothing left over: no loop.  FOUT's digit loop and MAF in 16-bit;
+FIN's plain whole numbers direct (fin_fast); fp_next and fp_ayint16 for
+the VM.
 
 **Stage 1 is complete: every AppleSoft float routine, bit-exact** (29 test
 families; `make test CASES=50000` runs in ~90 s).  Cost, cycles per call on

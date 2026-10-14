@@ -76,3 +76,11 @@ Compiling Lemonade: 14,761,369 cycles.
 | 10: FOUT's digit loop and MAF in 16-bit | 560,914 | 5,421,854 | 13,448,210 | 6,756,528 | 48,996,873 | |
 | 11: NEXT's usual case (own frame on top, cached) without find_for; packing via the direct page | 428,002 | 5,421,854 | 12,871,210 | 6,756,528 | 45,810,081 | |
 | 12: FIN's plain whole numbers (fin_fast) | 428,002 | 5,421,854 | 12,871,210 | 6,756,528 | 45,281,111 | 9,215,216 COMPILE |
+| 13: FDIV by a power of two (the quotient is ARG's mantissa) | 428,002 | 5,416,748 | 11,406,690 | 6,758,928 | 45,279,619 | |
+
+Tried and dropped: FADD/FSUB rewritten whole on 40-bit little-endian copies.
+fptest's average halved (964 -> 486 cycles: its random cases are long
+shifts and normalizations), but every benchmark got slower - real programs
+add numbers with equal or near exponents, where the 8-bit port is quick and
+the copies in and out cost more than they save.  Lesson: judge by the
+programs, not by fptest's averages.
