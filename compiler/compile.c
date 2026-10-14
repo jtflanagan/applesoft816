@@ -196,6 +196,21 @@ static void error_here(uint8_t e)
 }
 
 /* ---- symbols ---- */
+/* a name's key: its first character, its second (none, A-Z, 0-9), its type */
+#define NKEYS (26 * 37 * 3)
+static const uint16_t key1[26] = {        /* (c1 - 'A') * 111, no multiply on the 65816 */
+  0, 111, 222, 333, 444, 555, 666, 777, 888, 999, 1110, 1221, 1332, 1443, 1554, 1665, 1776,
+  1887, 1998, 2109, 2220, 2331, 2442, 2553, 2664, 2775 };
+static uint16_t name_key(uint8_t c1, uint8_t c2, uint8_t type)
+{
+  uint8_t k2 = c2 == 0 ? 0 : c2 >= 'A' ? (uint8_t)(c2 - 'A' + 1) : (uint8_t)(c2 - '0' + 27);
+  return (uint16_t)(key1[c1 - 'A'] + k2 + k2 + k2 + type);
+}
+NOINIT static uint16_t var_of[NKEYS];   /* index + 1 in vars, 0: none */
+NOINIT static uint8_t array_of[NKEYS];  /* index + 1 in arrays, 0: none */
+NOINIT static uint8_t dims_of[NKEYS];   /* the scan's arrays: their most subscripts */
+NOINIT static uint8_t seen[(NKEYS + 7) / 8];   /* the scan's variables */
+static uint8_t keys_clean;          /* var_of, array_of, dims_of all 0 (bss: not yet) */
 static uint16_t var_at, desc_at;    /* the next variable's slot, the next descriptor */
 static void program_var(uint16_t i);
 static void program_array(uint16_t i);
@@ -248,13 +263,13 @@ static uint16_t direct_var(uint8_t size, int is_string)
 }
 static uint16_t var_slot(uint8_t c1, uint8_t c2, uint8_t type)
 {
-  uint16_t i;
-  for (i = 0; i < nvars; i++)
-    if (vars[i].c1 == c1 && vars[i].c2 == c2 && vars[i].type == type) break;
-  if (i == nvars) {
+  uint16_t key = name_key(c1, c2, type), i = var_of[key];
+  if (i) i--;
+  else {
     if (nvars == MAX_VARS) { overflow = 1; return 0; }
+    i = nvars;
     vars[nvars].c1 = c1, vars[nvars].c2 = c2, vars[nvars].type = type;
-    nvars++;
+    var_of[key] = ++nvars;
     if (direct) var_off[i] = direct_var(type == 1 ? 2 : type == 2 ? 4 : 5, type == 2);
     else program_var(i);
   }
@@ -265,14 +280,14 @@ static uint16_t var_slot(uint8_t c1, uint8_t c2, uint8_t type)
  * subscripts than it first had */
 static int array_slot(uint8_t c1, uint8_t c2, uint8_t type, uint8_t ndims)
 {
-  uint16_t i;
-  for (i = 0; i < narrays; i++)
-    if (arrays[i].c1 == c1 && arrays[i].c2 == c2 && arrays[i].type == type) break;
-  if (i == narrays) {
+  uint16_t key = name_key(c1, c2, type), i = array_of[key];
+  if (i) i--;
+  else {
     if (narrays == MAX_ARRAYS) { overflow = 1; return 0; }
+    i = narrays;
     arrays[narrays].c1 = c1, arrays[narrays].c2 = c2, arrays[narrays].type = type;
     arrays[narrays].ndims = ndims;
-    narrays++;
+    array_of[key] = (uint8_t)++narrays;
     if (direct) direct_array(i);
     else program_array(i);
   }
@@ -1139,19 +1154,13 @@ static uint16_t read_line(uint16_t at, uint16_t *num)
  * literals, REM, DATA and &'s text (more is only room unused) ---- */
 static uint16_t var_max, desc_max, nfn_max, nsv_max, nsa_max, nstmt_max;
 
-static void skip_spaces(uint16_t *j)
-{
-  while (*j < blen && buf[*j] == ' ') (*j)++;
-}
-
 /* the subscripts' count of the "(" at buf[j]: its commas at depth 1, + 1 */
-static uint8_t scan_dims(uint16_t j)
+static uint8_t scan_dims(uint8_t j)
 {
-  uint8_t nd = 1;
-  int depth = 0, q = 0;
+  uint8_t nd = 1, depth = 0, q = 0;
   for (; j < blen; j++) {
     uint8_t d = buf[j];
-    if (d == '"') { q = !q; continue; }
+    if (d == '"') { q ^= 1; continue; }
     if (q) continue;
     if (d == '(') depth++;
     else if (d == ')') { if (--depth == 0) break; }
@@ -1160,83 +1169,86 @@ static uint8_t scan_dims(uint16_t j)
   return nd;
 }
 
+/* the keys dims_of holds (to clear them after), as many as fit */
+#define SCAN_KEYS 128
+static uint16_t scan_key[SCAN_KEYS];
+static uint8_t nscan_keys;
+
 static int prescan(void)
 {
-  uint16_t at = 0x0801, link, num, j, k, nv = 0, na = 0;
+  uint16_t at = 0x0801, link, num;
+  memset(seen, 0, sizeof seen);
+  nscan_keys = 0;
   nlines = 0;
   var_max = desc_max = nfn_max = nsv_max = nsa_max = nstmt_max = 0;
   use_onerr = 0;
   while ((link = read_line(at, &num)) != 0) {
+    uint8_t j = 0, n = blen;
     if (pf->poll) pf->poll(pf->ctx);
     if (nlines == MAX_LINES) return -1;
     lines[nlines].num = num, lines[nlines].at = at;
     nlines++;
     nstmt_max++;
-    j = 0;
-    while (j < blen) {
-      uint8_t c = buf[j];
-      if (c == '"') {
-        for (j++; j < blen && buf[j] != '"'; j++) {}
-        j++;
+    while (j < n) {
+      uint8_t c = buf[j++];
+      if (c < 'A') {                      /* digits, punctuation: " and : matter */
+        if (c == '"') { while (j < n && buf[j++] != '"') {} }
+        else if (c == ':') nstmt_max++;
         continue;
       }
-      if (c == T_REM) break;
-      if (c == T_DATA || c == T_AMPER || c == T_SHLOAD || c == T_RECALL || c == T_STORE || c == T_SAVE ||
-          c == T_LOAD) {                  /* raw text to the statement's end */
-        int q = 0;
-        for (j++; j < blen && (q || buf[j] != ':'); j++)
-          if (buf[j] == '"') q = !q;
-        continue;
-      }
-      if (c == ':') { nstmt_max++; j++; continue; }
-      if (c == T_ONERR || c == T_RESUME || c == T_TRACE) use_onerr = 1;
-      if (c == T_DEF) nfn_max++;
-      if (!is_letter(c)) { j++; continue; }
-      {                                   /* a name, as read_name reads it */
-        uint8_t c1 = c, c2 = 0, type = 0;
-        j++;
-        skip_spaces(&j);
-        if (j < blen && (is_letter(buf[j]) || is_digit(buf[j]))) {
-          c2 = buf[j++];
-          for (;;) {
-            skip_spaces(&j);
-            if (j < blen && (is_letter(buf[j]) || is_digit(buf[j]))) j++;
-            else break;
-          }
+      if (c <= 'Z') {                     /* a name, as read_name reads it */
+        uint8_t c2 = 0, type = 0, d;
+        while (j < n && buf[j] == ' ') j++;
+        if (j < n && (((d = buf[j]) >= 'A' && d <= 'Z') || (d >= '0' && d <= '9'))) {
+          c2 = d, j++;
+          while (j < n && ((d = buf[j]) == ' ' || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9'))) j++;
         }
-        skip_spaces(&j);
-        if (j < blen && buf[j] == '$') type = 2, j++;
-        else if (j < blen && buf[j] == '%') type = 1, j++;
-        skip_spaces(&j);
-        if (j < blen && buf[j] == '(') {
-          uint8_t nd = scan_dims(j);
-          for (k = 0; k < na; k++)
-            if (arrays[k].c1 == c1 && arrays[k].c2 == c2 && arrays[k].type == type) break;
-          if (k == na) {
-            if (na == MAX_ARRAYS) return -1;
-            arrays[na].c1 = c1, arrays[na].c2 = c2, arrays[na].type = type, arrays[na].ndims = nd;
-            na++;
+        if (j < n && buf[j] == '$') type = 2, j++;
+        else if (j < n && buf[j] == '%') type = 1, j++;
+        while (j < n && buf[j] == ' ') j++;
+        if (j < n && buf[j] == '(') {
+          uint16_t key = name_key(c, c2, type);
+          uint8_t nd = scan_dims(j), had = dims_of[key];
+          if (!had) {
             desc_max = (uint16_t)(desc_max + 4 + 2 * nd);
             nsa_max += type == 2;
-          } else if (nd > arrays[k].ndims) {
-            desc_max = (uint16_t)(desc_max + 2 * (nd - arrays[k].ndims));
-            arrays[k].ndims = nd;
+            if (nscan_keys < SCAN_KEYS) scan_key[nscan_keys] = key;
+            if (nscan_keys < 255) nscan_keys++;
+            dims_of[key] = nd;
+          } else if (nd > had) {
+            desc_max = (uint16_t)(desc_max + 2 * (nd - had));
+            dims_of[key] = nd;
           }
         } else {
-          for (k = 0; k < nv; k++)
-            if (vars[k].c1 == c1 && vars[k].c2 == c2 && vars[k].type == type) break;
-          if (k == nv) {
-            if (nv == MAX_VARS) return -1;
-            vars[nv].c1 = c1, vars[nv].c2 = c2, vars[nv].type = type;
-            nv++;
+          uint16_t key = name_key(c, c2, type);
+          uint8_t bit = (uint8_t)(1u << (key & 7));
+          if (!(seen[key >> 3] & bit)) {
+            seen[key >> 3] |= bit;
             var_max = (uint16_t)(var_max + (type == 1 ? 2 : type == 2 ? 4 : 5));
             nsv_max += type == 2;
           }
         }
+        continue;
       }
+      if (c < 0x80) continue;
+      if (c == T_REM) break;
+      if (c == T_DATA || c == T_AMPER || c == T_SHLOAD || c == T_RECALL || c == T_STORE || c == T_SAVE ||
+          c == T_LOAD) {                  /* raw text to the statement's end */
+        uint8_t q = 0;
+        while (j < n && (q || buf[j] != ':')) {
+          if (buf[j] == '"') q ^= 1;
+          j++;
+        }
+        continue;
+      }
+      if (c == T_ONERR || c == T_RESUME || c == T_TRACE) use_onerr = 1;
+      else if (c == T_DEF) nfn_max++;
     }
     at = link;
   }
+  if (nscan_keys > SCAN_KEYS) memset(dims_of, 0, sizeof dims_of);   /* (too many to list) */
+  else
+    while (nscan_keys) dims_of[scan_key[--nscan_keys]] = 0;
   if (nfn_max > MAX_FNS) nfn_max = MAX_FNS;
   return 0;
 }
@@ -1283,7 +1295,7 @@ static void program_array(uint16_t i)
 }
 
 /* line i's code: its entry in the line table, LINE, its statements */
-static void compile_line(uint16_t i)
+__attribute__((noinline)) static void compile_line(uint16_t i)
 {
   uint16_t num;
   line_i = i;
@@ -1310,6 +1322,11 @@ int as816_compile(const Platform *platform, CompileStats *st)
   overflow = 0;
   direct = 0;
   dvar_at = 0;
+  if (!keys_clean) {                      /* the first compile: the tables as yet unset */
+    memset(var_of, 0, sizeof var_of), memset(array_of, 0, sizeof array_of), memset(dims_of, 0, sizeof dims_of);
+    nvars = narrays = 0;
+    keys_clean = 1;
+  }
   if (prescan()) return -1;
 
   /* the layout: the fixed regions, then the code */
@@ -1331,7 +1348,9 @@ int as816_compile(const Platform *platform, CompileStats *st)
   cstack_base = (uint16_t)(sstack_base + SSTACK_SIZE);
   if (code_base < pf->prog_start || code_base >= STACKS_BASE) return -1;
 
-  /* the code, line by line */
+  /* the code, line by line; the last compile's names forgotten */
+  for (i = 0; i < nvars; i++) var_of[name_key(vars[i].c1, vars[i].c2, vars[i].type)] = 0;
+  for (i = 0; i < narrays; i++) array_of[name_key(arrays[i].c1, arrays[i].c2, arrays[i].type)] = 0;
   nvars = narrays = nfns = nconsts = nstmts = nsvars = nsarrays = 0;
   memset(const_head, 0, sizeof const_head);
   str_bytes = 0;
