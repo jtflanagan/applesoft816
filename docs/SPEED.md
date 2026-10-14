@@ -69,3 +69,4 @@ Compiling Lemonade: 14,761,369 cycles.
 | 3: READ from the text; one-pass compile | 560,802 | 6,624,870 | 18,055,242 | 9,573,416 | 49,703,940 | 10,625,980 |
 | 4: lazy compile (RUN: scan + layout; lines compile when reached) | 560,914 | 6,631,982 | 18,068,884 | 9,574,228 | 49,710,745 | 2,213,024 at RUN (cold call) |
 | 5: the scan's text in windows, its byte skipping in assembly | 560,914 | 6,631,982 | 18,068,884 | 9,574,228 | 49,710,745 | 1,818,284 at RUN (cold call; ~1.43M warm), 9,908,565 for COMPILE |
+| 6: FMULT by quarter squares (fp816 stage 2) | 560,914 | 6,215,854 | 17,767,884 | 6,944,742 | 49,438,014 | |

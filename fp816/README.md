@@ -36,6 +36,13 @@ compare each fail it.
 | functions: SQR ^ LOG EXP SIN COS TAN ATN RND (incl. RND's seed, SIN/TAN's quadrant flag) | ported, matches |
 | NEXT (`fp_next`: FADD, STORE rounded, FCOMP in one; an integer path for whole numbers below 32768) | new, matches the ROM's three in a row (random + every small case) |
 
+**Stage 2 (16-bit) so far:** FMULT - the ROM's shift-and-add comes to
+acc = (acc >> 8) + b * ARG per multiplier byte (plus its known bug: a zero
+byte after a zero byte shifts RESULT a bit further), done with quarter
+squares in 16-bit halves: 1316 -> 871 cycles a call, every function that
+multiplies faster too; mutation-checked (the bug path dropped fails FMULT,
+LOG and EXP).
+
 **Stage 1 is complete: every AppleSoft float routine, bit-exact** (29 test
 families; `make test CASES=50000` runs in ~90 s).  Cost, cycles per call on
 emu816 (valid cases): the port is the ROM plus 50-60 cycles of public-entry

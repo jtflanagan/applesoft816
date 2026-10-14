@@ -1008,34 +1008,179 @@ shift_right_5:
 ; Multiply, divide, compare
 ; =========================================================================
 
-; FMULTT ($E982): FAC = ARG * FAC; A = FAC exponent with flags on entry
+; FMULTT ($E982): FAC = ARG * FAC; A = FAC exponent with flags on entry.
+;
+; Stage 2.  The ROM multiplies by FAC's five mantissa bytes, the rounding
+; byte first, each through MULTIPLY.1/.2: for a byte b it shifts the 40-bit
+; RESULT:FAC.EXTENSION right eight times, adding ARG's mantissa to RESULT
+; for each set bit - which comes to acc = (acc >> 8) + b * ARG exactly (the
+; bits shifted out never carry back).  A zero byte goes to SHIFT.RIGHT.1
+; instead, whose carry in is MULTIPLY.2's last (1) or SHIFT.RIGHT's own (0):
+; after a nonzero byte it is acc >> 8, but a zero byte after a zero byte
+; shifts RESULT one bit more while FAC.EXTENSION keeps the byte shifted
+; into it (Applesoft's multiply bug).  The last byte (FAC+1) is always
+; MULTIPLY.2's.  Here: the four 8 x 8 products of b by ARG's bytes from
+; quarter squares (ab = sq(a+b) - sq(|a-b|), sq(n) = n*n/4), added in
+; 16-bit halves.  fptest holds it to the ROM's own FMULT and every
+; function that multiplies.
+MW_ACC = $67                    ; 7: the product so far, little-endian (5, 6 stay 0)
+MW_P   = $6E                    ; 8: b times ARG+4, ARG+3, ARG+2, ARG+1 (16 bits each)
+MW_PB1 = $76                    ; 2: sq + 2b
+MW_PB2 = $78                    ; 2: sqs + 2(255 - b)
+MW_X   = $7A                    ; 8: ARG+4, ARG+3, ARG+2, ARG+1, doubled (indices)
+
 fmultt:
         bne     @le987
         rts
-@le987: jsr     add_exponents
-        lda     #$00
-        sta     RESULT
-        sta     RESULT+1
-        sta     RESULT+2
-        sta     RESULT+3
+@le987: jsr     add_exponents   ; (underflow: back to our caller's caller)
+        rep     #$30
+        .a16
+        .i16
+        lda     ARG+4
+        and     #$00FF
+        asl     a
+        sta     MW_X
+        lda     ARG+3
+        and     #$00FF
+        asl     a
+        sta     MW_X+2
+        lda     ARG+2
+        and     #$00FF
+        asl     a
+        sta     MW_X+4
+        lda     ARG+1
+        and     #$00FF
+        asl     a
+        sta     MW_X+6
+        stz     MW_ACC
+        stz     MW_ACC+2
+        stz     MW_ACC+4
+        stz     MW_ACC+5
+        ldx     #$0000          ; 1 after a nonzero byte (SHIFT.RIGHT.1's carry in)
         lda     FAC_EXT
-        jsr     multiply_1
+        jsr     mul_byte
         lda     FAC+4
-        jsr     multiply_1
+        jsr     mul_byte
         lda     FAC+3
-        jsr     multiply_1
+        jsr     mul_byte
         lda     FAC+2
-        jsr     multiply_1
+        jsr     mul_byte
         lda     FAC+1
-        jsr     multiply_2
+        and     #$00FF
+        jsr     mul_nz          ; (MULTIPLY.2, whatever it is)
+        lda     MW_ACC+3        ; RESULT = bytes 4..1, FAC.EXTENSION byte 0
+        xba
+        sta     RESULT
+        lda     MW_ACC+1
+        xba
+        sta     RESULT+2
+        sep     #$30
+        .a8
+        .i8
+        lda     MW_ACC
+        sta     FAC_EXT
         jmp     copy_result_into_fac
 
-; MULTIPLY.1 ($E9B0)
+        .a16
+        .i16
+; one multiplier byte (A, its high byte junk): MULTIPLY.1
+mul_byte:
+        and     #$00FF
+        bne     mul_nz
+        cpx     #$0000
+        beq     @bug
+        ldx     #$0000          ; after a nonzero byte: acc >> 8
+        lda     MW_ACC+1
+        sta     MW_ACC
+        lda     MW_ACC+3
+        sta     MW_ACC+2
+        stz     MW_ACC+4
+        rts
+@bug:   lda     MW_ACC+1        ; after a zero byte: byte 0 = byte 1, bytes
+        sta     MW_ACC          ; 1-4 = bytes 1-4 >> 9
+        lda     MW_ACC+3
+        sta     MW_ACC+2
+        stz     MW_ACC+4
+        lsr     MW_ACC+3
+        ror     MW_ACC+1
+        rts
+
+; acc = (acc >> 8) + b * ARG, b = A (MULTIPLY.2)
+mul_nz: asl     a
+        sta     MW_PB2          ; (2b, for a moment)
+        clc
+        adc     #.loword(sq)
+        sta     MW_PB1
+        lda     #.loword(sqs + 510)
+        sec
+        sbc     MW_PB2
+        sta     MW_PB2
+        ldy     MW_X            ; the four products
+        lda     (MW_PB1),y
+        sec
+        sbc     (MW_PB2),y
+        sta     MW_P
+        ldy     MW_X+2
+        lda     (MW_PB1),y
+        sec
+        sbc     (MW_PB2),y
+        sta     MW_P+2
+        ldy     MW_X+4
+        lda     (MW_PB1),y
+        sec
+        sbc     (MW_PB2),y
+        sta     MW_P+4
+        ldy     MW_X+6
+        lda     (MW_PB1),y
+        sec
+        sbc     (MW_PB2),y
+        sta     MW_P+6
+        lda     MW_ACC+1        ; acc >> 8
+        sta     MW_ACC
+        lda     MW_ACC+3
+        sta     MW_ACC+2
+        stz     MW_ACC+4
+        clc                     ; + the products at bytes 0 and 2
+        lda     MW_ACC
+        adc     MW_P
+        sta     MW_ACC
+        lda     MW_ACC+2
+        adc     MW_P+4
+        sta     MW_ACC+2
+        lda     MW_ACC+4
+        adc     #$0000
+        sta     MW_ACC+4
+        clc                     ; + the products at bytes 1 and 3
+        lda     MW_ACC+1
+        adc     MW_P+2
+        sta     MW_ACC+1
+        lda     MW_ACC+3
+        adc     MW_P+6
+        sta     MW_ACC+3
+        lda     MW_ACC+5
+        adc     #$0000
+        sta     MW_ACC+5
+        ldx     #$0001
+        rts
+        .a8
+        .i8
+
+; the quarter squares: sq(n) = n*n/4 for n = 0..510, and sqs(n) = sq(|n - 255|)
+sq:
+        .repeat 511, n
+        .word   (n * n) / 4
+        .endrepeat
+sqs:
+        .repeat 511, n
+        .word   ((n - 255) * (n - 255)) / 4
+        .endrepeat
+
+; MULTIPLY.1 ($E9B0), MULTIPLY.2 ($E9B5): stage 1's, kept for the functions
+; that reach them (none now) and as the reference
 multiply_1:
         bne     multiply_2
         jmp     shift_right_1
 
-; MULTIPLY.2 ($E9B5)
 multiply_2:
         lsr     a
         ora     #$80
