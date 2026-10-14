@@ -18,12 +18,17 @@ under BASIC.SYSTEM: type numbered lines, `LIST`, `RUN`, `SAVE`, `LOAD`,
 `CATALOG`, and so on.  `BYE` returns to the program selector, or to GS/OS
 if it launched us.
 
-- `as816_master.po` (`MASTER=1 tools/mkdisk.sh IMAGE.po`) is the bare
-  bootable 800K disk - ProDOS 2.4.3 and the four AS816 files, 1367 blocks
-  free - a template for a disk of one's own.  Copy it; don't use the
-  master itself.
-- `tools/mkdisk.sh IMAGE.po` makes the same disk with Lemonade Stand and
-  the Rugg/Feldman benchmarks BM1-BM8 on it.
+Ready-made 800K ProDOS disks (ProDOS-order `.po`, for an emulator, a
+SmartPort/3.5" device or a card) are in `images/`:
+
+- `images/as816_master.po`: the bare bootable disk - ProDOS 2.4.3 and the
+  four AS816 files, 1367 blocks free - a template for a disk of one's own.
+  Copy it; don't use the master itself.
+- `images/as816_lemonade.po`: the same with Lemonade Stand (`RUN LEMONADE`)
+  and the Rugg/Feldman benchmarks BM1-BM8 on it.
+
+`tools/mkdisk.sh IMAGE.po` and `MASTER=1 tools/mkdisk.sh IMAGE.po` build
+them from source.
 
 ## What it does
 
@@ -167,6 +172,7 @@ Xvfb and xdotool.
 | `gsrun/` | a program under the GS ROM's AppleSoft or under ours, same virtual monitor; `parsetest` for the tokenizer |
 | `emu816/` | the ares 65816 core standalone |
 | `tests/` | `all.sh`/`compare.sh` and the programs; `dos/` the KEGS tests |
+| `images/` | the two disks, ready to boot |
 | `bench/` | Lemonade Stand (1979) and BM1-BM8 |
 | `prof/`, `tools/` | `asprof` (ROM AppleSoft profiled), `vmprof.py`/`ccprof.py` (where our cycles go), disk and KEGS tools |
 | `docs/` | `DESIGN.md` (decisions), `INTERP.md` (the compiler and VM), `M5.md` (the system on the machine), `SPEED.md`, `PROFILE.md`, `KNOWN_BUGS.md`, `AMPER_SURVEY.md` |
